@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from src.config import settings
 from src.verify import rules as R
@@ -465,19 +465,42 @@ def _fold_titles(text: str) -> str:
         R.NOTARY_NEAR, t[max(0, m.start() - 70):m.end() + 70]) else m.group(0), t)
 
 
-def qualifications_on(text: str) -> set:
-    """Every qualification a page names (SSC, HSC, DIPLOMA, BACHELOR, MASTER), on whole words.
+DEGREES = {"BACHELOR", "MASTER"}
 
-    A degree transcript can list its holder's SSC and HSC results, so on a page that names a
-    degree a school qualification only counts when its full exam title is printed there."""
+
+def page_qualifications(text: str) -> Tuple[set, set]:
+    """(found, doubtful): the qualifications a page names (SSC, HSC, DIPLOMA, BACHELOR, MASTER),
+    on whole words, and those it may hold but that cannot be counted.  A doubtful one never
+    counts towards a PASS; it only turns its missing qualification into a FLAG, never a FAIL.
+
+    * a school board's page (rules.SCHOOL_BOARD) names no degree, whatever short degree word
+      (a "BSC" serial, OCR noise, a stamp) it carries, unless a degree is written out in full;
+    * a degree certificate or transcript can list its holder's SSC and HSC results, so on a page
+      that names a degree a school qualification named by its title is doubtful, and one named
+      only by its short form ("HSC GPA 5.00") is ignored;
+    * "...Secondary Certificate" without "School" or "Higher" counts as the HSC, but the page
+      may be the SSC unless it shows a sign of the HSC (rules.HSC_UNSURE / HSC_SIGNS)."""
     t = _fold_titles(text)
-    found = {q for q, pats in R.QUALIFICATION_WORDS.items() if any(re.search(p, t) for p in pats)}
-    found |= {q for q, pats in R.QUALIFICATION_WORDS_CASED.items()
+    named = {q for q, pats in R.QUALIFICATION_WORDS.items() if any(re.search(p, t) for p in pats)}
+    named |= {q for q, pats in R.QUALIFICATION_WORDS_CASED.items()
               if any(re.search(p, text or "") for p in pats)}
-    if found & {"BACHELOR", "MASTER"}:
-        found = {q for q in found if q in ("BACHELOR", "MASTER")
-                 or any(re.search(p, t) for p in R.QUALIFICATION_TITLES.get(q, []))}
-    return found
+    doubt = set()
+    if "HSC" not in named and re.search(R.HSC_UNSURE, t):
+        named.add("HSC")
+        if "SSC" not in named and not re.search(R.HSC_SIGNS, re.sub(R.SCHOOL_BOARD, " ", t)):
+            doubt.add("SSC")
+    found = named | {q for q, p in R.QUALIFICATION_ABBREVIATIONS.items() if re.search(p, t)}
+    if re.search(R.SCHOOL_BOARD, t) and not re.search(R.DEGREE_IN_FULL, t):
+        found -= DEGREES
+    elif found & DEGREES:
+        doubt |= named - DEGREES
+        found &= DEGREES
+    return found, doubt - found
+
+
+def qualifications_on(text: str) -> set:
+    """Every qualification a page names and that counts (see page_qualifications)."""
+    return page_qualifications(text)[0]
 
 
 def academic_page_readable(text: str) -> bool:
@@ -510,12 +533,15 @@ def qualification_check(program: str, pages: List[tuple], extra_text: str = "",
     if not need:
         return []
     where: Dict[str, List[str]] = {}
+    maybe: Dict[str, List[str]] = {}        # pages that may hold it but could not be counted
     poor, unnamed = [], []
     for label, text in pages:
-        found = qualifications_on(text)
+        found, doubt = page_qualifications(text)
         for q in found:
             where.setdefault(q, []).append(str(label))
-        if found:
+        for q in doubt:
+            maybe.setdefault(q, []).append(str(label))
+        if found or doubt:
             continue
         low = (text or "").lower()
         if re.search(r"apostille", low):
@@ -524,8 +550,11 @@ def qualification_check(program: str, pages: List[tuple], extra_text: str = "",
             poor.append(str(label))
         elif any(re.search(r"\b" + w, low) for w in R.ACADEMIC_PAGE_WORDS):
             unnamed.append(str(label))
-    for q in qualifications_on(extra_text):
+    found, doubt = page_qualifications(extra_text)
+    for q in found:
         where.setdefault(q, [])
+    for q in doubt:
+        maybe.setdefault(q, [])
 
     names = R.QUALIFICATION_NAMES
     wanted = " and ".join(names[a[0]] + (f" (or a {names[a[1]]})" if len(a) > 1 else "")
@@ -555,10 +584,15 @@ def qualification_check(program: str, pages: List[tuple], extra_text: str = "",
         if any(q in where for q in alts):
             continue
         label = " or ".join(names[q] for q in alts)
-        if why:
+        because = list(why)
+        for q in alts:
+            if q in maybe:
+                on = _page_list(maybe[q]) if maybe[q] else "the whole-file read"
+                because.insert(0, f"{on} may hold the {names[q]} but it is not certain")
+        if because:
             out.append(("FLAG", f"could not confirm {label} in the academic file "
-                                f"({'; '.join(why)}) — check by eye ({program.upper()} requires "
-                                f"{wanted})"))
+                                f"({'; '.join(because)}) — check by eye ({program.upper()} "
+                                f"requires {wanted})"))
         else:
             out.append(("FAIL", f"academic file has no {label} — {program.upper()} requires "
                                 f"{wanted}"))

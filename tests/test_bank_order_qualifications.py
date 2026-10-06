@@ -87,8 +87,10 @@ def test_two_page_right_order_passes(monkeypatch):
 def test_statement_first_fails(monkeypatch):
     v, m = _order(_bank(monkeypatch, [STATEMENT, SOLVENCY]))
     assert v == dv.FAIL
-    assert m.startswith("page 1 is the bank statement, the solvency certificate is on page 2")
-    assert "must start with the solvency certificate" in m
+    assert m == ("page 1 is the statement, the solvency certificate is on page 2 — the solvency "
+                 "certificate must be page 1, then the statement")
+    # the Telegram line shows the first 160 characters, document title included
+    assert len(f"{R.TITLES['bank']}: {m}") <= 160
 
 
 def test_solvency_last_fails(monkeypatch):
@@ -102,11 +104,21 @@ def test_statement_first_without_any_solvency_page_fails(monkeypatch):
 
 
 def test_solvency_in_the_middle_fails(monkeypatch):
-    (v, m), _ = dv.bank_order([SOLVENCY, STATEMENT, SOLVENCY, STATEMENT_2])
-    assert v == dv.FAIL
-    assert "a solvency certificate is on page 3, after the statement on page 2" in m
     (v, m), _ = dv.bank_order([STATEMENT, SOLVENCY, STATEMENT_2])
     assert v == dv.FAIL and "solvency certificate is on page 2" in m
+    (v, m), _ = dv.bank_order([SOLVENCY, STATEMENT, SOLVENCY])
+    assert v == dv.FAIL
+    assert "a solvency certificate is on page 3, after the statement on page 2" in m
+
+
+def test_two_solvency_and_statement_sets_are_a_flag_until_the_owner_decides():
+    # two accounts in one file: solvency, statement, solvency, statement
+    (v, m), _ = dv.bank_order([SOLVENCY, STATEMENT, SOLVENCY, STATEMENT_2])
+    assert v == dv.FLAG
+    assert m.startswith("the file holds 2 sets of solvency certificate + statement (solvency "
+                        "certificates on pages 1, 3) — check by eye")
+    (v, _), _ = dv.bank_order([SOLVENCY, STATEMENT, STATEMENT_2, SOLVENCY, UNCLEAR])
+    assert v == dv.FLAG
 
 
 def test_unclear_page_1_is_a_flag_never_a_fail(monkeypatch):
@@ -263,6 +275,7 @@ def test_a_diploma_counts_instead_of_hsc():
 
 
 def test_a_degree_transcript_that_mentions_hsc_is_not_an_hsc():
+    # by its short form ("HSC GPA 5.00") the mention is ignored: a clear FAIL
     res = _qual("MASTER", [APOSTILLE, SSC, SSC_TRANSCRIPT, APOSTILLE, DEGREE_TRANSCRIPT_WITH_HSC])
     fails = [m for v, m in res if v == "FAIL"]
     assert len(fails) == 1 and fails[0].startswith("academic file has no HSC or Diploma")
@@ -342,3 +355,183 @@ def test_two_academic_files_are_judged_together(monkeypatch, tmp_path):
     line = [m for v, m in last if m.startswith("academic file contains")]
     assert line and "all that KLP requires" in line[0]
     assert f"{second.name} p2" in line[0] and f"{first.name} p2" in line[0]
+
+
+# --- review follow-ups: the bank file ------------------------------------------------------
+FOOTER_ONLY = ("Closing figures as on 30-09-2026. Certified that the above statement is correct "
+               "as per our books. Authorised Officer")
+FOOTER_ONLY_2 = "We certify that the above statement is correct. Balance as on 30-09-2026."
+THIN = "Branch: SAMPLE  Account statement  *** End of statement ***  Page 3 of 3"
+
+
+@pytest.mark.parametrize("footer", [FOOTER_ONLY, FOOTER_ONLY_2])
+def test_a_last_page_with_only_the_certify_footer_is_the_statement_going_on(monkeypatch, footer):
+    # the footer carries solvency wording ("certified that", "as on") but speaks of the statement
+    assert dv.bank_page_kind(footer) == dv.STATEMENT_PAGE
+    v, m = _order(_bank(monkeypatch, [SOLVENCY, STATEMENT, footer]))
+    assert (v, m) == (dv.PASS, "page 1 is the solvency certificate and pages 2-3 are the statement")
+
+
+def test_a_weak_later_solvency_page_is_a_flag_never_a_fail():
+    weak = "Certified that the balance as on 30-09-2026 is correct. Authorised Officer"
+    assert dv.bank_page_kind(weak) == dv.UNCLEAR_PAGE
+    (v, m), _ = dv.bank_order([SOLVENCY, STATEMENT, weak])
+    assert v == dv.FLAG and "page 3 could not be told apart" in m
+    assert dv.strong_solvency(SOLVENCY) and not dv.strong_solvency(weak)
+
+
+def test_a_later_solvency_after_only_a_thin_statement_page_is_a_flag():
+    # page 2 is only taken as the statement going on, so it cannot prove page 3 is out of place
+    (v, m), kinds = dv.bank_order([SOLVENCY, THIN, SOLVENCY])
+    assert kinds == [dv.SOLVENCY_PAGE, dv.STATEMENT_PAGE, dv.SOLVENCY_PAGE]
+    assert v == dv.FLAG and "page 3 also reads as a solvency certificate" in m
+
+
+def test_a_thin_footer_as_page_1_is_a_flag(monkeypatch):
+    v, m = _order(_bank(monkeypatch, [THIN, SOLVENCY]))
+    assert v == dv.FLAG and m.startswith("page 1 could not be told apart")
+
+
+def test_a_solvency_letter_that_mentions_a_statement_and_deposit_is_still_the_solvency_page():
+    letter = SOLVENCY + " A statement of the account is enclosed for the deposit history."
+    sol, stm, _ = dv._bank_markers(letter)
+    assert stm == 2 and sol >= 4                    # the second solvency test decides it
+    assert dv.bank_page_kind(letter, first=True) == dv.SOLVENCY_PAGE
+    (v, _), _ = dv.bank_order([letter, STATEMENT])
+    assert v == dv.PASS
+
+
+def test_dates_fall_back_to_page_1_and_the_other_pages_when_nothing_is_clear(monkeypatch):
+    first = f"SAMPLE BANK LIMITED  Date: {SLASH}  SAMPLE"
+    second = f"SAMPLE BANK LIMITED  Report date: {MON}  SAMPLE"
+    assert [dv.bank_page_kind(first, first=True), dv.bank_page_kind(second)] == [dv.UNCLEAR_PAGE] * 2
+    results = _bank(monkeypatch, [first, second])
+    assert (dv.PASS, f"solvency certificate and statement both dated {DAY}") in results
+
+
+def test_two_solvency_pages_give_no_statement_date(monkeypatch):
+    results = _bank(monkeypatch, [SOLVENCY, SOLVENCY])
+    assert any(v == dv.NOTE and "generation date could not be read" in m for v, m in results)
+
+
+def test_a_file_cut_at_the_page_limit_says_so(monkeypatch):
+    pages = [SOLVENCY] + [STATEMENT_2] * (dv.BANK_MAX_PAGES - 1)
+    v, m = _order(_bank(monkeypatch, pages))
+    assert (v, m) == (dv.PASS, "page 1 is the solvency certificate and pages 2-10 are the "
+                               "statement (only the first 10 pages were read)")
+
+
+def test_a_bank_file_that_cannot_be_read_page_by_page_is_a_flag(monkeypatch):
+    results = _bank(monkeypatch, [])
+    assert (dv.FLAG, "the bank file could not be read page by page — check the order by eye: "
+                     "the solvency certificate must be page 1, then the statement") in results
+
+    def broken(path, max_pages=20, sideways=None):
+        raise RuntimeError("SAMPLE unreadable")
+    monkeypatch.setattr(dv, "read_pages", broken)
+    results = dv.check_bank(SOLVENCY, STUDENT, [], "KLP", Path("SAMPLE (A99900001)/BANK.pdf"), {})
+    assert any(v == dv.FLAG and "could not be read page by page" in m for v, m in results)
+
+
+# --- review follow-ups: the academic file ----------------------------------------------------
+SSC_TITLED = SSC.replace("Secondary School Certificate Examination",
+                         "Secondary School Certificate (SSC) Examination")
+
+
+def test_a_stray_degree_word_on_a_school_board_page_is_not_a_degree():
+    serial = SSC_TITLED.replace("Dhaka. ", "Dhaka. Serial No. BSC 0001234. ", 1)
+    stamp = SSC_TITLED + " Attested. Seal. SAMPLE OFFICER LL.B (Hons), LL.M"
+    noise = SSC_TITLED + " msc mss llm"
+    headmaster = SSC_TITLED + " Headmaster: SAMPLE TEACHER, B.Sc., B.Ed."
+    for page in (serial, stamp, noise, headmaster):
+        assert PC.qualifications_on(page) == {"SSC"}
+        assert _verdicts(_qual("KLP", [APOSTILLE, page, APOSTILLE, HSC])) == ["PASS"]
+
+
+def test_bare_degree_tokens_need_a_title():
+    assert PC.qualifications_on("Ref BSC 0001 SAMPLE") == set()
+    assert PC.qualifications_on("BSc in Computer Science, SAMPLE University") == {"BACHELOR"}
+    assert PC.qualifications_on("B.Sc. (Engineering) SAMPLE University") == {"BACHELOR"}
+    assert PC.qualifications_on("MSc in Physics, SAMPLE University") == {"MASTER"}
+
+
+def test_attestation_stamp_degrees_are_not_the_students():
+    stamp = ("Academic Transcript of SAMPLE STUDENT. Attested. SAMPLE OFFICER, LL.B (Hons), LL.M. "
+             "True copy.")
+    assert PC.qualifications_on(stamp) == set()
+    for word in ("Attested by", "Stamp:", "Seal of"):
+        assert PC.qualifications_on(f"Academic Transcript. {word} SAMPLE OFFICER, LL.B (Hons)") == set()
+
+
+def test_a_school_level_beside_a_degree_word_is_a_flag_never_a_fail():
+    # board name lost to the scan, a degree word on the page: the SSC is not certain, so a FLAG
+    page = ("Secondary School Certificate (SSC) Examination 2019. SAMPLE STUDENT of SAMPLE High "
+            "School passed with GPA 5.00. Bachelor of Arts (SAMPLE examiner).")
+    assert PC.page_qualifications(page) == ({"BACHELOR"}, {"SSC"})
+    res = _qual("KLP", [APOSTILLE, page, APOSTILLE, HSC])
+    assert _verdicts(res) == ["PASS", "FLAG"]
+    assert res[1][1].startswith("could not confirm SSC in the academic file (page 2 may hold the "
+                                "SSC but it is not certain) — check by eye")
+
+
+def test_a_degree_transcript_with_the_full_hsc_title_is_not_an_hsc():
+    page = ("University of SAMPLE. Academic Transcript. Bachelor of Science. Name of student "
+            "SAMPLE STUDENT. Higher Secondary Certificate Examination GPA 5.00. Semester 1 credit "
+            "18 grade A. CGPA 3.60.")
+    assert PC.qualifications_on(page) == {"BACHELOR"}
+    res = _qual("MASTER", [APOSTILLE, SSC, APOSTILLE, page])
+    assert res[-1][0] == "FLAG" and "page 4 may hold the HSC" in res[-1][1]
+    assert "FAIL" not in _verdicts(res)
+
+
+def test_secondary_certificate_without_school_or_higher_is_doubtful():
+    lost_school = SSC.replace("Secondary School Certificate", "Secondary Certificate")
+    assert PC.page_qualifications(lost_school) == ({"HSC"}, {"SSC"})
+    res = _qual("KLP", [APOSTILLE, lost_school, APOSTILLE, HSC])
+    assert _verdicts(res) == ["PASS", "FLAG"] and "page 2 may hold the SSC" in res[1][1]
+    # with a sign of the HSC (a college) it is the HSC with "Higher" lost: no SSC there
+    lost_higher = HSC.replace("Higher Secondary Certificate", "Secondary Certificate")
+    assert PC.page_qualifications(lost_higher) == ({"HSC"}, set())
+    assert ("FAIL", "academic file has no SSC — KLP requires SSC and HSC (or a Diploma)") in \
+        _qual("KLP", [APOSTILLE, lost_higher])
+
+
+def test_higher_secondary_school_certificate_is_only_an_hsc():
+    assert PC.page_qualifications("Higher Secondary School Certificate Examination 2021") == \
+        ({"HSC"}, set())
+
+
+@pytest.mark.parametrize("text, level", [
+    ("CAMBRIDGE INTERNATIONAL A LEVEL", "HSC"), ("GCE O LEVEL", "SSC"),
+    ("Pearson Edexcel Level 3 Advanced GCE in Mathematics", "HSC"),
+    ("Cambridge International AS & A Level", "HSC"), ("Edexcel International O-Level", "SSC"),
+])
+def test_cambridge_and_edexcel_equivalents(text, level):
+    assert PC.qualifications_on(text) == {level}
+
+
+def test_a_level_found_only_in_the_whole_file_read_counts():
+    res = PC.qualification_check("KLP", [("1", APOSTILLE), ("2", HSC)], extra_text=SSC)
+    assert res == [("PASS", "academic file contains SSC, HSC (page 2) — all that KLP requires")]
+
+
+def test_an_academic_file_that_cannot_be_read_page_by_page_is_never_a_fail(monkeypatch):
+    monkeypatch.setattr(dv, "read_pages", lambda path, max_pages=20, sideways=None: [])
+    monkeypatch.setattr(PC, "academic_check", lambda path, pages_text: [])
+    # the whole-file read may have stopped early, so a missing HSC is only a FLAG
+    res = dv.check_academic("\n".join([APOSTILLE, SSC]), STUDENT, [],
+                            Path("SAMPLE (A99900001)/ACADEMIC CERTIFICATE.pdf"), {}, "KLP")
+    assert any(v == dv.FLAG and m.startswith("could not confirm HSC or Diploma") and
+               "not every page was read" in m for v, m in res)
+    assert not any(v == dv.FAIL for v, _ in res)
+
+
+def test_a_degree_transcript_that_names_the_hsc_board_is_still_a_degree_page():
+    page = ("University of SAMPLE. Academic Transcript. Bachelor of Social Science. Previous "
+            "education: HSC 2019, Board of Intermediate and Secondary Education, Dhaka, GPA 5.00. "
+            "Semester 1 credit 18 grade A. CGPA 3.60.")
+    assert PC.page_qualifications(page) == ({"BACHELOR"}, set())
+    res = _qual("MASTER", [APOSTILLE, SSC, APOSTILLE, page])
+    assert ("FAIL", "academic file has no HSC or Diploma — MASTER requires SSC and HSC (or a "
+                    "Diploma) and Bachelor's degree") in res
+    assert "Bachelor's degree (page 4)" in res[0][1]

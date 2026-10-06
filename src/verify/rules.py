@@ -157,6 +157,13 @@ BANK_STATEMENT_MARKERS = [
 BANK_SOLVENCY_MIN = 2          # solvency markers a solvency-certificate page carries at least
 BANK_STATEMENT_MIN = 3         # statement markers a statement page carries at least
 BANK_STATEMENT_ROWS = 5        # dated rows that, with 2 markers, also make a statement page
+# After page 1 a page only counts as a solvency certificate on strong evidence, so a statement's
+# last page holding only the bank's "Certified that the above statement is correct" footer never
+# reads as a solvency certificate in the wrong place: at least this many solvency markers, one of
+# them a solvency certificate's own, and no word of "the above statement".
+BANK_LATE_SOLVENCY_MIN = 3
+BANK_SOLVENCY_CORE = r"solvency|to whom it may concern|maintaining|\busd\b|us\s*dollar|equivalent"
+BANK_STATEMENT_REFERENCE = r"\b(?:above|this|the\s+said)\s+statement\b"
 
 # --- Document 07: the qualifications each program's academic file must contain -------
 # Each entry is a list of alternatives: ("HSC", "DIPLOMA") is an HSC or, instead, a Diploma.
@@ -176,36 +183,57 @@ QUALIFICATION_NAMES = {"SSC": "SSC", "HSC": "HSC", "DIPLOMA": "Diploma",
 QUALIFICATION_WORDS: Dict[str, List[str]] = {
     "SSC": [r"secondary\s+school\s+(?:\S{1,15}\s+)?(?:cer[a-z]{2,}|exam)", r"\bschool\s+cer[a-z]{2,}\s+exam",
             r"certificate\s+of\s+secondary\s+education",
-            r"\bs\.?\s?s\.?\s?c\b", r"\bdakhil\b", r"ordinary\s+level", r"\bi?gcse\b"],
-    "HSC": [r"higher\s+secondary", r"\bsecondary\s+cer[a-z]{2,}", r"\bh\.?\s?s\.?\s?c\b",
+            r"\bdakhil\b", r"ordinary\s+level", r"\bi?gcse\b",
+            r"\b(?:gce|cambridge|edexcel|international)\s+o[\s'-]{0,2}levels?\b"],
+    "HSC": [r"higher\s+secondary",
             r"\balim\s+(?:exam|certif|transcript|result|\()", r"advanced\s+level",
-            r"intermediate\s+certificate"],
+            r"intermediate\s+certificate",
+            r"\b(?:gce|cambridge|edexcel|international)\s+(?:as\s*(?:&|and)\s*)?a[\s'-]{0,2}levels?\b",
+            r"\badvanced\s+(?:subsidiary\s+)?gce\b"],
     "DIPLOMA": [r"\bdiploma\b"],
-    "BACHELOR": [r"\bbachelor", r"\bb\.\s?sc\b|\bbsc\b", r"\bbba\b", r"\bb\.\s?a\.?\s*\(?\s*(?:hons|honours|pass)", r"\bbss\b|\bb\.\s?s\.\s?s\b",
+    # A bare three-letter token ("BSC 0001234" as a serial, "msc"/"mss" as OCR noise) is not a
+    # degree: the short forms only count dotted ("B.Sc") or titled ("BSc in", "BSc (Hons)").
+    "BACHELOR": [r"\bbachelor", r"\bb\.\s?sc\b|\bbsc\s*(?:\(|in\b|hons|engineering)",
+                 r"\bb\.\s?b\.\s?a\b|\bbba\s*(?:\(|in\b|hons)",
+                 r"\bb\.\s?a\.?\s*\(?\s*(?:hons|honours|pass)", r"\bb\.\s?s\.\s?s\b|\bbss\s*(?:\(|in\b|hons)",
                  r"\bb\.?\s?com\b", r"\bhonou?rs\b|\bhons\b", r"\bmbbs\b",
-                 r"\bbds\b", r"\bb\.?\s?pharm", r"\bb\.\s?ed\b", r"\bb\.?\s?tech\b", r"\bdegree\s+pass\b"],
-    "MASTER": [r"\bmaster'?s?\s+(?:of|in|degree)\b", r"\bm\.\s?sc\b|\bmsc\b", r"\bmba\b", r"\bm\.\s?a\b",
-               r"\bmss\b", r"\bm\.\s?com\b", r"\bllm\b"],
+                 r"\bb\.\s?d\.\s?s\b", r"\bb\.?\s?pharm", r"\bb\.\s?ed\b", r"\bb\.?\s?tech\b", r"\bdegree\s+pass\b"],
+    "MASTER": [r"\bmaster'?s?\s+(?:of|in|degree)\b", r"\bm\.\s?sc\b|\bmsc\s*(?:\(|in\b)",
+               r"\bm\.\s?b\.\s?a\b|\bmba\s*(?:\(|in\b)", r"\bm\.\s?a\.?\s*\(?\s*(?:in\b|final|prelim)",
+               r"\bm\.\s?s\.\s?s\b|\bmss\s*(?:\(|in\b)", r"\bm\.\s?com\b"],
 }
+# A degree certificate or transcript often lists the holder's earlier SSC/HSC results, even
+# under their full exam titles.  On a page that names a degree a school qualification therefore
+# never counts: named by its title it only turns a missing one into a FLAG, never a FAIL; named
+# by its short form alone ("HSC GPA 5.00") it is ignored.
+QUALIFICATION_ABBREVIATIONS: Dict[str, str] = {"SSC": r"\bs\.?\s?s\.?\s?c\b", "HSC": r"\bh\.?\s?s\.?\s?c\b"}
+# "...Secondary Certificate" with neither "School" nor "Higher" is the HSC title with "Higher"
+# lost to the scan (5 stored pages) -- or the SSC title with "School" lost.  It counts as the HSC,
+# but when the page shows no sign of the HSC (HSC_SIGNS) it may be the SSC, so a missing SSC
+# is then a FLAG, never a FAIL.
+HSC_UNSURE = r"\bsecondary\s+cer[a-z]{2,}"
+HSC_SIGNS = r"\bcollege\b|\bhigher\b|\bintermediate\b(?!\s*(?:and|&)\s*secondary)"
 # A notary signs as "Adv. <name>, LL.B (Hons), Dhaka Judge Court", and the officer who signs an
-# e-Apostille prints a degree too: a degree abbreviation this close to those words is theirs, not
-# the student's.  For the same reason a bare "LL.B" is not taken as the student's degree (it was
-# the notary's or the signing officer's on every stored page that had it); a law degree still
-# reads by "Bachelor of Laws", and "B. A." only counts as "B.A. (Hons)" / "B.A. Pass" (a bare
-# "B. A." was an exam centre's name).
+# e-Apostille or an attestation stamp prints a degree too: a degree abbreviation this close to
+# those words is theirs, not the student's.  For the same reason a bare "LL.B" is not taken as the
+# student's degree (it was the notary's or the signing officer's on every stored page that had
+# it); a law degree still reads by "Bachelor of Laws", and "B. A." only counts as "B.A. (Hons)" /
+# "B.A. Pass" (a bare "B. A." was an exam centre's name).
 NOTARY_DEGREE = r"\b(?:ll\.?\s?[bm]|[bm]\.\s?a|hons|honou?rs)\b\.?"
-NOTARY_NEAR = r"\badv|advoca|\bnotar|\bcourt\b|bar\s+association|ministry|signing"
+NOTARY_NEAR = (r"\badv|advoca|\bnotar|\bcourt\b|bar\s+association|ministry|signing|attest|"
+               r"\bseal\b|\bstamp|true\s+copy")
 # Matched case-sensitively, so the English "a level" is not read as an A Level.
 QUALIFICATION_WORDS_CASED: Dict[str, List[str]] = {
     "SSC": [r"\bO[\s'-]{0,2}Levels?\b"], "HSC": [r"\bA[\s'-]{0,2}Levels?\b"],
 }
-# A degree transcript often lists the holder's SSC/HSC results.  On a page that names a degree,
-# a school qualification only counts when its full exam title is printed.
-QUALIFICATION_TITLES: Dict[str, List[str]] = {
-    "SSC": [r"secondary\s+school\s+cer[a-z]{2,}\s+exam", r"\bdakhil\s+exam"],
-    "HSC": [r"higher\s+secondary\s+exam", r"higher\s+secondary\s+cer[a-z]{2,}\s+exam", r"\balim\s+exam"],
-    "DIPLOMA": [r"diploma[\s-]+in[\s-]+[a-z]+"],
-}
+# A school board (SSC/HSC, Dakhil/Alim, Diploma) issues no degree: on its page a short degree word
+# is a serial number, OCR noise, a headmaster's signature or an attestation stamp, never the
+# student's degree.  Only a degree written out in full (DEGREE_IN_FULL) still makes it a degree
+# page -- a degree transcript can name the board of its holder's HSC.
+SCHOOL_BOARD = (r"intermediate\s*(?:and|&)\s*secondary|board\s+of\s+(?:intermediate|secondary)|"
+                r"madrasah\s+education|technical\s+education\s+board")
+DEGREE_IN_FULL = r"\bbachelor\b|\bmaster'?s?\s+(?:of|in|degree)\b|\bdegree\s+of\b"
+
 # A page naming no qualification that still carries these words is a certificate or transcript
 # the scan did not let us name, so a missing qualification there is a FLAG, never a FAIL.
 ACADEMIC_PAGE_WORDS = ["examination", "board", "transcript", "gpa", "cgpa", "grade", "result",

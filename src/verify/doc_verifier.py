@@ -583,8 +583,10 @@ def qualification_results(text: str, pages: List[str], program: str, path=None,
     ctx = others if isinstance(others, dict) else {}
     seen = ctx.setdefault("_academic_files", []) if isinstance(others, dict) else []
     name = path.name if path is not None else ""
+    # A file that could not be read page by page is judged on the whole-file read, which may
+    # stop early (the automatic run reads 6 pages): it is never complete enough for a FAIL.
     seen.append({"name": name, "pages": list(pages) or [text or ""], "text": text or "",
-                 "complete": len(pages) < ACADEMIC_MAX_PAGES})
+                 "complete": (bool(pages) or path is None) and len(pages) < ACADEMIC_MAX_PAGES})
     siblings = _academic_siblings(path) if path is not None else []
     if path is not None and len(siblings) > 1 and siblings[-1] != path:
         return [(NOTE, f"the required qualifications are judged together with {siblings[-1].name}")]
@@ -666,6 +668,15 @@ def _bank_markers(text: str) -> Tuple[int, int, int]:
     return sol, stm, len(re.findall(_DATED_ROW, t))
 
 
+def strong_solvency(text: str) -> bool:
+    """A page that is the solvency certificate beyond doubt: at least BANK_LATE_SOLVENCY_MIN
+    solvency markers, one of them a solvency certificate's own (rules.BANK_SOLVENCY_CORE), and
+    no word of "the above statement" (calibrated: every stored later solvency page has 3+)."""
+    t = (text or "").lower()
+    return (_bank_markers(t)[0] >= R.BANK_LATE_SOLVENCY_MIN and bool(re.search(R.BANK_SOLVENCY_CORE, t))
+            and not re.search(R.BANK_STATEMENT_REFERENCE, t))
+
+
 def bank_page_kind(text: str, first: bool = False) -> str:
     """Whether a page of the bank file is the solvency certificate, the statement, or unclear.
 
@@ -675,12 +686,21 @@ def bank_page_kind(text: str, first: bool = False) -> str:
     and a statement page the other way round (rules.BANK_SOLVENCY_MARKERS / _STATEMENT_).
     After page 1, a page with no solvency wording and some statement wording — the last
     page's "end of statement" footer, a short page of rows — is taken as the statement going
-    on; page 1 must be clear."""
+    on; page 1 must be clear.
+
+    A statement's last page can hold nothing but the bank's footer ("Certified that the above
+    statement is correct ... as on ..."), which carries solvency wording.  So after page 1 a
+    page only counts as a solvency certificate on strong evidence (strong_solvency); a weaker
+    one that speaks of "the above statement" is the statement going on, and any other weaker
+    one cannot be told apart (a FLAG, never a FAIL)."""
     sol, stm, rows = _bank_markers(text)
-    if sol >= R.BANK_SOLVENCY_MIN and stm <= 1:
-        return SOLVENCY_PAGE
-    if sol >= R.BANK_SOLVENCY_MIN + 1 and sol > stm + 1 and stm <= 2:
-        return SOLVENCY_PAGE
+    if (sol >= R.BANK_SOLVENCY_MIN and stm <= 1) or \
+            (sol >= R.BANK_SOLVENCY_MIN + 1 and sol > stm + 1 and stm <= 2):
+        if strong_solvency(text):
+            return SOLVENCY_PAGE
+        if re.search(R.BANK_STATEMENT_REFERENCE, (text or "").lower()):
+            return UNCLEAR_PAGE if first else STATEMENT_PAGE
+        return SOLVENCY_PAGE if first else UNCLEAR_PAGE
     if sol <= 1 and (stm >= R.BANK_STATEMENT_MIN or (stm >= 2 and rows >= R.BANK_STATEMENT_ROWS)):
         return STATEMENT_PAGE
     if not first and ((sol <= 1 and stm >= 2) or (sol == 0 and (stm >= 1 or rows >= 3))):
@@ -697,17 +717,20 @@ def _pages_str(nums: List[int]) -> str:
     return "pages " + ", ".join(str(n) for n in nums)
 
 
-_BANK_ORDER = ("the file must start with the solvency certificate, followed by the statement "
-               "(page 2 to the last page)")
+# Kept short: the Telegram line shows a FAIL's first 160 characters, document title included.
+_BANK_ORDER = "the solvency certificate must be page 1, then the statement"
+BANK_MAX_PAGES = 10           # check_bank reads this many pages of the bank file
 
 
-def bank_order(pages: List[str]) -> Tuple[Tuple[str, str], List[str]]:
+def bank_order(pages: List[str], cut: bool = False) -> Tuple[Tuple[str, str], List[str]]:
     """The owner's rule for the bank file: page 1 is the solvency certificate and page 2 to the
     last page are the statement.  Returns the result and each page's kind.
 
     FAIL only when the order is clearly wrong: page 1 is clearly a statement page, or a
     solvency certificate sits after statement pages.  A page that cannot be told apart makes
-    it a FLAG for a look by eye, never a FAIL."""
+    it a FLAG for a look by eye, never a FAIL.  A file that holds two (or more) complete sets —
+    solvency certificate, then its statement — is a FLAG until the owner says whether two
+    accounts in one file are acceptable.  `cut` says the page limit was reached."""
     kinds = [bank_page_kind(p, first=(i == 0)) for i, p in enumerate(pages)]
     sol = [i + 1 for i, k in enumerate(kinds) if k == SOLVENCY_PAGE]
     stm = [i + 1 for i, k in enumerate(kinds) if k == STATEMENT_PAGE]
@@ -719,8 +742,13 @@ def bank_order(pages: List[str]) -> Tuple[Tuple[str, str], List[str]]:
     if kinds[0] == STATEMENT_PAGE:
         where = (f"the solvency certificate is on {_pages_str(sol)}" if sol
                  else "no page reads as the solvency certificate")
-        return (FAIL, f"page 1 is the bank statement, {where} — {_BANK_ORDER}"), kinds
+        return (FAIL, f"page 1 is the statement, {where} — {_BANK_ORDER}"), kinds
     late = [n for n in sol if clear_stm and n > clear_stm[0]]
+    code = "".join({SOLVENCY_PAGE: "S", STATEMENT_PAGE: "T"}.get(k, "U") for k in kinds)
+    if late and re.fullmatch(r"(?:S[TU]+){2,}", code):
+        return (FLAG, f"the file holds {len(sol)} sets of solvency certificate + statement "
+                      f"(solvency certificates on {_pages_str(sol)}) — check by eye: "
+                      f"{_BANK_ORDER}"), kinds
     if late:
         before = [n for n in clear_stm if n < late[0]]
         return (FAIL, f"a solvency certificate is on {_pages_str(late)}, after the statement on "
@@ -730,8 +758,9 @@ def bank_order(pages: List[str]) -> Tuple[Tuple[str, str], List[str]]:
         return (FLAG, f"page 1 could not be told apart as the solvency certificate or the "
                       f"statement{seen} — check the order by eye: {_BANK_ORDER}"), kinds
     if not unclear and len(sol) == 1:
+        more = f" (only the first {len(pages)} pages were read)" if cut else ""
         return (PASS, f"page 1 is the solvency certificate and {_pages_str(stm)} "
-                      f"{'is' if len(stm) == 1 else 'are'} the statement"), kinds
+                      f"{'is' if len(stm) == 1 else 'are'} the statement{more}"), kinds
     odd = []
     if len(sol) > 1:
         odd.append(f"{_pages_str(sol[1:])} also {'reads' if len(sol) == 2 else 'read'} as a "
@@ -856,11 +885,14 @@ def check_bank(text: str, student, sizes, program: str, path=None, others=None) 
     pages: List[str] = []
     if path is not None:
         try:
-            pages = read_pages(path, max_pages=10)
+            pages = read_pages(path, max_pages=BANK_MAX_PAGES)
         except Exception as e:
             logger.warning("could not read %s page by page: %s", path.name, e)
+    if path is not None and not pages:
+        out.append((FLAG, f"the bank file could not be read page by page — check the order by "
+                          f"eye: {_BANK_ORDER}"))
     if len(pages) >= 2:
-        order, kinds = bank_order(pages)
+        order, kinds = bank_order(pages, cut=len(pages) >= BANK_MAX_PAGES)
         out.append(order)
         sol_at = next((i for i, k in enumerate(kinds) if k == SOLVENCY_PAGE), None)
         if sol_at is None and kinds[0] != STATEMENT_PAGE:
