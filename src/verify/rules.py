@@ -132,3 +132,91 @@ TITLES = {
     "personal_statement": "Personal Statement / Study Plan", "recommendation": "Recommendation Letter",
     "eca": "Extra Curricular (ECA)", "language_cert": "IELTS / TOPIK Certificate",
 }
+
+# --- Document 08: the order of the bank file -----------------------------------------
+# Owner's rule: page 1 is the bank solvency certificate, pages 2 to the last are the statement.
+# Each page is told apart by the wording it carries (regular expressions, lower-cased text).
+# A solvency certificate can say "deposit" and "balance", and a statement page can carry the
+# bank's "certify" footer, so neither single word decides: a page is a solvency certificate
+# when it carries at least BANK_SOLVENCY_MIN of the solvency markers and (almost) none of the
+# statement markers, and a statement page the other way round.  Calibrated on 162 stored bank
+# files (420 pages): no page read as both.
+BANK_SOLVENCY_MARKERS = [
+    r"solvency", r"to whom it may concern", r"certif(?:y|ied) that", r"maintaining",
+    r"\busd\b|us\s*dollar", r"equivalent", r"\bas on\b", r"in words",
+    r"good (?:standing|reputation)", r"satisfactor",
+]
+BANK_STATEMENT_MARKERS = [
+    r"statement of account|account statement|statement period|statement date|\bstatement\b",
+    r"\bdebit\b|\bdr\.?\b|withdrawal", r"\bcredit\b|\bcr\.?\b|deposit", r"transaction",
+    r"particulars", r"cheque|chq", r"narration|description",
+    r"value date|txn date|tran(?:saction)? date",
+    r"opening balance|closing balance|brought forward|balance b/?f",
+    r"\bpage\s*\d+\s*(?:of|/)\s*\d+",
+]
+BANK_SOLVENCY_MIN = 2          # solvency markers a solvency-certificate page carries at least
+BANK_STATEMENT_MIN = 3         # statement markers a statement page carries at least
+BANK_STATEMENT_ROWS = 5        # dated rows that, with 2 markers, also make a statement page
+
+# --- Document 07: the qualifications each program's academic file must contain -------
+# Each entry is a list of alternatives: ("HSC", "DIPLOMA") is an HSC or, instead, a Diploma.
+REQUIRED_QUALIFICATIONS: Dict[str, List[tuple]] = {
+    "KLP": [("SSC",), ("HSC", "DIPLOMA")],
+    "EAP": [("SSC",), ("HSC", "DIPLOMA")],
+    "BACHELOR": [("SSC",), ("HSC", "DIPLOMA")],
+    "MASTER": [("SSC",), ("HSC", "DIPLOMA"), ("BACHELOR",)],
+}
+QUALIFICATION_NAMES = {"SSC": "SSC", "HSC": "HSC", "DIPLOMA": "Diploma",
+                       "BACHELOR": "Bachelor's degree", "MASTER": "Master's degree"}
+# How each qualification (or its equivalent) is named on the page, matched on whole words in
+# lower-cased text.  "Higher Secondary (School) Certificate" is folded to "higher secondary"
+# first, and "Junior School/Dakhil Certificate" removed, so neither reads as an SSC.  An SSC
+# certificate says "Secondary SCHOOL Certificate"; "...secondary certificate" without
+# "school" is the HSC title with "Higher" lost to the scan (seen 5 times in the stored text).
+QUALIFICATION_WORDS: Dict[str, List[str]] = {
+    "SSC": [r"secondary\s+school\s+(?:\S{1,15}\s+)?(?:cer[a-z]{2,}|exam)", r"\bschool\s+cer[a-z]{2,}\s+exam",
+            r"certificate\s+of\s+secondary\s+education",
+            r"\bs\.?\s?s\.?\s?c\b", r"\bdakhil\b", r"ordinary\s+level", r"\bi?gcse\b"],
+    "HSC": [r"higher\s+secondary", r"\bsecondary\s+cer[a-z]{2,}", r"\bh\.?\s?s\.?\s?c\b",
+            r"\balim\s+(?:exam|certif|transcript|result|\()", r"advanced\s+level",
+            r"intermediate\s+certificate"],
+    "DIPLOMA": [r"\bdiploma\b"],
+    "BACHELOR": [r"\bbachelor", r"\bb\.\s?sc\b|\bbsc\b", r"\bbba\b", r"\bb\.\s?a\.?\s*\(?\s*(?:hons|honours|pass)", r"\bbss\b|\bb\.\s?s\.\s?s\b",
+                 r"\bb\.?\s?com\b", r"\bhonou?rs\b|\bhons\b", r"\bmbbs\b",
+                 r"\bbds\b", r"\bb\.?\s?pharm", r"\bb\.\s?ed\b", r"\bb\.?\s?tech\b", r"\bdegree\s+pass\b"],
+    "MASTER": [r"\bmaster'?s?\s+(?:of|in|degree)\b", r"\bm\.\s?sc\b|\bmsc\b", r"\bmba\b", r"\bm\.\s?a\b",
+               r"\bmss\b", r"\bm\.\s?com\b", r"\bllm\b"],
+}
+# A notary signs as "Adv. <name>, LL.B (Hons), Dhaka Judge Court", and the officer who signs an
+# e-Apostille prints a degree too: a degree abbreviation this close to those words is theirs, not
+# the student's.  For the same reason a bare "LL.B" is not taken as the student's degree (it was
+# the notary's or the signing officer's on every stored page that had it); a law degree still
+# reads by "Bachelor of Laws", and "B. A." only counts as "B.A. (Hons)" / "B.A. Pass" (a bare
+# "B. A." was an exam centre's name).
+NOTARY_DEGREE = r"\b(?:ll\.?\s?[bm]|[bm]\.\s?a|hons|honou?rs)\b\.?"
+NOTARY_NEAR = r"\badv|advoca|\bnotar|\bcourt\b|bar\s+association|ministry|signing"
+# Matched case-sensitively, so the English "a level" is not read as an A Level.
+QUALIFICATION_WORDS_CASED: Dict[str, List[str]] = {
+    "SSC": [r"\bO[\s'-]{0,2}Levels?\b"], "HSC": [r"\bA[\s'-]{0,2}Levels?\b"],
+}
+# A degree transcript often lists the holder's SSC/HSC results.  On a page that names a degree,
+# a school qualification only counts when its full exam title is printed.
+QUALIFICATION_TITLES: Dict[str, List[str]] = {
+    "SSC": [r"secondary\s+school\s+cer[a-z]{2,}\s+exam", r"\bdakhil\s+exam"],
+    "HSC": [r"higher\s+secondary\s+exam", r"higher\s+secondary\s+cer[a-z]{2,}\s+exam", r"\balim\s+exam"],
+    "DIPLOMA": [r"diploma[\s-]+in[\s-]+[a-z]+"],
+}
+# A page naming no qualification that still carries these words is a certificate or transcript
+# the scan did not let us name, so a missing qualification there is a FLAG, never a FAIL.
+ACADEMIC_PAGE_WORDS = ["examination", "board", "transcript", "gpa", "cgpa", "grade", "result",
+                       "university", "college", "school", "semester", "marks", "subject", "roll",
+                       "registration", "passed", "academic", "degree"]
+# A page reads well enough to judge when it is this long and carries this many plain English words.
+ACADEMIC_MIN_PAGE_CHARS = 150
+ACADEMIC_MIN_ENGLISH_WORDS = 4
+ACADEMIC_ENGLISH_WORDS = {"the", "and", "of", "this", "that", "is", "to", "in", "has", "his", "her", "date",
+                          "name", "father", "mother", "board", "examination", "education", "university",
+                          "bangladesh", "roll", "registration", "gpa", "grade", "result", "subject", "year",
+                          "school", "college", "passed", "issued", "student", "group", "science",
+                          "certificate", "certify", "transcript", "apostille", "document", "signature",
+                          "seal", "held"}

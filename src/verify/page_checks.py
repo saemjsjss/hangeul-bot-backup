@@ -450,3 +450,116 @@ def academic_check(path: Path, pages_text: List[str]) -> List[tuple]:
             out.append(("PASS", f"e-Apostille on page {start + 1} is followed by {found} "
                                 f"certificate/transcript (page {where})"))
     return out
+
+
+# --- academic documents: the qualifications each program requires ----------------------
+def _fold_titles(text: str) -> str:
+    """Lower-case, with the wordings that would be misread as another level taken out:
+    "Higher Secondary (School) Certificate" contains "Secondary ... Certificate", and the
+    Junior School / Junior Dakhil Certificate is not an SSC."""
+    t = (text or "").lower()
+    t = re.sub(r"higher\s+secondary\s+(?:school\s+)?certificate", " higher secondary ", t)
+    t = re.sub(r"junior\s+(?:school|dakhil)\s+certificate|\bj\.?\s?s\.?\s?c\b|\bj\.?\s?d\.?\s?c\b", " ", t)
+    # The notary's own degrees ("Adv. ..., LL.B (Hons), Dhaka Judge Court") are on most pages.
+    return re.sub(R.NOTARY_DEGREE, lambda m: " " if re.search(
+        R.NOTARY_NEAR, t[max(0, m.start() - 70):m.end() + 70]) else m.group(0), t)
+
+
+def qualifications_on(text: str) -> set:
+    """Every qualification a page names (SSC, HSC, DIPLOMA, BACHELOR, MASTER), on whole words.
+
+    A degree transcript can list its holder's SSC and HSC results, so on a page that names a
+    degree a school qualification only counts when its full exam title is printed there."""
+    t = _fold_titles(text)
+    found = {q for q, pats in R.QUALIFICATION_WORDS.items() if any(re.search(p, t) for p in pats)}
+    found |= {q for q, pats in R.QUALIFICATION_WORDS_CASED.items()
+              if any(re.search(p, text or "") for p in pats)}
+    if found & {"BACHELOR", "MASTER"}:
+        found = {q for q in found if q in ("BACHELOR", "MASTER")
+                 or any(re.search(p, t) for p in R.QUALIFICATION_TITLES.get(q, []))}
+    return found
+
+
+def academic_page_readable(text: str) -> bool:
+    """Whether a page read well enough to say what is (or is not) on it."""
+    t = (text or "").lower()
+    if len(t.strip()) < R.ACADEMIC_MIN_PAGE_CHARS:
+        return False
+    words = set(re.findall(r"[a-z]+", t))
+    return len(words & R.ACADEMIC_ENGLISH_WORDS) >= R.ACADEMIC_MIN_ENGLISH_WORDS
+
+
+def _page_list(nums: List[str]) -> str:
+    return ("page " if len(nums) == 1 else "pages ") + ", ".join(nums)
+
+
+def qualification_check(program: str, pages: List[tuple], extra_text: str = "",
+                        complete: bool = True) -> List[tuple]:
+    """The academic file must hold every qualification its program requires
+    (rules.REQUIRED_QUALIFICATIONS): SSC and HSC (or a Diploma) for all, plus a Bachelor's
+    degree for a Master's applicant.
+
+    `pages` is [(label, text)] — label is the page number staff see.  `extra_text` is the
+    whole-file read, used only as more evidence that a qualification is there.  `complete`
+    is False when not every page could be read (the page limit was reached).
+
+    FAIL only when the file read well and the qualification is clearly absent: every page that
+    names no qualification is an e-Apostille or a readable page that is not a certificate or
+    transcript.  Otherwise a FLAG asks for a look by eye."""
+    need = R.REQUIRED_QUALIFICATIONS.get((program or "").upper())
+    if not need:
+        return []
+    where: Dict[str, List[str]] = {}
+    poor, unnamed = [], []
+    for label, text in pages:
+        found = qualifications_on(text)
+        for q in found:
+            where.setdefault(q, []).append(str(label))
+        if found:
+            continue
+        low = (text or "").lower()
+        if re.search(r"apostille", low):
+            continue
+        if not academic_page_readable(text):
+            poor.append(str(label))
+        elif any(re.search(r"\b" + w, low) for w in R.ACADEMIC_PAGE_WORDS):
+            unnamed.append(str(label))
+    for q in qualifications_on(extra_text):
+        where.setdefault(q, [])
+
+    names = R.QUALIFICATION_NAMES
+    wanted = " and ".join(names[a[0]] + (f" (or a {names[a[1]]})" if len(a) > 1 else "")
+                          for a in need)
+    out: List[tuple] = []
+    have = [a for a in need if any(q in where for q in a)]
+    if have:
+        bits = []
+        for alts in have:
+            q = next(q for q in alts if q in where)
+            bits.append(names[q] + (f" ({_page_list(where[q])})" if where[q] else ""))
+        if len(have) == len(need):
+            out.append(("PASS", f"academic file contains {', '.join(bits)} — all that "
+                                f"{program.upper()} requires"))
+        else:
+            out.append(("PASS", "academic file contains " + ", ".join(bits)))
+    why = []
+    if poor:
+        why.append(f"{_page_list(poor)} could not be read")
+    if unnamed:
+        why.append(f"{_page_list(unnamed)} could not be named as a qualification")
+    if not complete:
+        why.append("not every page was read")
+    if not pages and not extra_text.strip():
+        why.append("no text could be read from the file")
+    for alts in need:
+        if any(q in where for q in alts):
+            continue
+        label = " or ".join(names[q] for q in alts)
+        if why:
+            out.append(("FLAG", f"could not confirm {label} in the academic file "
+                                f"({'; '.join(why)}) — check by eye ({program.upper()} requires "
+                                f"{wanted})"))
+        else:
+            out.append(("FAIL", f"academic file has no {label} — {program.upper()} requires "
+                                f"{wanted}"))
+    return out

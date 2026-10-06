@@ -561,14 +561,52 @@ def check_family_cert(text: str, student, sizes, path=None) -> List[Tuple[str, s
     return out
 
 
-def check_academic(text: str, student, sizes, path=None, others=None) -> List[Tuple[str, str]]:
+ACADEMIC_MAX_PAGES = 20       # read_pages' default: a file this long may hold more pages
+
+
+def _academic_siblings(path: Path) -> List[Path]:
+    """The student's academic files in the order verify_student checks them."""
+    try:
+        return [f for f in sorted(path.parent.iterdir())
+                if f.is_file() and not f.name.startswith(".") and classify(f.name) == "academic"]
+    except OSError:
+        return [path]
+
+
+def qualification_results(text: str, pages: List[str], program: str, path=None,
+                          others=None) -> List[Tuple[str, str]]:
+    """The program's required qualifications (rules.REQUIRED_QUALIFICATIONS), judged over every
+    academic file the student uploaded: the result is given with the last of them, and an
+    earlier one only says so."""
+    if not R.REQUIRED_QUALIFICATIONS.get((program or "").upper()):
+        return []
+    ctx = others if isinstance(others, dict) else {}
+    seen = ctx.setdefault("_academic_files", []) if isinstance(others, dict) else []
+    name = path.name if path is not None else ""
+    seen.append({"name": name, "pages": list(pages) or [text or ""], "text": text or "",
+                 "complete": len(pages) < ACADEMIC_MAX_PAGES})
+    siblings = _academic_siblings(path) if path is not None else []
+    if path is not None and len(siblings) > 1 and siblings[-1] != path:
+        return [(NOTE, f"the required qualifications are judged together with {siblings[-1].name}")]
+    many = len(seen) > 1
+    labelled = [((f"{f['name']} p{i}" if many else str(i)), t)
+                for f in seen for i, t in enumerate(f["pages"], 1)]
+    return PC.qualification_check(program, labelled,
+                                  extra_text="\n".join(f["text"] for f in seen),
+                                  complete=all(f["complete"] for f in seen))
+
+
+def check_academic(text: str, student, sizes, path=None, others=None,
+                   program: str = "") -> List[Tuple[str, str]]:
     out = []
+    pages: List[str] = []
     # The apostille QR is mandatory here, and each apostille must be followed by the
     # certificate and transcript for the qualification it covers.
     if path is not None:
         try:
             sideways: List[int] = []
-            out += PC.academic_check(path, read_pages(path, sideways=sideways))
+            pages = read_pages(path, sideways=sideways)
+            out += PC.academic_check(path, pages)
             if sideways:
                 out.append((NOTE, "page(s) " + ", ".join(str(n) for n in sideways) +
                                   " are scanned sideways — they were turned upright to be read, "
@@ -600,6 +638,8 @@ def check_academic(text: str, student, sizes, path=None, others=None) -> List[Tu
             out.append((PASS, f"{label} GPA {gpa} matches the portal")
                        if (gpa in text or g in text)
                        else (FLAG, f"portal {label} GPA {gpa} not found in the certificate text"))
+    # Document 07: the qualifications the program requires must all be in the file.
+    out += qualification_results(text, pages, program, path, others)
     return out
 
 
@@ -612,6 +652,94 @@ def looks_like_statement(text: str) -> bool:
     hits = sum(w in t for w in ("statement", "debit", "credit", "withdrawal", "deposit",
                                 "transaction", "balance b/f", "closing balance"))
     return hits >= 2
+
+
+SOLVENCY_PAGE, STATEMENT_PAGE, UNCLEAR_PAGE = "solvency", "statement", "unclear"
+_DATED_ROW = r"\d{1,2}[./-](?:\d{1,2}|[a-z]{3})[./-]\d{2,4}"
+
+
+def _bank_markers(text: str) -> Tuple[int, int, int]:
+    """(solvency markers, statement markers, dated rows) on one page."""
+    t = (text or "").lower()
+    sol = sum(1 for p in R.BANK_SOLVENCY_MARKERS if re.search(p, t))
+    stm = sum(1 for p in R.BANK_STATEMENT_MARKERS if re.search(p, t))
+    return sol, stm, len(re.findall(_DATED_ROW, t))
+
+
+def bank_page_kind(text: str, first: bool = False) -> str:
+    """Whether a page of the bank file is the solvency certificate, the statement, or unclear.
+
+    Neither kind is decided by one word: a solvency certificate says "deposit" and "balance",
+    and a statement page can carry the bank's "certify" footer.  A page is the solvency
+    certificate when it carries several solvency markers and (almost) no statement markers,
+    and a statement page the other way round (rules.BANK_SOLVENCY_MARKERS / _STATEMENT_).
+    After page 1, a page with no solvency wording and some statement wording — the last
+    page's "end of statement" footer, a short page of rows — is taken as the statement going
+    on; page 1 must be clear."""
+    sol, stm, rows = _bank_markers(text)
+    if sol >= R.BANK_SOLVENCY_MIN and stm <= 1:
+        return SOLVENCY_PAGE
+    if sol >= R.BANK_SOLVENCY_MIN + 1 and sol > stm + 1 and stm <= 2:
+        return SOLVENCY_PAGE
+    if sol <= 1 and (stm >= R.BANK_STATEMENT_MIN or (stm >= 2 and rows >= R.BANK_STATEMENT_ROWS)):
+        return STATEMENT_PAGE
+    if not first and ((sol <= 1 and stm >= 2) or (sol == 0 and (stm >= 1 or rows >= 3))):
+        return STATEMENT_PAGE
+    return UNCLEAR_PAGE
+
+
+def _pages_str(nums: List[int]) -> str:
+    """[2, 3, 4] -> 'pages 2-4', [2, 5] -> 'pages 2, 5', [3] -> 'page 3'."""
+    if len(nums) == 1:
+        return f"page {nums[0]}"
+    if nums == list(range(nums[0], nums[-1] + 1)):
+        return f"pages {nums[0]}-{nums[-1]}"
+    return "pages " + ", ".join(str(n) for n in nums)
+
+
+_BANK_ORDER = ("the file must start with the solvency certificate, followed by the statement "
+               "(page 2 to the last page)")
+
+
+def bank_order(pages: List[str]) -> Tuple[Tuple[str, str], List[str]]:
+    """The owner's rule for the bank file: page 1 is the solvency certificate and page 2 to the
+    last page are the statement.  Returns the result and each page's kind.
+
+    FAIL only when the order is clearly wrong: page 1 is clearly a statement page, or a
+    solvency certificate sits after statement pages.  A page that cannot be told apart makes
+    it a FLAG for a look by eye, never a FAIL."""
+    kinds = [bank_page_kind(p, first=(i == 0)) for i, p in enumerate(pages)]
+    sol = [i + 1 for i, k in enumerate(kinds) if k == SOLVENCY_PAGE]
+    stm = [i + 1 for i, k in enumerate(kinds) if k == STATEMENT_PAGE]
+    unclear = [i + 1 for i, k in enumerate(kinds) if k == UNCLEAR_PAGE]
+    # Only a page that is clearly a statement (not one taken as the statement going on) can
+    # put a later solvency certificate in the wrong place.
+    clear_stm = [i + 1 for i, p in enumerate(pages)
+                 if kinds[i] == STATEMENT_PAGE and bank_page_kind(p, first=True) == STATEMENT_PAGE]
+    if kinds[0] == STATEMENT_PAGE:
+        where = (f"the solvency certificate is on {_pages_str(sol)}" if sol
+                 else "no page reads as the solvency certificate")
+        return (FAIL, f"page 1 is the bank statement, {where} — {_BANK_ORDER}"), kinds
+    late = [n for n in sol if clear_stm and n > clear_stm[0]]
+    if late:
+        before = [n for n in clear_stm if n < late[0]]
+        return (FAIL, f"a solvency certificate is on {_pages_str(late)}, after the statement on "
+                      f"{_pages_str(before)} — {_BANK_ORDER}"), kinds
+    if kinds[0] == UNCLEAR_PAGE:
+        seen = f" (the solvency certificate reads on {_pages_str(sol)})" if sol else ""
+        return (FLAG, f"page 1 could not be told apart as the solvency certificate or the "
+                      f"statement{seen} — check the order by eye: {_BANK_ORDER}"), kinds
+    if not unclear and len(sol) == 1:
+        return (PASS, f"page 1 is the solvency certificate and {_pages_str(stm)} "
+                      f"{'is' if len(stm) == 1 else 'are'} the statement"), kinds
+    odd = []
+    if len(sol) > 1:
+        odd.append(f"{_pages_str(sol[1:])} also {'reads' if len(sol) == 2 else 'read'} as a "
+                   "solvency certificate")
+    if unclear:
+        odd.append(f"{_pages_str(unclear)} could not be told apart")
+    return (FLAG, f"page 1 is the solvency certificate, but {' and '.join(odd)} — check the order "
+                  f"by eye: {_BANK_ORDER}"), kinds
 
 
 def document_date(text: str) -> Optional[dt.date]:
@@ -722,9 +850,9 @@ def check_bank(text: str, student, sizes, program: str, path=None, others=None) 
     who = {"FATHER": student.get("Father", ""), "MOTHER": student.get("Mother", "")}.get(sponsor, "")
     holder = who or student.get("Full Name", "")
 
-    # The file always has the solvency certificate on page 1 and the statement from
-    # page 2 onwards, so the two dates can be read from their own pages rather than
-    # guessed out of one merged block of text.
+    # Owner's rule: page 1 is the solvency certificate and page 2 to the last page are the
+    # statement.  Each page is told apart by its wording, so the order is checked rather than
+    # assumed, and the two dates are read from the pages that really are each document.
     pages: List[str] = []
     if path is not None:
         try:
@@ -732,8 +860,15 @@ def check_bank(text: str, student, sizes, program: str, path=None, others=None) 
         except Exception as e:
             logger.warning("could not read %s page by page: %s", path.name, e)
     if len(pages) >= 2:
-        sol = document_date(pages[0])
-        stm = statement_date(pages[1:])
+        order, kinds = bank_order(pages)
+        out.append(order)
+        sol_at = next((i for i, k in enumerate(kinds) if k == SOLVENCY_PAGE), None)
+        if sol_at is None and kinds[0] != STATEMENT_PAGE:
+            sol_at = 0                    # nothing reads as one: page 1, where it belongs
+        stm_pages = [p for p, k in zip(pages, kinds) if k == STATEMENT_PAGE] or \
+            [p for i, p in enumerate(pages) if i != sol_at and kinds[i] != SOLVENCY_PAGE]
+        sol = document_date(pages[sol_at]) if sol_at is not None else None
+        stm = statement_date(stm_pages)
         # FLAG, not FAIL: this rule produced false failures (HANDOFF §5.1) and its rewritten
         # date logic has not yet been proven against real statements (HANDOFF §8.1).
         if sol and stm:
@@ -918,7 +1053,7 @@ CHECKS = {
     "mother_nid": lambda t, s, z, p, prog, path: check_nid(t, s, z, "mother", path, p),
     "student_nid": lambda t, s, z, p, prog, path: check_nid(t, s, z, "student", path, p),
     "family_cert": lambda t, s, z, p, prog, path: check_family_cert(t, s, z, path),
-    "academic": lambda t, s, z, p, prog, path: check_academic(t, s, z, path, p),
+    "academic": lambda t, s, z, p, prog, path: check_academic(t, s, z, path, p, prog),
     "bank": lambda t, s, z, p, prog, path: check_bank(t, s, z, prog, path, p),
     "trade_license": lambda t, s, z, p, prog, path: check_financial(t, s, z, path, p),
     "income_tax": lambda t, s, z, p, prog, path: check_income_tax(t, s, z, prog, path),
