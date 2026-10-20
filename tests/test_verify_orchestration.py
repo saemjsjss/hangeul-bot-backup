@@ -46,7 +46,7 @@ from src.verify import doc_verifier as dv  # noqa: E402
 from src.verify import field_check as fc  # noqa: E402
 from src.verify import page_checks as PC  # noqa: E402
 from src.verify import text_cache as tc  # noqa: E402
-from verify_fixtures import PASSPORTS, make_pdf  # noqa: E402
+from verify_fixtures import FILLER, PASSPORTS, make_pdf  # noqa: E402
 from verify_fixtures import student as make_student  # noqa: E402
 
 P1, P2, P3, P4, P5 = PASSPORTS[:5]
@@ -796,6 +796,35 @@ def test_uninstall_puts_the_real_readers_back(readers):
     av.save_text_cache(inner)
     av.save_text_cache(h)
     assert (dv.read_document, fc.read_document, dv.read_pages, PC.inspect, PC.seal_present, PC.page_codes) == before
+
+
+def test_the_real_readers_and_page_checks_go_through_the_caches(tmp_path, monkeypatch):
+    """doc_verifier's and page_checks' own functions (no fakes) behind the caches. Every page
+    carries a text layer, so nothing is OCR'd."""
+    def no_ocr():
+        raise AssertionError("OCR must not start in this test")
+
+    monkeypatch.setattr(dv, "_ocr_reader", no_ocr)
+    f = make_pdf(tmp_path / "ACADEMIC CERTIFICATE.pdf", [FILLER + " page one", FILLER + " page two"])
+    h = av.install_text_cache(P1)
+    try:
+        text, sizes = dv.read_document(f)
+        assert "page one" in text and "page two" in text and sizes == [(595, 842), (595, 842)]
+        assert [("page two" in p) for p in dv.read_pages(f, max_pages=8)] == [False, True]
+        info = PC.inspect(f)
+        assert info["pages"] == 2 and info["saturation"] is not None
+        assert PC.page_codes(f) == [[], []]
+        assert PC.seal_present(f) is False
+    finally:
+        av.save_text_cache(h)
+    h = av.install_text_cache(P1, cache_only=True)
+    try:
+        assert dv.read_document(f) == (text, sizes) and fc.read_document(f) == (text, sizes)
+        assert PC.inspect(f) == info and h.misses == [] and h.fresh == []
+    finally:
+        av.save_text_cache(h)
+    images = json.loads((av.IMAGES_DIR / f"{P1}.json").read_text(encoding="utf-8"))
+    assert sorted(k.split(":")[0] for k in images) == ["inspect", "page_codes", "seal_present"]
 
 
 def test_engine_info_says_what_read_the_files(monkeypatch):
