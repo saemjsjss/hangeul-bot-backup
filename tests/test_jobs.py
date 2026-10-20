@@ -5,7 +5,9 @@
       grouped under Telegram's limit, and marked sent only once Telegram accepted it
   portal sync (src/sheets/auto_sync.py, every 15 min)    a student whose row key changed (an ID
       given, a passport number filled in) is "edited", never "new + removed"; the document-check
-      message under its own title; first downloads apart from re-downloads (verified_docs.py)
+      message under its own title; first downloads apart from re-downloads, and a changed document
+      replaces the old copy, kept in _replaced (verified_docs.py; the rest of it in
+      tests/test_verified_docs_replace.py)
   /stage (src/sheets/stage_report.py)       the stage from the student list, not the CSV export
   /missing (src/sheets/missing_report.py)   university fields read from the portal where the
       sheet has no such columns, "not checked" when that record is missing
@@ -404,28 +406,14 @@ def http(monkeypatch):
 
 
 def test_the_document_check_message_carries_its_own_title(http):
-    auto_sync.notify(["🔍 Documents checked: 1", "• PODDAR MD SAGOR (EAP) — FAIL"], title="🔍 Document check")
+    auto_sync.notify(["🔍 Documents checked: 1", "• SAMPLE STUDENT ONE (EAP) — FAIL"], title="🔍 Document check")
     assert [p["data"]["text"] for p in http.posts] == [
-        "🔍 Document check\n\n🔍 Documents checked: 1\n• PODDAR MD SAGOR (EAP) — FAIL"]
+        "🔍 Document check\n\n🔍 Documents checked: 1\n• SAMPLE STUDENT ONE (EAP) — FAIL"]
     assert "Portal sync" not in http.posts[0]["data"]["text"]
 
 
-def test_a_failed_document_check_says_which_rule_failed():
-    from src.verify import auto_verify
-    rows = [{"doc": "Passport", "file": "p.jpg", "verdict": "PASS", "detail": "PASS: readable"},
-            {"doc": "HSC certificate", "file": "h.pdf", "verdict": "FAIL",
-             "detail": "PASS: readable | FAIL: GPA 4.50 differs from the portal's 5.00 | FLAG: faint stamp"}]
-    result = {"checked": [{"student": "PODDAR MD SAGOR", "passport": "A01234567", "program": "EAP",
-                           "verdict": "FAIL", "differs": 0, "corrected": 0},
-                          {"student": "NO BANK", "passport": "B01234567", "program": "KLP",
-                           "verdict": "INCOMPLETE", "differs": 0, "corrected": 0}],
-              "store": {"documents": {"A01234567": {"rows": rows}, "B01234567": {"rows": [
-                  {"doc": "Bank certificate", "file": "", "verdict": "MISSING",
-                   "detail": "required by the guideline but not uploaded"}]}}}}
-    lines = auto_verify.summary_lines(result)
-    assert lines[1] == ("   • PODDAR MD SAGOR (EAP) — FAIL (HSC certificate: GPA 4.50 differs from "
-                        "the portal's 5.00)")
-    assert lines[2] == "   • NO BANK (KLP) — INCOMPLETE (Bank certificate: required by the guideline but not uploaded)"
+# (The document check's own summary lines are tested with the check itself:
+# tests/test_verify_orchestration.py.)
 
 
 def test_a_long_sync_summary_is_split_between_lines(http):
@@ -437,35 +425,50 @@ def test_a_long_sync_summary_is_split_between_lines(http):
     assert "\n".join(texts).split("\n")[2:] == lines                # no line cut in two
 
 
-def test_redownloads_are_not_newly_verified_and_empty_ones_are_dropped():
-    result = {"saved": [("KOREAN LANGUAGE PROGRAM (KLP)", "NEW STUDENT (A01234567)", 5, [])],
-              "redownloaded": [("KOREAN LANGUAGE PROGRAM (KLP)", "MD TANJIL BASHAR (B01234567)", 0, []),
-                               ("EAP (ENGLISH FOR ACADEMIC PURPOSE)", "BANU NAZNIN (C01234567)", 1, [])],
+KLP_DIR, EAP_DIR = "KOREAN LANGUAGE PROGRAM (KLP)", "EAP (ENGLISH FOR ACADEMIC PURPOSE)"
+
+
+def test_redownloads_are_not_newly_verified_and_every_one_is_listed():
+    result = {"saved": [(KLP_DIR, "SAMPLE STUDENT ONE (A99900001)", 5, [], 0)],
+              "redownloaded": [(KLP_DIR, "SAMPLE STUDENT TWO (A99900002)", 0, [], 0),
+                               (EAP_DIR, "SAMPLE STUDENT THREE (A99900003)", 1, [], 2)],
               "failed": []}
     assert auto_sync.doc_lines(result) == [
         "📁 1 newly verified student(s) — documents saved:",
-        "   • NEW STUDENT (A01234567) — KOREAN LANGUAGE PROGRAM (KLP), 5 file(s)",
-        "📁 1 student(s) changed their documents on the portal — new files saved:",
-        "   • BANU NAZNIN (C01234567) — EAP (ENGLISH FOR ACADEMIC PURPOSE), 1 new file(s)"]
-    assert auto_sync.doc_lines({"saved": [], "redownloaded": [("KLP", "X", 0, [])], "failed": []}) == []
+        "   • SAMPLE STUDENT ONE (A99900001) — KOREAN LANGUAGE PROGRAM (KLP), 5 file(s)",
+        "📁 2 student(s) changed their documents on the portal:",
+        "   • SAMPLE STUDENT TWO (A99900002) — KOREAN LANGUAGE PROGRAM (KLP), re-downloaded: every file is the "
+        "same as before (no document replaced)",
+        "   • SAMPLE STUDENT THREE (A99900003) — EAP (ENGLISH FOR ACADEMIC PURPOSE), 2 document(s) replaced "
+        "(old copies kept in _replaced), 1 new file(s)"]
+    # the 4-item tuples of the code before replaced documents were kept: nothing replaced
+    assert auto_sync.doc_lines({"saved": [], "redownloaded": [("KLP", "SAMPLE STUDENT FOUR (A99900004)", 1, [])],
+                                "failed": []}) == [
+        "📁 1 student(s) changed their documents on the portal:",
+        "   • SAMPLE STUDENT FOUR (A99900004) — KLP, 1 new file(s)"]
 
 
-def zip_of(*names):
+def zip_of(files):
+    """A portal ZIP: {name: bytes}, each under docs/ as the portal zips them."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as z:
-        for n in names:
-            z.writestr(f"docs/{n}", b"x" * 10)
+        for n, data in files.items():
+            z.writestr(f"docs/{n}", data)
     return buf.getvalue()
 
 
-def test_run_local_tells_a_redownload_from_a_first_download(monkeypatch, tmp_path):
+def test_run_local_replaces_a_changed_document_and_tells_a_redownload_from_a_first_download(monkeypatch, tmp_path):
+    """The portal's ZIP names every document by its type (PASSPORT.jpg, ACADEMIC CERTIFICATE.pdf), so
+    a replaced document comes back under the name of the old one: its bytes decide."""
     def listed(docs):
         rows = "".join(
             f'<tr><td><a href="download_docs.php?uid={uid}">ZIP</a> Full Name | {name} | Passport No | {pas} | '
-            f'Program | {KLP}<a href="view_doc.php?f={d}">d</a></td></tr>' for uid, name, pas, d in docs)
+            f'Program | {KLP}' + "".join(f'<a href="view_doc.php?f={d}">d</a>' for d in ds) + "</td></tr>"
+            for uid, name, pas, ds in docs)
         return f"<table>{rows}</table>"
 
-    zips = {"1": zip_of("passport_1_100.jpg", "photo_1_100.jpg"), "2": zip_of("passport_2_100.jpg", "ssc_2_200.pdf")}
+    zips = {"1": zip_of({"PASSPORT.jpg": b"passport one", "PHOTO.jpg": b"photo one"}),
+            "2": zip_of({"PASSPORT.jpg": b"passport two", "ACADEMIC CERTIFICATE.pdf": b"academic two, again"})}
 
     class Client:
         client = SimpleNamespace()
@@ -476,8 +479,8 @@ def test_run_local_tells_a_redownload_from_a_first_download(monkeypatch, tmp_pat
 
         async def read_student_pages(self, params):
             assert params == {"source": "direct", "filter_docs": "verified"}
-            return [listed([("1", "NEW STUDENT", "A01234567", "passport_1_100.jpg"),
-                            ("2", "OLD STUDENT", "B01234567", "ssc_2_200.pdf")])]
+            return [listed([("1", "SAMPLE STUDENT ONE", "A99900001", ["passport_1_100.jpg", "photo_1_100.jpg"]),
+                            ("2", "SAMPLE STUDENT TWO", "A99900002", ["passport_2_100.jpg", "academic_2_300.pdf"])])]
 
         async def close(self):
             pass
@@ -487,15 +490,27 @@ def test_run_local_tells_a_redownload_from_a_first_download(monkeypatch, tmp_pat
 
     Client.client.get = get
     monkeypatch.setattr(client_module, "admin_client", Client())
-    old = tmp_path / "KOREAN LANGUAGE PROGRAM (KLP)" / "OLD STUDENT (B01234567)"
+    monkeypatch.setattr(verified_docs, "BACKUP_ROOT", tmp_path / "originals")
+    root = tmp_path / "docs"
+    old = root / KLP_DIR / "SAMPLE STUDENT TWO (A99900002)"
     old.mkdir(parents=True)
-    (old / "passport_2_100.jpg").write_bytes(b"x")
-    (old / verified_docs.LOCAL_DONE_MARKER).write_text("passport_2_100.jpg", encoding="utf-8")   # before the SSC upload
+    (old / "PASSPORT.jpg").write_bytes(b"passport two")
+    (old / "ACADEMIC CERTIFICATE.pdf").write_bytes(b"academic two")
+    # downloaded before the academic certificate was uploaded again
+    (old / verified_docs.LOCAL_DONE_MARKER).write_text("v2\nacademic_2_200.pdf|passport_2_100.jpg", encoding="utf-8")
 
-    result = asyncio.run(verified_docs.run_local(tmp_path, skip_drive_done=False))
-    assert result["saved"] == [("KOREAN LANGUAGE PROGRAM (KLP)", "NEW STUDENT (A01234567)", 2, [])]
-    assert result["redownloaded"] == [("KOREAN LANGUAGE PROGRAM (KLP)", "OLD STUDENT (B01234567)", 1, [])]
-    assert auto_sync.doc_lines(result)[2] == "📁 1 student(s) changed their documents on the portal — new files saved:"
+    result = asyncio.run(verified_docs.run_local(root, skip_drive_done=False))
+    assert result["saved"] == [(KLP_DIR, "SAMPLE STUDENT ONE (A99900001)", 2, [], 0)]
+    assert result["redownloaded"] == [(KLP_DIR, "SAMPLE STUDENT TWO (A99900002)", 0, [], 1)]
+    assert (old / "ACADEMIC CERTIFICATE.pdf").read_bytes() == b"academic two, again"
+    kept, = (old / verified_docs.REPLACED_DIR).iterdir()                      # _replaced/<today>/
+    assert [(f.name, f.read_bytes()) for f in kept.iterdir()] == [("ACADEMIC CERTIFICATE.pdf", b"academic two")]
+    assert (old / verified_docs.LOCAL_DONE_MARKER).read_text(encoding="utf-8") == \
+        "v2\nacademic_2_300.pdf|passport_2_100.jpg"
+    assert auto_sync.doc_lines(result)[2:] == [
+        "📁 1 student(s) changed their documents on the portal:",
+        "   • SAMPLE STUDENT TWO (A99900002) — KOREAN LANGUAGE PROGRAM (KLP), 1 document(s) replaced "
+        "(old copies kept in _replaced)"]
 
 
 def test_the_verified_documents_list_fails_loudly_when_login_is_refused(portal, monkeypatch):

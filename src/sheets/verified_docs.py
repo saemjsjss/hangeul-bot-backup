@@ -10,28 +10,38 @@ fetched, unzipped in memory, and each file is uploaded to
 where <PROGRAM> is one of the four program folders (KLP, EAP, BACHELOR'S, MASTER'S).
 
 Re-runnable: a student folder that finished completely is skipped; a half-finished one
-only gets the files it is missing.  Nothing is ever deleted or overwritten.
+only gets the files it is missing.  On this PC (run_local), a student whose portal documents
+changed is fetched again and a changed document replaces the old copy, which is moved to
+<student>/_replaced/<date>/ (and its over-2 MB original likewise under the originals folder).
+Nothing is ever deleted.
 
 CLI (run from the BOT folder):
   python -m src.sheets.verified_docs            # copy all verified students
   python -m src.sheets.verified_docs --list     # just list who would be copied
   python -m src.sheets.verified_docs --limit 2  # try the first 2 students only
   python -m src.sheets.verified_docs --local "..\\VERIFIED STUDENT DOCUMENTS"   # save on this PC
+  python -m src.sheets.verified_docs --confirm-replace A99900001   # replace what the catch-up
+                                                # check held back for that student (this PC)
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
 import io
+import json
 import logging
 import mimetypes
+import os
 import re
+import shutil
+import time
 import zipfile
+from datetime import date
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from src.config import settings
-from src.sheets.progress_builder import PARENT_FOLDER_ID, PROGRAMS, _services, program_matches
+from src.sheets.progress_builder import BOT_ROOT, PARENT_FOLDER_ID, PROGRAMS, _services, program_matches
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +68,9 @@ def _parse_rows(html: str) -> List[Dict[str, str]]:
 
         # The portal puts the upload time in every document's filename
         # (passport_492_1789796548.jpeg), so the set of names is a fingerprint of what
-        # the student currently has uploaded.  Replace a document and the name changes.
+        # the student currently has uploaded.  Replace a document and the name changes:
+        # run_local fetches the ZIP again, and the changed document replaces the old copy
+        # (kept in the student's _replaced folder).
         row = a.find_parent("tr")
         docs = sorted({m.group(1).rsplit("/", 1)[-1]
                        for m in re.finditer(r"view_doc\.php\?f=([^\"&'\s]+)", str(row))})
@@ -236,7 +248,54 @@ def _drive_complete_names() -> set:
             return names
 
 
+# The last list _drive_complete_names() read, for the runs when Google cannot be reached.
+DRIVE_NAMES_CACHE = BOT_ROOT / "data" / "drive_complete_names.json"
+
+
+def _drive_names(result: Dict) -> set:
+    """_drive_complete_names(), failing open: Drive down or its login expired must never stop the
+    downloads to this PC.  A good read is saved to DRIVE_NAMES_CACHE; a failed one logs one
+    warning, uses the saved list (an empty one when there is none) and sets
+    result["drive_lookup_error"] (not sent to Telegram)."""
+    try:
+        names = set(_drive_complete_names())
+    except Exception as e:
+        result["drive_lookup_error"] = f"{type(e).__name__}: {e}"
+        try:
+            saved = json.loads(DRIVE_NAMES_CACHE.read_text(encoding="utf-8"))
+            names = set(saved.get("names", []) if isinstance(saved, dict) else saved)
+        except Exception:
+            names = set()
+        logger.warning("Google Drive could not be asked which folders are finished (%s) — "
+                       "using the list saved earlier (%d name(s))", result["drive_lookup_error"], len(names))
+        return names
+    try:
+        DRIVE_NAMES_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = DRIVE_NAMES_CACHE.with_name(DRIVE_NAMES_CACHE.name + ".part")
+        tmp.write_text(json.dumps({"saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "names": sorted(names)},
+                                  ensure_ascii=False), encoding="utf-8")
+        tmp.replace(DRIVE_NAMES_CACHE)
+    except Exception as e:
+        logger.warning("the Drive folder list could not be saved (%s)", e)
+    return names
+
+
 LOCAL_DONE_MARKER = ".download_complete"
+# The marker records the portal's document list at the moment of the download: "v2\n<docs>".
+# A marker without the "v2" line was written before documents were compared byte for byte
+# (old copies may have been kept where the portal had replaced them), so its student is
+# checked once more by the catch-up sweep.
+MARKER_VERSION = "v2"
+REPLACED_DIR = "_replaced"      # <student>/_replaced/<YYYY-MM-DD>/<old copy>
+REFRESH_PER_RUN = 8             # catch-up sweep: students per run, oldest marker first
+# The sweep's circuit breaker: a portal that zips the same document into other bytes would make
+# every file look replaced, so nothing is replaced (and it is reported) when one student would
+# have more than half of their files replaced, or more than SWEEP_MAX_STUDENTS students would.
+SWEEP_MAX_STUDENTS = 2
+# The verified list is implausible (a changed page layout?) when, from LAYOUT_MIN_ROWS rows on,
+# more than LAYOUT_MAX_BLANK of them show no document list or no passport number.
+LAYOUT_MIN_ROWS = 10
+LAYOUT_MAX_BLANK = 0.10
 
 # Files above this are shrunk after download; the untouched original is copied to
 # BACKUP_ROOT first (same sub-path).
@@ -327,27 +386,218 @@ def shrink_large_files(folder: Path, root: Path) -> List[str]:
     return report
 
 
-async def run_local(root: Path, limit: int = 0, skip_drive_done: bool = True) -> Dict[str, list]:
+# --- what a re-download changes (run_local) -------------------------------------------------
+def _read_marker(folder: Path) -> Tuple[str, Optional[str]]:
+    """A student folder's marker -> (version, docs): ("", None) when there is none, ("v2", the
+    portal's document list) for the current format, ("v1", its text) for an older one ("" or
+    "ok" when it predates the document list; "" also when it cannot be read)."""
+    marker = folder / LOCAL_DONE_MARKER
+    if not marker.exists():
+        return "", None
+    try:
+        text = marker.read_text(encoding="utf-8")
+    except Exception:
+        return "v1", ""
+    head, sep, rest = text.partition("\n")
+    if sep and head.strip() == MARKER_VERSION:
+        return MARKER_VERSION, rest.strip()
+    return "v1", text.strip()
+
+
+def _write_marker(folder: Path, docs: str) -> None:
+    tmp = folder / (LOCAL_DONE_MARKER + ".part")
+    tmp.write_text(f"{MARKER_VERSION}\n{docs}", encoding="utf-8")
+    tmp.replace(folder / LOCAL_DONE_MARKER)
+
+
+def _passport_key(value) -> str:
+    return re.sub(r"\s+", "", str(value or "")).upper()
+
+
+def layout_alert(students: List[Dict[str, str]]) -> str:
+    """Why the verified list looks wrong, in counts only (never a name) — "" when it looks right.
+    From LAYOUT_MIN_ROWS rows on, more than LAYOUT_MAX_BLANK of them without a document list or a
+    passport number means the page was not read as it should be (a changed layout): nothing may
+    be downloaded or reset from it."""
+    total = len(students)
+    if total < LAYOUT_MIN_ROWS:
+        return ""
+    no_docs = sum(1 for s in students if not str(s.get("docs") or "").strip())
+    no_passport = sum(1 for s in students if not str(s.get("passport") or "").strip())
+    blank = sum(1 for s in students if not str(s.get("docs") or "").strip()
+                or not str(s.get("passport") or "").strip())
+    if blank <= total * LAYOUT_MAX_BLANK:
+        return ""
+    return (f"{no_docs} of {total} row(s) show no document list and {no_passport} no passport number")
+
+
+def _set_aside(path: Path, base: Path, day: str) -> Path:
+    """Move `path` to <base>/_replaced/<day>/ under its own name (" (2)", " (3)" … when that name
+    is taken there).  Nothing is overwritten or deleted."""
+    where = base / REPLACED_DIR / day
+    where.mkdir(parents=True, exist_ok=True)
+    target, n = where / path.name, 1
+    while target.exists():
+        n += 1
+        target = where / f"{path.stem} ({n}){path.suffix}"
+    shutil.move(str(path), str(target))
+    return target
+
+
+class _Plan:
+    """What extracting one student's ZIP would change, worked out before anything is touched.
+    steps: (name, new bytes or None, the local copy to set aside or None, its original under
+    BACKUP_ROOT to set aside or None), in ZIP order; a step without bytes only sets a file aside.
+    added / replaced count documents (ZIP entries): one whose old copy is set aside, under its own
+    name or another extension's, is replaced; one that had no copy on this PC is added."""
+
+    def __init__(self) -> None:
+        self.files = 0                   # documents in the ZIP
+        self.same = 0                    # equal to the copy on this PC: left alone
+        self.ambiguous: List[str] = []   # sweep only: a shrunk copy without its original, left alone
+        self.steps: List[Tuple[str, Optional[bytes], Optional[Path], Optional[Path]]] = []
+        self.kind: Dict[str, str] = {}   # entry name (lower case) -> "new" | "same" | "kept" | "replaced"
+
+    @property
+    def added(self) -> int:
+        return sum(1 for k in self.kind.values() if k == "new")
+
+    @property
+    def replaced(self) -> int:
+        return sum(1 for k in self.kind.values() if k == "replaced")
+
+
+def _plan(z: zipfile.ZipFile, folder: Path, root: Path, *, sweep: bool = False,
+          stems: bool = False) -> _Plan:
+    """Compare each ZIP entry with the copy on this PC: the original under BACKUP_ROOT when the
+    copy was shrunk (a .png shrunk to .jpg included), else the copy itself.  `sweep`: a copy that
+    looks shrunk but has no original to compare with is left alone, not replaced.  `stems` (a
+    re-download because the portal's documents changed): a local file of an entry's name under
+    another extension (PASSPORT.jpg when the ZIP has PASSPORT.pdf) is set aside too, except a .jpg
+    whose original under BACKUP_ROOT has the entry's name (it is that entry, shrunk)."""
+    rel = folder.relative_to(root)
+    plan = _Plan()
+    names: List[str] = []
+    seen, matched = set(), set()
+    for info in z.infolist():
+        if info.is_dir() or not info.filename.rsplit("/", 1)[-1]:
+            continue
+        fname = _safe_path_part(info.filename.rsplit("/", 1)[-1])
+        if fname.lower() in seen:
+            continue                     # one name twice in the ZIP: the first one counts
+        seen.add(fname.lower())
+        names.append(fname)
+        plan.files += 1
+        data = z.read(info)
+        dest = folder / fname
+        if fname.lower().endswith(".png") and not dest.exists() and dest.with_suffix(".jpg").exists():
+            dest = dest.with_suffix(".jpg")   # shrink_large_files saves a shrunk .png as .jpg
+        backup = BACKUP_ROOT / rel / fname
+        has_backup = backup.is_file()
+        if not dest.exists():
+            stale = backup if has_backup and backup.read_bytes() != data else None
+            plan.steps.append((fname, data, None, stale))
+            plan.kind[fname.lower()] = "new"
+            continue
+        matched.add(dest.name.lower())
+        if (backup if has_backup else dest).read_bytes() == data:
+            plan.same += 1
+            plan.kind[fname.lower()] = "same"
+            continue
+        if sweep and not has_backup and (len(data) > MAX_FILE_BYTES or dest.name != fname):
+            plan.ambiguous.append(fname)
+            plan.kind[fname.lower()] = "kept"
+            continue
+        plan.steps.append((fname, data, dest, backup if has_backup else None))
+        plan.kind[fname.lower()] = "replaced"
+    if stems and folder.is_dir():
+        by_stem: Dict[str, List[str]] = {}
+        for name in names:
+            by_stem.setdefault(Path(name).stem.lower(), []).append(name)
+        for f in sorted(folder.iterdir()):
+            low = f.name.lower()
+            entries = by_stem.get(f.stem.lower())
+            if (not f.is_file() or f.name.startswith(".") or low.endswith(".part") or low in seen
+                    or low in matched or not entries):
+                continue
+            if f.suffix.lower() == ".jpg" and any((BACKUP_ROOT / rel / n).is_file() for n in entries):
+                continue                 # that entry's shrunk copy: its original has the entry's name
+            backup = BACKUP_ROOT / rel / f.name
+            plan.steps.append((f.name, None, f, backup if backup.is_file() else None))
+            # the document it was is replaced (the entry with no copy of its own name first)
+            entry = next((n for n in entries if plan.kind[n.lower()] == "new"), entries[0])
+            plan.kind[entry.lower()] = "replaced"
+    return plan
+
+
+def _apply(plan: _Plan, folder: Path, root: Path) -> Tuple[int, int]:
+    """Carry out a plan -> (added, replaced).  Each old copy (and its original) is moved to
+    _replaced/<today>/ just before the new one is written, through .part and a rename."""
+    day = date.today().isoformat()
+    originals = BACKUP_ROOT / folder.relative_to(root)
+    folder.mkdir(parents=True, exist_ok=True)
+    for fname, data, local, backup in plan.steps:
+        if local is not None:
+            _set_aside(local, folder, day)
+        if backup is not None and backup.exists():
+            _set_aside(backup, originals, day)
+        if data is not None:
+            dest = folder / fname
+            tmp = dest.with_name(dest.name + ".part")
+            tmp.write_bytes(data)
+            tmp.replace(dest)
+    return plan.added, plan.replaced
+
+
+async def run_local(root: Path, limit: int = 0, skip_drive_done: bool = True,
+                    confirm_replace: Iterable[str] = ()) -> Dict[str, list]:
     """Same as run(), but saves into a folder on this PC:
     <root>/<PROGRAM>/<FULL NAME> (<PASSPORT NO>)/<files>.  Files over 2 MB are shrunk.
-    Returns {"saved": [(program, name, n_files, shrink_report)] for first downloads,
-    "redownloaded": [the same] for students fetched again because their portal files changed
-    (n_files = the files that were new), "failed": [(name, error)], "students": every verified
-    student the list showed (fetch_verified_students: the whole list, whatever `limit` is)}."""
+
+    A student is fetched when they have no marker yet (a first download) or when the portal's
+    document list is not the one their marker recorded (a re-download).  Each ZIP entry is compared
+    byte for byte with the copy on this PC (_plan): an equal one is left alone; a changed one
+    replaces the old copy, which goes to <student>/_replaced/<date>/.  The marker is written only
+    once every entry and the shrinking succeeded, so a run that stops halfway is done again.
+    A student whose marker is older than this (no "v2" line) is compared once more by the
+    catch-up sweep, REFRESH_PER_RUN a run, oldest marker first, which replaces nothing when the
+    circuit breaker trips (SWEEP_MAX_STUDENTS); such a student's marker is left for the next run.
+
+    Returns {"saved": [(program, name, added, shrunk, replaced)] for first downloads,
+    "redownloaded": [the same] for students fetched again because their portal files changed,
+    "refreshed": [the same] for the sweep's students, "held": [(program, name, differing, files)]
+    for the sweep's students the breaker held back, "failed": [(name, error)], "students": every
+    verified student the list showed (fetch_verified_students: the whole list, whatever `limit`
+    is)}, and "layout_alert" (then nothing was downloaded and no marker touched) or
+    "drive_lookup_error" (the saved Drive list was used) when they apply.
+
+    `confirm_replace`: these passports only, each compared even when their marker is current, and
+    with no circuit breaker (python -m src.sheets.verified_docs --confirm-replace)."""
     from src.scraper.client import admin_client as client
     try:
         await client.login()
         students = await fetch_verified_students(client)
         listed = list(students)
         print(f"{len(students)} verified student(s) on the portal.")
+        result: Dict[str, list] = {"saved": [], "redownloaded": [], "refreshed": [], "held": [],
+                                   "failed": [], "students": listed}
+        alert = layout_alert(listed)
+        if alert:
+            result["layout_alert"] = alert
+            print(f"The verified-students list looks wrong ({alert}) - nothing downloaded, no marker touched.")
+            return result
+        confirm = {_passport_key(p) for p in confirm_replace if _passport_key(p)}
+        if confirm:
+            students = [s for s in students if _passport_key(s.get("passport")) in confirm]
+            print(f"Only {len(students)} student(s) to compare with --confirm-replace.")
         if limit:
             students = students[:limit]
-        in_drive = _drive_complete_names() if skip_drive_done else set()
+        in_drive = _drive_names(result) if skip_drive_done and not confirm else set()
         if in_drive:
             print(f"{len(in_drive)} already complete in Google Drive - not downloaded again.")
         print(f"Saving to: {root}")
 
-        result: Dict[str, list] = {"saved": [], "redownloaded": [], "failed": [], "students": listed}
+        sweep: List[Tuple[float, int, Dict[str, str], Path]] = []
         done = skipped = drive_skipped = failed = 0
         for n, s in enumerate(students, 1):
             name = folder_name(s)
@@ -359,57 +609,118 @@ async def run_local(root: Path, limit: int = 0, skip_drive_done: bool = True) ->
             # downloaded.  The marker records the portal's own filenames, which carry
             # the upload time — so a student who replaces a rejected document is fetched
             # again instead of being trusted forever.
-            marker = folder / LOCAL_DONE_MARKER
-            again = marker.exists()          # downloaded before: this is a re-download
+            version, was = _read_marker(folder)
+            now = s.get("docs", "")
+            again = bool(version)            # downloaded before: this is a re-download
             if again:
-                try:
-                    was = marker.read_text(encoding="utf-8").strip()
-                except Exception:
-                    was = ""
-                now = s.get("docs", "")
-                if was and was != "ok" and was == now:
+                if not now:                  # a row without its document list: nothing to go by
                     skipped += 1
                     continue
-                if was in ("", "ok"):        # downloaded before this check existed
-                    marker.write_text(now, encoding="utf-8")
-                    skipped += 1
+                current = was == now if version == MARKER_VERSION else was in ("", "ok", now)
+                if current:
+                    if version != MARKER_VERSION or confirm:
+                        try:
+                            at = (folder / LOCAL_DONE_MARKER).stat().st_mtime
+                        except OSError:
+                            at = 0.0
+                        sweep.append((at, n, s, folder))
+                    else:
+                        skipped += 1
                     continue
                 print(f"[{n}/{len(students)}] {name}: documents changed on the portal — "
                       "downloading again")
             try:
                 data = await _download_zip(client, s["uid"])
                 folder.mkdir(parents=True, exist_ok=True)
-                added = 0
                 with zipfile.ZipFile(io.BytesIO(data)) as z:
-                    for info in z.infolist():
-                        fname = _safe_path_part(info.filename.rsplit("/", 1)[-1])
-                        dest = folder / fname
-                        if info.is_dir() or dest.exists():
-                            continue
-                        tmp = dest.with_name(dest.name + ".part")
-                        tmp.write_bytes(z.read(info))
-                        tmp.replace(dest)
-                        added += 1
+                    plan = _plan(z, folder, root, stems=again)
+                added, replaced = _apply(plan, folder, root)
                 shrunk = shrink_large_files(folder, root)
                 # record what the portal held at this moment, so a later upload is noticed
-                (folder / LOCAL_DONE_MARKER).write_text(s.get("docs", "ok") or "ok",
-                                                        encoding="utf-8")
+                _write_marker(folder, now)
                 done += 1
-                result["redownloaded" if again else "saved"].append((program_folder(s), name, added, shrunk))
-                print(f"[{n}/{len(students)}] {name}: {added} {'new ' if again else ''}file(s) saved")
+                result["redownloaded" if again else "saved"].append(
+                    (program_folder(s), name, added, shrunk, replaced))
+                print(f"[{n}/{len(students)}] {name}: {added} {'new ' if again else ''}file(s) saved"
+                      + (f", {replaced} replaced (old copies in {REPLACED_DIR})" if replaced else ""))
                 for line in shrunk:
                     print(f"      compressed {line}")
             except Exception as e:
                 failed += 1
                 result["failed"].append((name, str(e)))
                 print(f"[{n}/{len(students)}] {name}: FAILED - {e}")
+
+        if sweep:
+            failed += await _sweep(client, root, sweep, result, confirmed=bool(confirm))
         print(f"\nFinished: {done} saved, {skipped} already on this PC, "
+              f"{len(result['refreshed'])} compared again (catch-up), {len(result['held'])} held back, "
               f"{drive_skipped} already in Drive, {failed} failed.")
         if failed:
             print("Run again to retry the failed ones (finished folders are skipped).")
         return result
     finally:
         await client.close()
+
+
+async def _sweep(client, root: Path, queue: List[Tuple[float, int, Dict[str, str], Path]],
+                 result: Dict[str, list], confirmed: bool = False) -> int:
+    """The catch-up sweep: students whose marker predates the byte comparison (or, `confirmed`,
+    the --confirm-replace students) are fetched again and compared, REFRESH_PER_RUN a run, oldest
+    marker first.  Equal files are left alone and the marker is upgraded.  Replacing is held back,
+    files and marker untouched (the student comes back next run), when a student would have more
+    than half of their files replaced or more than SWEEP_MAX_STUDENTS students would — unless
+    `confirmed`.  Adds to result["refreshed"] / result["held"] / result["failed"]; -> failures."""
+    queue = sorted(queue, key=lambda c: (c[0], c[1]))
+    if not confirmed:
+        queue = queue[:REFRESH_PER_RUN]
+    failed = 0
+    waiting: List[Tuple[Dict[str, str], Path, _Plan]] = []     # would replace: decided at the end
+    held: List[Tuple[Dict[str, str], int, int]] = []
+    would = 0                                                   # students with something to replace
+
+    def finish(s, folder, plan):
+        added, replaced = _apply(plan, folder, root)
+        shrunk = shrink_large_files(folder, root)
+        _write_marker(folder, s.get("docs", ""))
+        result["refreshed"].append((program_folder(s), folder_name(s), added, shrunk, replaced))
+        print(f"   catch-up {folder_name(s)}: {plan.same} file(s) the same, {added} added, {replaced} replaced"
+              + (f", {len(plan.ambiguous)} shrunk copy(ies) without an original left alone"
+                 if plan.ambiguous else ""))
+
+    for _, _, s, folder in queue:
+        try:
+            data = await _download_zip(client, s["uid"])
+            with zipfile.ZipFile(io.BytesIO(data)) as z:
+                # --confirm-replace: the portal's copy wins even over a shrunk copy without its original
+                plan = _plan(z, folder, root, sweep=not confirmed)
+            if plan.replaced and not confirmed:
+                would += 1
+                if plan.replaced * 2 > plan.files or would > SWEEP_MAX_STUDENTS:
+                    held.append((s, plan.replaced, plan.files))
+                    continue
+                waiting.append((s, folder, plan))
+                continue
+            finish(s, folder, plan)
+        except Exception as e:
+            failed += 1
+            result["failed"].append((folder_name(s), str(e)))
+            print(f"   catch-up {folder_name(s)}: FAILED - {e}")
+    if would > SWEEP_MAX_STUDENTS:                 # too many at once: none is replaced
+        held += [(s, plan.replaced, plan.files) for s, _, plan in waiting]
+        waiting = []
+    for s, folder, plan in waiting:
+        try:
+            finish(s, folder, plan)
+        except Exception as e:
+            failed += 1
+            result["failed"].append((folder_name(s), str(e)))
+            print(f"   catch-up {folder_name(s)}: FAILED - {e}")
+    for s, differ, files in held:
+        result["held"].append((program_folder(s), folder_name(s), differ, files))
+        print(f"   catch-up {folder_name(s)}: the portal ZIP differs for {differ} of {files} file(s) — "
+              "held back, nothing replaced (python -m src.sheets.verified_docs --confirm-replace "
+              f"{s.get('passport', '')} replaces them)")
+    return failed
 
 
 def main() -> None:
@@ -421,10 +732,31 @@ def main() -> None:
                     f"\"{settings.docs_root()}\"")
     ap.add_argument("--include-drive-done", action="store_true",
                     help="with --local: also download students already finished in Drive")
+    ap.add_argument("--confirm-replace", metavar="PASSPORT", default="",
+                    help="on this PC: compare these students' files with the portal's (comma "
+                         "separated) and replace what differs, even when the catch-up check held "
+                         "it back; --local defaults to the documents folder")
     args = ap.parse_args()
+    confirm = [p for p in args.confirm_replace.split(",") if p.strip()]
+    if confirm and not args.local:
+        args.local = str(settings.docs_root())
     loop = asyncio.new_event_loop()
     try:
-        if args.local and not args.list:
+        if args.local and not args.list and confirm:
+            # the scheduled sync writes the same folders: never at the same time as it, so this
+            # takes its lock (and a sync that starts meanwhile skips its run)
+            from src.sheets import auto_sync
+            if auto_sync._lock_held(auto_sync.LOCK_PATH):
+                print("A portal sync is running (or paused) right now — try again in a few minutes.")
+                return
+            auto_sync.LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+            auto_sync.LOCK_PATH.write_text(str(os.getpid()), encoding="utf-8")
+            try:
+                loop.run_until_complete(run_local(Path(args.local), limit=args.limit,
+                                                  confirm_replace=confirm))
+            finally:
+                auto_sync.LOCK_PATH.unlink(missing_ok=True)
+        elif args.local and not args.list:
             loop.run_until_complete(run_local(Path(args.local), limit=args.limit,
                                               skip_drive_done=not args.include_drive_done))
         else:
