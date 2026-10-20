@@ -484,3 +484,101 @@ def test_every_document_key_has_a_title_and_the_old_constants_stay():
                  "FISCAL_LABELS"):
         assert hasattr(R, name), name
     assert not set(R.BALANCE_LABELS) & set(R.OPENING_BALANCE_WORDS)
+
+
+# --------------------------------------------------------------------------- P1 / P3 in verify_student
+
+from src.verify import page_checks as PC  # noqa: E402
+
+KLP_DIR = "KOREAN LANGUAGE PROGRAM (KLP)"
+# Every document KLP requires, as the ZIP names them.
+KLP_FILES = {"PASSPORT.pdf": None, "PASSPORT SIZE PHOTO.jpg": None, "BIRTH CERTIFICATE.pdf": None,
+             "FATHER NID.pdf": None, "MOTHER NID.pdf": None, "FAMILY RELATIONSHIP CERTIFICATE.pdf": None,
+             "ACADEMIC CERTIFICATE.pdf": None, "BANK STATEMENT.pdf": None, "TRADE LICENSE.pdf": None}
+
+
+@pytest.fixture
+def reads(monkeypatch):
+    """No image work and no OCR: page checks say nothing, and read_document is a spy that
+    returns each file's own words without opening it."""
+    monkeypatch.setattr(PC, "inspect", lambda path: {})
+    monkeypatch.setattr(PC, "colour_check", lambda info, key="": [])
+    monkeypatch.setattr(PC, "qr_check", lambda info, required=False, text="": [])
+    monkeypatch.setattr(PC, "bangla_check", lambda text: [])
+    monkeypatch.setattr(PC, "seal_present", lambda path: False)
+    monkeypatch.setattr(PC, "academic_check", lambda path, pages: [])
+    seen = []
+
+    def read_document(path, max_pages=20):
+        seen.append(path.name)
+        return f"{path.stem} {FILLER}", [(595, 842)]
+
+    monkeypatch.setattr(dv, "read_document", read_document)
+    return seen
+
+
+def klp(tmp_path, drop=(), add=None):
+    files = {k: v for k, v in KLP_FILES.items() if k not in drop}
+    files.update(add or {})
+    return folder(tmp_path, KLP_DIR, "SAMPLE STUDENT ONE", PASSPORTS[0], files)
+
+
+def test_p1_father_death_certificate_in_place_of_his_nid(tmp_path, reads):
+    d = klp(tmp_path, drop=["FATHER NID.pdf"], add={"FATHER DEATH CERTIFICATE.pdf": None})
+    rows = dv.verify_student(d, student(), "KLP")
+    assert not [r for r in rows if r["key"] == "father_nid"]
+    row, = [r for r in rows if r["key"] == "father_death_cert"]
+    assert row["doc"] == "05 Father Death Certificate" and row["verdict"] == "PASS"
+    assert row["detail"] == "PASS: present — accepted in place of the father's NID (05 Father NID not needed)"
+    assert "MISSING" not in {r["verdict"] for r in rows}
+    assert C.student_verdict(rows) != C.INCOMPLETE
+    assert "FATHER DEATH CERTIFICATE.pdf" in reads           # read like any other document
+
+
+def test_p1_mother_death_certificate_in_place_of_her_nid(tmp_path, reads):
+    d = klp(tmp_path, drop=["MOTHER NID.pdf"], add={"mother_death_cert_1760000000.pdf": None})
+    rows = dv.verify_student(d, student(), "KLP")
+    assert not [r for r in rows if r["key"] == "mother_nid"]
+    row, = [r for r in rows if r["key"] == "mother_death_cert"]
+    assert row["detail"] == "PASS: present — accepted in place of the mother's NID (05 Mother NID not needed)"
+    assert C.student_verdict(rows) != C.INCOMPLETE
+
+
+def test_p1_neither_nid_nor_death_certificate_is_missing(tmp_path, reads):
+    d = klp(tmp_path, drop=["FATHER NID.pdf"])
+    rows = dv.verify_student(d, student(), "KLP")
+    assert [r for r in rows if r["verdict"] == "MISSING"] == [
+        {"doc": "05 Father NID", "file": "", "key": "father_nid", "verdict": "MISSING",
+         "detail": "required by the guideline but not uploaded"}]
+    assert C.student_verdict(rows) == C.INCOMPLETE
+    # the mother's death certificate does not stand in for the father's NID
+    d2 = klp(tmp_path / "two", drop=["FATHER NID.pdf"], add={"MOTHER DEATH CERTIFICATE.pdf": None})
+    rows = dv.verify_student(d2, student(), "KLP")
+    assert [r["key"] for r in rows if r["verdict"] == "MISSING"] == ["father_nid"]
+    row, = [r for r in rows if r["key"] == "mother_death_cert"]
+    assert row["detail"] == "PASS: present (no automatic rule for this document)"
+
+
+def test_p1_both_present_the_nid_is_checked_as_usual(tmp_path, reads):
+    d = klp(tmp_path, add={"FATHER DEATH CERTIFICATE.pdf": None})
+    rows = dv.verify_student(d, student(), "KLP")
+    nid, = [r for r in rows if r["key"] == "father_nid"]
+    assert nid["file"] == "FATHER NID.pdf"
+    assert "FAIL: no notarisation found — parents' NID must be notarised" in nid["detail"]
+    cert, = [r for r in rows if r["key"] == "father_death_cert"]
+    assert cert["detail"] == "PASS: present (no automatic rule for this document)"
+
+
+def test_p3_the_cv_is_recorded_as_present_and_never_read(tmp_path, reads):
+    d = klp(tmp_path, add={"ID CARD CV.pdf": [f"Curriculum vitae of OTHER PERSON {FILLER}"],
+                           "id_card_1760000000.jpg": None})
+    rows = dv.verify_student(d, student(), "KLP")
+    assert "ID CARD CV.pdf" not in reads and "id_card_1760000000.jpg" not in reads
+    assert "PASSPORT.pdf" in reads
+    cv = [r for r in rows if r["key"] == "id_card_cv"]
+    assert cv == [{"doc": "03 ID Card / CV", "file": name, "key": "id_card_cv", "verdict": "PASS",
+                   "detail": "PASS: present — recorded as present only (not checked)"}
+                  for name in ("ID CARD CV.pdf", "id_card_1760000000.jpg")]
+    # nothing else changes: no NID findings, no cross-check row comes from the CV
+    plain = dv.verify_student(klp(tmp_path / "no-cv"), student(), "KLP")
+    assert [r for r in rows if r["key"] != "id_card_cv"] == plain
