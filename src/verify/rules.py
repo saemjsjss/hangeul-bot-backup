@@ -7,7 +7,7 @@ checks that run on the text read out of it.  Checks are deliberately conservativ
 rule only fails when the evidence is clear; anything doubtful becomes a FLAG for a human.
 
 Verdicts:  PASS (rule satisfied) · FLAG (needs a human eye) · FAIL (rule broken)
-           MISSING (no such file uploaded)
+           MISSING (no such file uploaded) · ERROR (the file could not be checked; retried)
 """
 from __future__ import annotations
 
@@ -51,21 +51,28 @@ QR_DOCS = ["birth_cert"]
 TRANSLATION_WORDS = ["translated", "translation", "true copy", "english translation"]
 BANGLA_RANGE = ("ঀ", "৿")
 
-# file-name keywords -> document key.  The portal names files consistently
-# (passport_*.pdf, family_cert_*.pdf …), so matching on the name is reliable.
+# file-name keywords -> document key.  The portal's ZIP names each file by a descriptive
+# title ("FATHER NID.pdf", "FAMILY RELATIONSHIP CERTIFICATE.pdf"); a file saved under the
+# portal's own key ("family_cert_1234.pdf") is recognised too, because classify() also
+# reads the name with "_" as a space.  The longest matching pattern wins.
 FILE_PATTERNS: Dict[str, List[str]] = {
     "passport": ["passport"],
     "photo": ["passport size photo", "picture", "photo"],
-    "student_nid": ["student nid", "student_nid", "nid card", "id card cv", "id_card"],
-    "birth_cert": ["birth certificate", "birth_cert"],
+    "student_nid": ["student nid", "student_nid", "nid card"],
+    # Not "id card" on its own: "FATHER ID CARD.pdf" is a parent's NID, not the student's CV.
+    "id_card_cv": ["id card cv", "id_card_cv", "id_card"],
+    "birth_cert": ["birth certificate", "birth_cert", "birth cert"],
     "father_nid": ["father nid", "father_nid"],
     "mother_nid": ["mother nid", "mother_nid"],
-    "death_cert": ["death certificate", "death_cert"],
-    "family_cert": ["family relationship", "family certificate", "family_cert"],
-    "academic": ["academic certificate", "academic_cert", "transcript"],
+    "father_death_cert": ["father death certificate", "father death cert", "father_death_cert"],
+    "mother_death_cert": ["mother death certificate", "mother death cert", "mother_death_cert"],
+    "death_cert": ["death certificate", "death_cert", "death cert"],
+    "family_cert": ["family relationship", "family certificate", "family_cert", "family cert"],
+    "academic": ["academic certificate", "academic_cert", "academic cert", "transcript"],
     "bank": ["bank statement", "bank_statement", "solvency", "sanchay", "savings"],
     "trade_license": ["trade license", "trade_license", "tin", "employment certificate"],
-    "income_tax": ["income tax", "tax certificate", "tax challan", "acknowledgement", "acknowledgment"],
+    "income_tax": ["income tax", "income_tax", "tax certificate", "tax challan", "acknowledgement",
+                   "acknowledgment"],
     "affidavit": ["affidavit"],
     "personal_statement": ["personal statement", "study plan", "personal_statement"],
     "recommendation": ["recommendation"],
@@ -85,8 +92,17 @@ REQUIRED: Dict[str, List[str]] = {
     "MASTER": ["passport", "photo", "birth_cert", "father_nid", "mother_nid", "family_cert",
                "academic", "bank", "trade_license", "income_tax"],
 }
-OPTIONAL = ["student_nid", "death_cert", "affidavit", "personal_statement", "recommendation", "eca",
-            "language_cert"]
+OPTIONAL = ["student_nid", "id_card_cv", "death_cert", "father_death_cert", "mother_death_cert",
+            "affidavit", "personal_statement", "recommendation", "eca", "language_cert"]
+
+# A required document that another one stands in for: a deceased parent has no NID to
+# give, and their death certificate is uploaded instead.  With the alternative present the
+# required one is not reported MISSING.
+ALTERNATIVES: Dict[str, List[str]] = {"father_nid": ["father_death_cert"],
+                                      "mother_nid": ["mother_death_cert"]}
+# Documents recorded as present and never read or checked (the portal's "ID Card / CV"
+# slot holds anything from a CV to a school ID).
+PRESENCE_ONLY = {"id_card_cv"}
 
 # Wording the checks look for in the OCR text (lower-cased, accents/spacing ignored).
 NOTARY_WORDS = ["notar", "advocate", "attested", "authenticated", "affidavit", "judge court"]
@@ -131,4 +147,26 @@ TITLES = {
     "income_tax": "09.1 Income Tax", "affidavit": "10 Affidavit",
     "personal_statement": "Personal Statement / Study Plan", "recommendation": "Recommendation Letter",
     "eca": "Extra Curricular (ECA)", "language_cert": "IELTS / TOPIK Certificate",
+    "id_card_cv": "03 ID Card / CV", "father_death_cert": "05 Father Death Certificate",
+    "mother_death_cert": "05 Mother Death Certificate",
 }
+
+# --- labels the amount, date and number rules read beside -----------------------------
+# The figure a statement or solvency certificate calls its balance.  The opening balance
+# (OPENING_BALANCE_WORDS) has its own rule and is never taken for it.
+BALANCE_LABELS = ["closing balance", "current balance", "available balance", "ledger balance",
+                  "total balance", "balance", "solvency", "amount of tk", "sum of tk",
+                  "amount of taka", "sum of taka"]
+# The amount an income-tax certificate or challan says was paid.
+TAX_PAID_LABELS = ["total tax paid", "amount of tax paid", "tax paid", "paid tax", "tax payment",
+                   "tax deposited", "paid amount"]
+# A figure written right after one of these is an account, customer or phone number, not
+# money (each is matched as a whole word: "paid" holds no "id", "nominee" no "no").
+ID_NUMBER_LABELS = ["a/c", "account", "customer", "cif", "id", "no", "number", "routing",
+                    "mobile", "phone", "tin", "nid"]
+# Where a certificate prints the date of birth, and the labels that end that field (so the
+# registration or issue date after an unreadable birth date is not taken for it).
+DOB_LABELS = ["date of birth", "birth date", "d.o.b", "dob"]
+DOB_STOP_LABELS = ["date of", "registration", "issue", "issued"]
+# A trade licence's fiscal year is printed beside one of these.
+FISCAL_LABELS = ["fiscal", "financial year", "renewal", "validity", "valid up to"]
