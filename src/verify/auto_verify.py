@@ -1694,20 +1694,23 @@ def _cli(args, passports: List[str], export_rows) -> int:
         print(f"reports: {DOC_REPORT}\n         {FIELD_REPORT}")
         return 0
 
-    if args.pending:
-        from src.verify import doc_verifier as dv
-        store = _peek_store()
+    rerun = args.recheck or args.force or args.dry_run
+    if args.pending or (passports and not rerun):
+        try:
+            if passports and not args.pending:
+                _show(passports)
+                return 0
+            from src.verify import doc_verifier as dv
+            store = _peek_store()
+        except StoreUnreadable as e:
+            print(f"{e} — nothing was changed")
+            return 1
         portal = dv.portal_students(rows=export_rows) if export_rows is not None else dv.portal_students()
         folders = dv.student_folders(portal)
         q = pending(store, folders, portal)
         print(f"{len(q)} student(s) waiting to be checked")
         for p in q[:20]:
             print(f"   {p} ({_status(p, store['documents'].get(p), folders, portal)})")
-        return 0
-
-    rerun = args.recheck or args.force or args.dry_run
-    if passports and not rerun:
-        _show(passports)
         return 0
 
     try:
