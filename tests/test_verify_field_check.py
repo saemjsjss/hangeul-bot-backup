@@ -148,6 +148,11 @@ def test_a_labelled_gpa_that_may_be_another_certificates_is_not_a_difference():
     assert result == fc.NOT_CONFIRMED and "4.83" in detail
 
 
+def test_a_gpa_label_in_unreadable_noise_proves_nothing():
+    texts = {"07 Academic Certificate & Transcript": f"{NOISE} GPA 4.83"}
+    assert check("HSC GPA", "5.00", texts)[0] == fc.UNREADABLE
+
+
 def test_a_non_numeric_portal_gpa_is_matched_as_words():
     assert check("CGPA", "FIRST CLASS", {"07 Academic Certificate & Transcript": f"{READ} First Class"})[0] == fc.MATCH
 
@@ -181,8 +186,8 @@ def test_honorifics_are_ignored_anywhere():
 
 def test_a_labelled_name_that_is_someone_else_on_the_record_proves_nothing():
     """The first "Name:" on a family certificate is often the father's."""
-    who = student(Father="KORIM SAMPLE")
-    texts = {"06 Family Relationship Certificate": f"{READ} Name: KORIM SAMPLE"}
+    who = student(Father="SAMPLE PAPA")
+    texts = {"06 Family Relationship Certificate": f"{READ} Name: SAMPLE PAPA"}
     assert check("Full Name", "SAMPLE STUDENT ONE", texts, who)[0] == fc.NOT_CONFIRMED
     assert check("Full Name", "SAMPLE STUDENT ONE", texts)[0] == fc.DIFFERS      # nobody to compare with
 
@@ -210,8 +215,8 @@ def test_a_labels_own_words_are_not_part_of_a_name():
     assert fc.without_name_labels("Father's Name: SAMPLE OTHERMAN").split() == [":", "sample", "otherman"]
     assert "student" not in fc.without_name_labels("Name of Student: SAMPLE ONE")
     # on one line of OCR text the word before "Name" ends the value before: it stays
-    assert fc.without_name_labels("Mother's Name: SAMPLE BEGUM Name: X").split() == [
-        ":", "sample", "begum", ":", "x"]
+    assert fc.without_name_labels("Mother's Name: SAMPLE MAMA Name: X").split() == [
+        ":", "sample", "mama", ":", "x"]
 
 
 def test_ali_is_not_found_in_khalil():

@@ -362,7 +362,7 @@ def check_field(field: str, value: str, texts: Dict[str, str],
             if matched:
                 return MATCH, f"found on {name}"
             loose_gpa = loose_gpa or loose
-            if labelled:
+            if labelled and readable(text):
                 shown = ", ".join(f"{x:.2f}" for x in sorted(set(labelled)))
                 differs.append(f"{name} shows GPA {shown}")
         elif field in NAME_FIELDS:
