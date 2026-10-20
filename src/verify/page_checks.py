@@ -6,15 +6,52 @@ Used by doc_verifier for the reviewer's rules:
   * "All documents must be provided as clear colour scans … black-and-white will not be accepted."
   * "Documents containing a QR code must be scanned clearly so the QR code can be scanned."
   * "If any required document is in Bangla, it must be translated into English."
+
+A file that cannot be opened or drawn has not been checked, which is not the same as
+failing a check: those cases raise CheckError (or, for inspect, set info["error"] so that
+colour_check reports ERROR) and the file is checked again on the next pass.
 """
 from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from src.config import settings
 from src.verify import rules as R
+from src.verify.common import CheckError
+
+# A fault in the code rather than in the file: never turned into an ERROR row, so that it
+# stops the run instead of being retried forever.
+_CODE_FAULTS = (NameError, AttributeError, ImportError, TypeError)
+
+
+def _why(e: Exception, path: Path) -> str:
+    """'<Type>: message', with the file's full path cut down to its name: the message ends
+    up in the report and in Telegram, where the student's folder path is only noise."""
+    msg = str(e)
+    for full in (str(path), repr(str(path))[1:-1]):
+        msg = msg.replace(full, path.name)
+    return f"{type(e).__name__}: {msg}"
+
+
+def _read_image(path: Path):
+    """An image file as an OpenCV BGR image. cv2.imread cannot open a path holding
+    non-ASCII letters on Windows, so when it fails the bytes are read by Python and
+    decoded instead. Raises CheckError when the file cannot be read or decoded."""
+    import cv2
+    import numpy as np
+    img = cv2.imread(str(path))
+    if img is not None:
+        return img
+    try:
+        data = np.fromfile(str(path), dtype=np.uint8)
+    except OSError as e:
+        raise CheckError(f"could not open {path.name} ({_why(e, path)})") from e
+    img = cv2.imdecode(data, cv2.IMREAD_COLOR) if data.size else None
+    if img is None:
+        raise CheckError(f"could not decode the image {path.name}")
+    return img
 
 
 def _pages(path: Path, dpi: int = 250, max_pages: int = 4):
@@ -23,18 +60,51 @@ def _pages(path: Path, dpi: int = 250, max_pages: int = 4):
     import numpy as np
     out = []
     if path.suffix.lower() in (".jpg", ".jpeg", ".png"):
-        img = cv2.imread(str(path))
-        return [img] if img is not None else []
+        return [_read_image(path)]
     import pymupdf
     doc = pymupdf.open(str(path))
-    for i, page in enumerate(doc):
-        if i >= max_pages:
-            break
-        pix = page.get_pixmap(dpi=dpi)
-        a = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-        out.append(cv2.cvtColor(a, cv2.COLOR_RGB2BGR) if pix.n == 3 else cv2.cvtColor(a, cv2.COLOR_RGBA2BGR))
-    doc.close()
+    try:
+        for i, page in enumerate(doc):
+            if i >= max_pages:
+                break
+            pix = page.get_pixmap(dpi=dpi)
+            a = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+            out.append(cv2.cvtColor(a, cv2.COLOR_RGB2BGR) if pix.n == 3 else cv2.cvtColor(a, cv2.COLOR_RGBA2BGR))
+    finally:
+        doc.close()
     return out
+
+
+def _render(path: Path, dpi: int, max_pages: int, what: str):
+    """_pages, with any failure to open or draw the file raised as CheckError."""
+    try:
+        return _pages(path, dpi=dpi, max_pages=max_pages)
+    except (CheckError, *_CODE_FAULTS):
+        raise
+    except Exception as e:
+        raise CheckError(f"could not render {path.name} {what} ({_why(e, path)})") from e
+
+
+def zbar_available() -> Tuple[bool, str]:
+    """Whether the QR reader works: pyzbar imports and its zbar library decodes a blank
+    image. (True, "available"), or (False, the reason)."""
+    try:
+        import numpy as np
+        from pyzbar.pyzbar import decode
+        decode(np.full((32, 32), 255, dtype=np.uint8))
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    return True, "available"
+
+
+def _zbar_decoder():
+    """pyzbar's decode. A missing reader is a broken installation, not a document without
+    a QR, so it raises CheckError instead of quietly reading nothing."""
+    try:
+        from pyzbar.pyzbar import decode
+    except Exception as e:
+        raise CheckError(f"pyzbar (QR reader) not available: {type(e).__name__}: {e}") from e
+    return decode
 
 
 def is_digital(path: Path) -> bool:
@@ -82,7 +152,8 @@ def _clean_code(raw: bytes) -> str:
 
 
 def inspect(path: Path) -> Dict[str, object]:
-    """{'saturation': float, 'qr': [decoded strings], 'pages': n, 'digital': bool}"""
+    """{'saturation': float, 'qr': [decoded strings], 'pages': n, 'digital': bool}, plus
+    'error': "<Type>: message" when the pages could not be rendered."""
     import cv2
     info: Dict[str, object] = {"saturation": None, "qr": [], "qr_seen": False,
                                "pages": 0, "digital": False}
@@ -92,15 +163,15 @@ def inspect(path: Path) -> Dict[str, object]:
         pass
     try:
         imgs = _pages(path)
-    except Exception:
+    except _CODE_FAULTS:
+        raise
+    except Exception as e:
+        info["error"] = _why(e, path)
         return info
     info["pages"] = len(imgs)
     if not imgs:
         return info
-    try:                                   # pyzbar reads real scans; OpenCV often cannot
-        from pyzbar.pyzbar import decode as _zbar
-    except Exception:
-        _zbar = None
+    _zbar = _zbar_decoder()                # pyzbar reads real scans; OpenCV often cannot
     det = cv2.QRCodeDetector()
     sats, codes, seen = [], [], False
     for img in imgs:
@@ -115,15 +186,14 @@ def inspect(path: Path) -> Dict[str, object]:
                 codes += [d for d in decoded if d]
         except Exception:
             pass
-        if _zbar is not None:
-            try:
-                for r in _zbar(img):
-                    data = _clean_code(r.data)
-                    if data:
-                        codes.append(data)
-                        seen = True
-            except Exception:
-                pass
+        try:
+            for r in _zbar(img):
+                data = _clean_code(r.data)
+                if data:
+                    codes.append(data)
+                    seen = True
+        except Exception:
+            pass
         try:
             if det.detectMulti(img)[0]:       # a QR pattern is there, readable or not
                 seen = True
@@ -142,6 +212,8 @@ def colour_check(info: Dict[str, object], doc_key: str = "") -> List[tuple]:
     if info.get("digital"):
         return [("PASS", "produced on a computer, not scanned from paper — "
                          "the colour-scan rule does not apply")]
+    if info.get("error"):
+        return [("ERROR", f"could not render the pages to judge colour ({info['error']})")]
     if pct is None:
         return [("FLAG", "could not judge whether the scan is in colour")]
     if pct >= R.MIN_COLOUR_PERCENT:
@@ -160,6 +232,12 @@ def qr_check(info: Dict[str, object], required: bool = False, text: str = "") ->
     low = (text or "").lower()
     if "taxpayer" in low or "tin certificate" in low or "etin" in low:
         return []                      # a TIN is checked by name against the trade licence
+    if info.get("error"):
+        # colour_check has reported it already, except on a computer-made file, where the
+        # colour rule needed no pages and said nothing: the QR was not looked at either way
+        if info.get("digital"):
+            return [("ERROR", f"could not render the pages to read a QR code ({info['error']})")]
+        return []
     codes = info.get("qr") or []
     if codes:
         return [("PASS", "QR code scans cleanly: " + ", ".join(c[:48] for c in codes[:2]))]
@@ -271,10 +349,7 @@ def seal_present(path: Path) -> bool:
     the colour is far more reliable."""
     import cv2
     import numpy as np
-    try:
-        imgs = _pages(path, dpi=150, max_pages=4)
-    except Exception:
-        return False
+    imgs = _render(path, dpi=150, max_pages=4, what="to look for a seal")
     for img in imgs:
         H, W = img.shape[:2]
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
@@ -319,43 +394,26 @@ LEVELS = [
     ("HSC", r"higher\s+secondary|\bh\.?\s?s\.?\s?c\b|\balim\b|intermediate\s+certificate"),
     ("SSC", r"secondary\s+school\s+certificate|\bs\.?\s?s\.?\s?c\b|\bdakhil\b"),
     ("DIPLOMA", r"\bdiploma\b|polytechnic|technical\s+education\s+board"),
-    ("MASTER", r"\bmaster'?s?\b|\bm\.?\s?sc\b|\bm\.?\s?a\b|\bmba\b"),
+    # "M.A." needs its dot: a bare "MA" is as often a name ("MA SAMPLE") as a degree
+    ("MASTER", r"\bmaster'?s?\b|\bm\.?\s?sc\b|\bmba\b|\bm\.\s?a\b\.?"),
     ("BACHELOR", r"\bbachelor'?s?\b|\bb\.?\s?sc\b|\bb\.?\s?a\b|\bb\.?\s?com\b|\bbba\b|honours|\bhons\b"),
 ]
 
 
 def page_codes(path: Path, max_pages: int = 20) -> List[List[str]]:
-    """Codes decoded on each page, in page order."""
+    """Codes decoded on each page, in page order. Raises CheckError when the file cannot
+    be opened or rendered, or the QR reader is missing."""
     import cv2
-    import numpy as np
-    try:
-        from pyzbar.pyzbar import decode as zbar
-    except Exception:
-        zbar = None
+    zbar = _zbar_decoder()
     out: List[List[str]] = []
-    if path.suffix.lower() in (".jpg", ".jpeg", ".png"):
-        img = cv2.imread(str(path))
-        imgs = [img] if img is not None else []
-    else:
-        import pymupdf
-        doc = pymupdf.open(str(path))
-        imgs = []
-        for i, page in enumerate(doc):
-            if i >= max_pages:
-                break
-            pix = page.get_pixmap(dpi=250)
-            a = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-            imgs.append(cv2.cvtColor(a, cv2.COLOR_RGB2BGR) if pix.n == 3
-                        else cv2.cvtColor(a, cv2.COLOR_RGBA2BGR))
-        doc.close()
+    imgs = _render(path, dpi=250, max_pages=max_pages, what="to read its QR codes")
     det = cv2.QRCodeDetector()
     for img in imgs:
         codes = []
-        if zbar is not None:
-            try:
-                codes += [_clean_code(r.data) for r in zbar(img) if r.data]
-            except Exception:
-                pass
+        try:
+            codes += [_clean_code(r.data) for r in zbar(img) if r.data]
+        except Exception:
+            pass
         if not codes:
             try:
                 ok, decoded, _, _ = det.detectAndDecodeMulti(img)
@@ -401,7 +459,8 @@ def academic_check(path: Path, pages_text: List[str]) -> List[tuple]:
     # Page 1 must be an e-Apostille.  The file is assembled apostille-first, and anything
     # else means the student has put it together in the wrong order — a hard no, whatever
     # the rest of the file contains.
-    if apostilles and apostilles[0] != 0:
+    page1_fail = apostilles[0] != 0
+    if page1_fail:
         out.append(("FAIL", f"page 1 is not an e-Apostille — the first apostille is on page "
                             f"{apostilles[0] + 1}. The file must start with the apostille, "
                             "followed by the certificate and transcript it covers"))
@@ -418,8 +477,11 @@ def academic_check(path: Path, pages_text: List[str]) -> List[tuple]:
         subject = apostille_subject(link)
 
         if not block:
-            out.append(("FLAG", f"the e-Apostille on page {start + 1} is not followed by the "
-                                "certificate and transcript it covers"))
+            # the page-1 FAIL already says the apostille must come first, followed by the
+            # certificate and transcript it covers: saying it again as a FLAG adds nothing
+            if not page1_fail:
+                out.append(("FLAG", f"the e-Apostille on page {start + 1} is not followed by the "
+                                    "certificate and transcript it covers"))
             continue
         if not named:
             out.append(("NOTE", f"pages {block[0] + 1}-{block[-1] + 1} could not be read well "
