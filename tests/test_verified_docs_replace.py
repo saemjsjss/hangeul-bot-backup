@@ -211,6 +211,53 @@ def test_a_redownload_whose_files_are_all_the_same_replaces_nothing_and_says_so(
         "same as before (no document replaced)"]
 
 
+def pdf(body, doc_id, stamp):
+    """A small PDF-shaped byte string: `body` stands for the pages, `doc_id` and `stamp` for the
+    ID, dates and XMP ids the portal writes afresh into every download."""
+    return (b"%PDF-1.7\n" + body + b"\n<x:xmpmeta><xmp:CreateDate>" + stamp + b"</xmp:CreateDate>"
+            b"<xmpMM:DocumentID>uuid:" + doc_id * 8 + b"-" + doc_id * 4 + b"-" + doc_id * 4 + b"-" + doc_id * 4
+            + b"-" + doc_id * 12 + b"</xmpMM:DocumentID></x:xmpmeta>\ntrailer << /Info << /CreationDate (D:" + stamp
+            + b") /ModDate (D:" + stamp + b") >> /ID [<" + doc_id * 32 + b"><" + doc_id * 32 + b">] >>\n%%EOF")
+
+
+def test_the_same_document_ignores_only_the_ids_and_dates_the_portal_stamps_into_a_pdf():
+    saved = pdf(b"page one of the academic file", b"a", b"20261005101500")
+    assert vd._same_document(saved, pdf(b"page one of the academic file", b"b", b"20261021053000"))
+    assert not vd._same_document(saved, pdf(b"page one of a NEW academic file", b"b", b"20261021053000"))
+    assert not vd._same_document(b"a photo", b"another photo")          # not a PDF: bytes must match
+    assert vd._same_document(b"a photo", b"a photo")
+
+
+def real_pdf(text, created):
+    """A real one-page PDF saved by pymupdf with `text` on it and creation date `created`."""
+    import pymupdf
+    doc = pymupdf.open()
+    doc.new_page().insert_text((72, 72), text)
+    doc.set_metadata({"creationDate": created, "modDate": created, "producer": "SAMPLE"})
+    return doc.tobytes()
+
+
+def test_a_stamp_of_another_length_still_counts_as_the_same_pdf_page_by_page():
+    saved = real_pdf("SAMPLE STUDENT ONE academic page", "D:20261005")
+    again = real_pdf("SAMPLE STUDENT ONE academic page", "D:20261021053000+06'00'")   # longer: offsets move
+    assert saved != again and len(saved) != len(again)
+    assert vd._same_document(saved, again)
+    assert not vd._same_document(saved, real_pdf("SAMPLE STUDENT ONE NEW academic page", "D:20261005"))
+    assert not vd._same_document(saved, b"%PDF-1.7 not really a pdf")
+
+
+def test_a_redownloaded_pdf_that_differs_only_in_the_portals_stamps_is_not_replaced(world):
+    old = pdf(b"academic pages", b"a", b"20261005101500")
+    folder = add(world, 5, {"ACADEMIC CERTIFICATE.pdf": pdf(b"academic pages", b"c", b"20261021053000")},
+                 docs="academic_5_200.pdf", marker="v2\nacademic_5_100.pdf",
+                 local={"ACADEMIC CERTIFICATE.pdf": old})
+    before = (folder / "ACADEMIC CERTIFICATE.pdf").stat().st_mtime_ns
+    assert run(world)["redownloaded"] == [(PROG, "SAMPLE STUDENT FIVE (A99900005)", 0, [], 0)]
+    assert files(folder) == {"ACADEMIC CERTIFICATE.pdf": old}                # the saved copy stays as it was
+    assert (folder / "ACADEMIC CERTIFICATE.pdf").stat().st_mtime_ns == before  # so it is not checked again
+    assert not (folder / vd.REPLACED_DIR).exists()
+
+
 def test_a_shrunk_copy_whose_original_is_unchanged_is_not_replaced(world):
     folder = add(world, 3, {"BANK CERTIFICATE.pdf": b"bank, original"}, docs="bank_3_200.pdf",
                  marker="v2\nbank_3_100.pdf", local={"BANK CERTIFICATE.pdf": b"bank, shrunk"},

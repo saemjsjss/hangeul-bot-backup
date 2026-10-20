@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import io
 import json
 import logging
@@ -496,6 +497,52 @@ class _Plan:
         return sum(1 for k in self.kind.values() if k == "replaced")
 
 
+# The portal stamps a fresh document ID and fresh dates into every PDF it zips (measured 21 Oct:
+# 25 of 41 downloaded PDFs differed from the saved copy in those bytes only), so a PDF that is the
+# same apart from them is the same document and must not count as replaced.
+_PDF_VOLATILE = re.compile(
+    rb"/ID\s*\[\s*<[0-9A-Fa-f]*>\s*<[0-9A-Fa-f]*>\s*\]"
+    rb"|/(?:CreationDate|ModDate)\s*\([^)]*\)"
+    rb"|<xmp(?:MM)?:(?:CreateDate|ModifyDate|MetadataDate|DocumentID|InstanceID)>[^<]*</xmp(?:MM)?:\w+>"
+    rb"|uuid:[0-9a-fA-F-]{36}")
+
+
+def _pdf_pages_digest(data: bytes) -> Optional[str]:
+    """A digest of what a PDF shows: its page count, each page's drawing instructions and the
+    images on it. Metadata, object numbers and byte offsets are left out, so a stamp of another
+    length (which moves every offset after it) changes nothing. None when it cannot be read."""
+    try:
+        import pymupdf
+        doc = pymupdf.open(stream=data, filetype="pdf")
+    except Exception:
+        return None
+    digest = hashlib.sha256()
+    try:
+        with doc:
+            digest.update(str(doc.page_count).encode())
+            for page in doc:
+                digest.update(page.read_contents())
+                for image in page.get_images(full=True):
+                    digest.update(doc.xref_stream_raw(image[0]) or b"")
+    except Exception:
+        return None
+    return digest.hexdigest()
+
+
+def _same_document(old: bytes, new: bytes) -> bool:
+    """True when `new` is the document already saved as `old`: the same bytes, or two PDFs that
+    differ only in the ID and dates the portal stamps into each download (first compared with the
+    stamps cut out, then page by page when a stamp's length moved the rest of the file)."""
+    if old == new:
+        return True
+    if not (old.startswith(b"%PDF") and new.startswith(b"%PDF")):
+        return False
+    if _PDF_VOLATILE.sub(b"", old) == _PDF_VOLATILE.sub(b"", new):
+        return True
+    old_pages = _pdf_pages_digest(old)
+    return old_pages is not None and old_pages == _pdf_pages_digest(new)
+
+
 def _plan(z: zipfile.ZipFile, folder: Path, root: Path, *, sweep: bool = False,
           stems: bool = False) -> _Plan:
     """Compare each ZIP entry with the copy on this PC: the original under BACKUP_ROOT when the
@@ -524,12 +571,12 @@ def _plan(z: zipfile.ZipFile, folder: Path, root: Path, *, sweep: bool = False,
         backup = BACKUP_ROOT / rel / fname
         has_backup = backup.is_file()
         if not dest.exists():
-            stale = backup if has_backup and backup.read_bytes() != data else None
+            stale = backup if has_backup and not _same_document(backup.read_bytes(), data) else None
             plan.steps.append((fname, data, None, stale))
             plan.kind[fname.lower()] = "new"
             continue
         matched.add(dest.name.lower())
-        if (backup if has_backup else dest).read_bytes() == data:
+        if _same_document((backup if has_backup else dest).read_bytes(), data):
             plan.same += 1
             plan.kind[fname.lower()] = "same"
             continue
