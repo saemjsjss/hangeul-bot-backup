@@ -377,3 +377,110 @@ def test_fixture_folder_is_found_by_student_folders(tmp_path, monkeypatch):
     assert "page two" in dv.read_pages(d / "ACADEMIC CERTIFICATE.pdf")[1]
     monkeypatch.setattr(dv, "DOCS_ROOTS", [tmp_path])
     assert dv.student_folders() == {"A99900001": (d, "SAMPLE STUDENT ONE (A99900001)")}
+
+
+# --------------------------------------------------------------------------- rules.py: document keys
+
+from src.verify import rules as R  # noqa: E402
+
+# The portal's own key for each upload slot, the ZIP's title for it, and the document key
+# the checker files it under.
+SLOTS = [
+    ("passport", "PASSPORT", "passport"),
+    ("photo", "PASSPORT SIZE PHOTO", "photo"),
+    ("student_nid", "STUDENT NID", "student_nid"),
+    ("id_card_cv", "ID CARD CV", "id_card_cv"),
+    ("birth_cert", "BIRTH CERTIFICATE", "birth_cert"),
+    ("father_nid", "FATHER NID", "father_nid"),
+    ("mother_nid", "MOTHER NID", "mother_nid"),
+    ("father_death_cert", "FATHER DEATH CERTIFICATE", "father_death_cert"),
+    ("mother_death_cert", "MOTHER DEATH CERTIFICATE", "mother_death_cert"),
+    ("family_cert", "FAMILY RELATIONSHIP CERTIFICATE", "family_cert"),
+    ("academic_cert", "ACADEMIC CERTIFICATE", "academic"),
+    ("bank_statement", "BANK STATEMENT", "bank"),
+    ("trade_license", "TRADE LICENSE", "trade_license"),
+    ("income_tax", "INCOME TAX CERTIFICATE", "income_tax"),
+    ("affidavit", "AFFIDAVIT", "affidavit"),
+    ("personal_statement", "PERSONAL STATEMENT AND STUDY PLAN", "personal_statement"),
+    ("recommendation", "RECOMMENDATION LETTER", "recommendation"),
+    ("eca", "EXTRA CURRICULAR ACTIVITIES (ECA)", "eca"),
+    ("ielts_topik", "IELTS TOPIK CERTIFICATE", "language_cert"),
+]
+
+
+@pytest.mark.parametrize("portal_key, title, key", SLOTS)
+def test_classify_reads_the_portal_key_form(portal_key, title, key):
+    assert dv.classify(f"{portal_key}.pdf") == key
+    assert dv.classify(f"{portal_key}_1760000000.pdf") == key
+    assert dv.classify(f"{portal_key.upper()}_1760000000.JPG") == key
+
+
+@pytest.mark.parametrize("portal_key, title, key", SLOTS)
+def test_classify_reads_the_zip_title(portal_key, title, key):
+    assert dv.classify(f"{title}.pdf") == key
+    assert dv.classify(f"{title.lower()}.jpg") == key
+    assert dv.classify(title.replace(" ", "_") + ".pdf") == key
+
+
+@pytest.mark.parametrize("name, key", [
+    ("BIRTH CERT.pdf", "birth_cert"), ("FAMILY CERT.pdf", "family_cert"),
+    ("ACADEMIC CERT.pdf", "academic"), ("DEATH CERT.pdf", "death_cert"),
+    ("DEATH CERTIFICATE.pdf", "death_cert"), ("FATHER DEATH CERT.pdf", "father_death_cert"),
+    ("MOTHER DEATH CERT.pdf", "mother_death_cert"), ("NID CARD.pdf", "student_nid"),
+    ("id_card.pdf", "id_card_cv"),
+    # A parent's ID card is not the student's CV slot, and there is no bare "id card" rule.
+    ("FATHER ID CARD.pdf", None), ("SAMPLE.pdf", None),
+])
+def test_classify_space_forms_and_what_is_not_a_cv(name, key):
+    assert dv.classify(name) == key
+
+
+def test_id_card_cv_patterns_and_presence_only():
+    assert R.FILE_PATTERNS["id_card_cv"] == ["id card cv", "id_card_cv", "id_card"]
+    assert not {"id card cv", "id_card", "id card"} & set(R.FILE_PATTERNS["student_nid"])
+    assert R.PRESENCE_ONLY == {"id_card_cv"}
+    assert R.TITLES["id_card_cv"] == "03 ID Card / CV"
+
+
+def test_death_certificates_stand_in_for_a_parents_nid():
+    assert R.ALTERNATIVES == {"father_nid": ["father_death_cert"], "mother_nid": ["mother_death_cert"]}
+    assert R.TITLES["father_death_cert"] == "05 Father Death Certificate"
+    assert R.TITLES["mother_death_cert"] == "05 Mother Death Certificate"
+    assert "death cert" in R.FILE_PATTERNS["death_cert"]
+    for key in ("id_card_cv", "father_death_cert", "mother_death_cert", "death_cert", "student_nid"):
+        assert key in R.OPTIONAL
+        assert all(key not in req for req in R.REQUIRED.values())
+
+
+def test_required_lists_are_unchanged():
+    base = ["passport", "photo", "birth_cert", "father_nid", "mother_nid", "family_cert",
+            "academic", "bank", "trade_license"]
+    assert R.REQUIRED == {"KLP": base, "EAP": base, "BACHELOR": base, "MASTER": base + ["income_tax"]}
+
+
+def test_p2_income_tax_stays_required_for_masters():
+    assert "income_tax" in R.REQUIRED["MASTER"]
+    assert all("income_tax" not in R.REQUIRED[p] for p in ("KLP", "EAP", "BACHELOR"))
+
+
+def test_p4_study_plan_is_never_required():
+    assert all("personal_statement" not in req for req in R.REQUIRED.values())
+    assert "personal_statement" in R.OPTIONAL
+
+
+def test_every_document_key_has_a_title_and_the_old_constants_stay():
+    for key in set(R.FILE_PATTERNS) | set(R.OPTIONAL) | {k for v in R.REQUIRED.values() for k in v}:
+        assert key in R.TITLES, key
+    # read by the DOCCHECK parity test and the parked rules branch
+    for name in ("PROGRAMS", "MIN_BANK_TAKA", "MIN_TAX_PAID_TAKA", "MIN_NET_WEALTH_TAKA",
+                 "PASSPORT_MIN_MONTHS", "FAMILY_CERT_MAX_MONTHS", "BANK_MIN_ACCOUNT_MONTHS",
+                 "BANK_MIN_STATEMENT_MONTHS", "BANK_RELAXED_STATEMENT_MONTHS", "PHOTO_RATIO",
+                 "PHOTO_FORMATS", "MIN_OPENING_BALANCE", "PREFERRED_OPENING_MAX", "MIN_COLOUR_PERCENT",
+                 "IDENTITY_DOCS", "QR_DOCS", "TRANSLATION_WORDS", "BANGLA_RANGE", "NOTARY_WORDS",
+                 "LAWYER_PAD_WORDS", "APOSTILLE_WORDS", "PROVISIONAL_WORDS", "ONLINE_BIRTH_WORDS",
+                 "OPENING_BALANCE_WORDS", "SOLVENCY_WORDS", "SEAL_WORDS", "USD_WORDS",
+                 "UNION_ISSUER_WORDS", "REF_NO_WORDS", "TRADE_RUNNING_WORDS", "BOILERPLATE_NUMBERS",
+                 "TYPED_DOCS", "BALANCE_LABELS", "TAX_PAID_LABELS", "ID_NUMBER_LABELS", "DOB_LABELS",
+                 "FISCAL_LABELS"):
+        assert hasattr(R, name), name
+    assert not set(R.BALANCE_LABELS) & set(R.OPENING_BALANCE_WORDS)

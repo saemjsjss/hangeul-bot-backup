@@ -13,7 +13,8 @@ What it does per student:
   4. Writes an Excel report: one row per document with verdict + reason, and a
      summary sheet for the whole run.
 
-Verdicts: PASS · FLAG (needs a human eye) · FAIL · MISSING
+Verdicts: PASS · FLAG (needs a human eye) · FAIL · MISSING · ERROR (the file could not be
+checked — locked, unrenderable, OCR broke; never a document problem, retried next pass)
 
 CLI (run from the BOT folder):
   python -m src.verify.doc_verifier --student "SAMPLE STUDENT ONE"
@@ -29,7 +30,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from src.config import settings
 from src.verify import page_checks as PC
@@ -37,13 +38,22 @@ from src.verify import rules as R
 # The verdict names and the name rules live in common, shared with field_check and
 # auto_verify; norm, name_tokens, name_in and student_verdict stay importable from here.
 from src.verify.common import (ERROR, FAIL, FLAG, MISSING, NOTE, PASS,  # noqa: F401
-                               name_in, name_tokens, norm, student_verdict)
+                               CheckError, edit_distance, has_error, name_in, name_tokens, norm,
+                               row_verdict, sponsor_kind, student_verdict)
 
 logger = logging.getLogger(__name__)
 
 DOCS_ROOTS = [settings.docs_root(), settings.konyang_root()]   # an absent one is skipped
 REPORT_DIR = settings.verification_dir()
 TODAY = dt.date.today()
+
+# The portal fields the document check reads.  A change to any of them means the stored
+# verdict must be re-evaluated (auto_verify fingerprints exactly these).
+PORTAL_KEYS_READ = ("Full Name", "Father", "Mother", "DOB", "Gender", "Passport No", "Passport Expiry",
+                    "Sponsor", "SSC GPA", "HSC GPA", "Program")
+
+# Faults in this code, not in a file: they must stop the run, never become an ERROR row.
+CODE_FAULTS = (NameError, AttributeError, ImportError, TypeError)
 
 
 # --- text extraction ---------------------------------------------------------------
@@ -92,14 +102,17 @@ def _ocr_image(arr, turned=None) -> str:
 
 def read_pages(path: Path, max_pages: int = 20, sideways: Optional[List[int]] = None) -> List[str]:
     """The text of each page on its own, in order.  Needed where page ORDER matters — an
-    e-Apostille and the certificate that follows it."""
+    e-Apostille and the certificate that follows it.
+
+    A file that cannot be opened raises CheckError: an empty page list would read as "no
+    number on any page" and be judged, where the truth is that nothing was read."""
     import pymupdf
     if path.suffix.lower() in (".jpg", ".jpeg", ".png"):
         return [" ".join(_ocr_reader().readtext(str(path), detail=0))]
     try:
         doc = pymupdf.open(str(path))
-    except Exception:
-        return []
+    except Exception as e:
+        raise CheckError(f"could not open {path.name}: {type(e).__name__}: {e}") from e
     out: List[str] = []
     try:
         for i, page in enumerate(doc):
@@ -1016,12 +1029,15 @@ def cross_checks(texts: Dict[str, str], student: Dict[str, str]) -> List[Dict[st
 # --- per-student run ----------------------------------------------------------------
 def classify(filename: str) -> Optional[str]:
     """Longest matching pattern wins, so "PASSPORT SIZE PHOTO.jpg" is a photo, not a
-    passport, and "FATHER NID.pdf" is not mistaken for a student NID."""
-    n = norm(filename)
+    passport, and "FATHER NID.pdf" is not mistaken for a student NID.
+
+    The name is read as it is and with "_" as a space, so the portal's own key form
+    ("family_cert_1234.pdf") and the ZIP's title form ("FAMILY CERT.pdf") both match."""
+    names = {norm(filename), norm(filename.replace("_", " "))}
     best, best_len = None, 0
     for key, pats in R.FILE_PATTERNS.items():
         for p in pats:
-            if p in n and len(p) > best_len:
+            if len(p) > best_len and any(p in n for n in names):
                 best, best_len = key, len(p)
     return best
 
