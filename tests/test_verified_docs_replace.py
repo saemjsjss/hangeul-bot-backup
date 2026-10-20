@@ -134,8 +134,9 @@ def run(w, **kw):
 
 
 def files(folder):
-    """{name: bytes} of the files directly in a folder (what the document check reads)."""
-    return {f.name: f.read_bytes() for f in sorted(folder.iterdir()) if f.is_file() and f.name != vd.LOCAL_DONE_MARKER}
+    """{name: bytes} of the files directly in a folder (what the document check reads: not the
+    marker, nor the sweep's note of a hold, nor any other dot file)."""
+    return {f.name: f.read_bytes() for f in sorted(folder.iterdir()) if f.is_file() and not f.name.startswith(".")}
 
 
 def set_aside(folder):
@@ -381,10 +382,41 @@ def test_the_breaker_holds_back_a_student_with_more_than_half_the_files_changed(
              "   • SAMPLE STUDENT ONE (A99900001) — KOREAN LANGUAGE PROGRAM (KLP), 2 of 3 file(s) differ",
              "   To replace them once checked: python -m src.sheets.verified_docs --confirm-replace <passport number>"]
     assert auto_sync.doc_lines(result, state)[2:] == alert              # after the student who was replaced
-    again = run(world)
-    assert again["held"] == result["held"] and auto_sync.doc_lines(again, state) == []    # once a day
+    assert auto_sync.doc_lines(result, state)[2:] == []                 # once a day
     state["daily_alerts"]["docs_held"]["day"] = "2026-01-01"
-    assert auto_sync.doc_lines(again, state) == alert                                     # a new day: again
+    assert auto_sync.doc_lines(result, state)[2:] == alert              # a new day: again
+
+
+def a_day_later(*folders):
+    """The sweep's note of a hold, as if it had been made yesterday."""
+    for folder in folders:
+        if (folder / vd.SWEEP_HELD).exists():
+            (folder / vd.SWEEP_HELD).write_text("2026-01-01", encoding="utf-8")
+
+
+def test_a_student_held_back_is_not_fetched_again_until_the_next_day(world):
+    held = add(world, 1, {"PASSPORT.jpg": b"p2", "PHOTO.jpg": b"f2"}, docs="passport_1_100.jpg|photo_1_100.jpg",
+               marker="passport_1_100.jpg|photo_1_100.jpg", local={"PASSPORT.jpg": b"p1", "PHOTO.jpg": b"f1"})
+    os.utime(held / vd.LOCAL_DONE_MARKER, (1_700_000_000, 1_700_000_000))   # the oldest marker of all
+    others = legacy_students(world, vd.REFRESH_PER_RUN, start=2)
+    run(world)
+    assert world.gets[0] == "1" and len(world.gets) == vd.REFRESH_PER_RUN
+    assert (held / vd.SWEEP_HELD).read_text(encoding="utf-8") == TODAY
+    assert marker(held) == "passport_1_100.jpg|photo_1_100.jpg"           # the marker stays as it was (A5)
+
+    result = run(world)                                                   # the same day: its place goes on
+    assert world.gets == ["2"] and result["held"] == [] and result["refreshed"][0][1].endswith("(A99900002)")
+    assert run(world)["refreshed"] == [] and world.gets == []             # nothing else to do today
+
+    a_day_later(held)
+    result = run(world)
+    assert world.gets == ["1"] and result["held"][0][1] == "SAMPLE STUDENT ONE (A99900001)"
+    assert all(vd._read_marker(f)[0] == "v2" and not (f / vd.SWEEP_HELD).exists() for f in others)
+
+    world.zips["1"] = zip_of({"PASSPORT.jpg": b"p1", "PHOTO.jpg": b"f1"})   # the portal's copy is the same again
+    a_day_later(held)
+    assert run(world)["refreshed"] == [(PROG, "SAMPLE STUDENT ONE (A99900001)", 0, [], 0)]
+    assert marker(held).startswith("v2\n") and not (held / vd.SWEEP_HELD).exists()
 
 
 def test_the_breaker_holds_back_every_student_when_more_than_two_would_be_replaced(world):
@@ -401,6 +433,8 @@ def test_the_breaker_holds_back_every_student_when_more_than_two_would_be_replac
     assert all(files(f)["PASSPORT.jpg"].startswith(b"old") and vd._read_marker(f)[0] == "v1" for f in folders)
 
     world.students.pop()                                                 # two would be replaced: both are
+    assert run(world)["refreshed"] == [] and world.gets == []             # not before the next day
+    a_day_later(*folders)
     result = run(world)
     assert result["held"] == [] and sorted(r[4] for r in result["refreshed"]) == [1, 1]
     assert [files(f)["PASSPORT.jpg"] for f in folders[:2]] == [b"new 1", b"new 2"]
@@ -617,6 +651,8 @@ def check(monkeypatch, tmp_path):
     monkeypatch.setattr(av, "summary_lines", lambda result: list(result["lines"]))
     monkeypatch.setattr(av, "finish_reports", finish_reports, raising=False)
     monkeypatch.setattr(av, "ROLLOUT_TITLE", "🔍 Document check — rules updated", raising=False)
+    monkeypatch.setattr(av, "mark_rollout_announced",
+                        lambda complete=None, at=None: w.events.append(("marked", complete)) or True, raising=False)
     monkeypatch.setattr(sheet_hooks, "on", lambda: True)
     monkeypatch.setattr(sheet_hooks, "store_readable", lambda path: True)
     monkeypatch.setattr(sheet_hooks, "after_sync", lambda cloud: w.handed.append(cloud))
@@ -625,12 +661,14 @@ def check(monkeypatch, tmp_path):
 
 def test_the_check_message_goes_out_before_the_reports_and_their_note_after(check):
     check.result["rollout_lines"] = ["Rules unversioned -> 2026-10-21.1: 1 student(s) re-evaluated"]
+    check.result["rollout_complete"] = "2026-10-21T09:00:00"
     check.notes = ["📄 DOCUMENT CHECK.xlsx was open in Excel — this pass saved 'DOCUMENT CHECK (updated 09-15).xlsx'"]
     lines = auto_sync.run_once()
     assert check.events == [
         ("checked",),
         ("sent", "🔍 Document check", ["🔍 Documents checked: 1", "   • SAMPLE STUDENT ONE (KLP) — PASS"]),
         ("sent", "🔍 Document check — rules updated", ["Rules unversioned -> 2026-10-21.1: 1 student(s) re-evaluated"]),
+        ("marked", "2026-10-21T09:00:00"),                              # sent, so marked sent
         ("reports", True),
         ("sent", "🔍 Document check", check.notes)]
     cloud, = check.handed
@@ -662,8 +700,47 @@ def test_a_check_that_could_not_run_is_told_from_the_third_run_in_a_row(check):
     assert "verify" not in json.loads(auto_sync.STATE_PATH.read_text(encoding="utf-8"))["failures"]
 
 
+def test_a_roll_out_summary_telegram_refused_is_not_marked_sent(check, monkeypatch):
+    check.result.update(lines=[], rollout_lines=["Rules unversioned -> 2026-10-21.1: 1 student(s) re-evaluated"],
+                        rollout_complete="2026-10-21T09:00:00")
+
+    def refuse_the_roll_out(lines, title=auto_sync.SYNC_TITLE):
+        check.events.append(("refused" if title == "🔍 Document check — rules updated" else "sent", title, list(lines)))
+        return title != "🔍 Document check — rules updated"
+
+    monkeypatch.setattr(auto_sync, "notify", refuse_the_roll_out)
+    auto_sync.run_once()
+    assert [e[0] for e in check.events] == ["checked", "refused", "reports"]      # handed out again next pass
+    check.events[:] = []
+    auto_sync.run_once(send=False)                                                # --no-notify: nothing sent
+    assert [e[0] for e in check.events] == ["checked", "reports"]
+
+
+def test_a_report_open_in_excel_is_told_once_a_day(check):
+    check.result["lines"] = []
+    for minute in ("09-15", "09-30"):
+        check.notes = [f"📄 DOCUMENT CHECK.xlsx was open in Excel — this pass saved 'DOCUMENT CHECK (updated {minute}).xlsx'; "
+                       "close it and the next pass writes the usual file again."]
+        auto_sync.run_once()
+    sent = [e for e in check.events if e[0] == "sent"]
+    assert len(sent) == 1 and "(updated 09-15)" in sent[0][2][0]
+    check.notes = ["📄 FIELD CHECK.xlsx was open in Excel — this pass saved 'FIELD CHECK (updated 09-45).xlsx'; "
+                   "close it and the next pass writes the usual file again."]
+    auto_sync.run_once()                                                          # the other report: its own note
+    assert [e for e in check.events if e[0] == "sent"][-1] == ("sent", "🔍 Document check", check.notes)
+    state = json.loads(auto_sync.STATE_PATH.read_text(encoding="utf-8"))
+    state["daily_alerts"]["report_note:DOCUMENT CHECK"]["day"] = "2026-01-01"
+    auto_sync.STATE_PATH.write_text(json.dumps(state), encoding="utf-8")
+    check.notes = [sent[0][2][0].replace("09-15", "10-00")]
+    auto_sync.run_once()                                                          # a new day: again
+    assert [e for e in check.events if e[0] == "sent"][-1] == ("sent", "🔍 Document check", check.notes)
+
+
 @pytest.mark.parametrize("line", ["⚠️ Document check stopped: results.json could not be read — nothing was overwritten",
-                                  "⚠️ Document check paused: pyzbar is missing — no student was checked"])
+                                  "⚠️ Document check paused: pyzbar is missing — no student was checked",
+                                  "⚠️ results.json is unreadable (JSONDecodeError: Expecting value); it is kept as "
+                                  "results.corrupt-2026-10-21_090000.json — the check went on from results.json.bak "
+                                  "(saved 2026-10-21 08:45)"])
 def test_a_stopped_or_paused_check_is_told_once_a_day(check, line):
     check.result.update(lines=[line], reports_due=False)
     auto_sync.run_once()

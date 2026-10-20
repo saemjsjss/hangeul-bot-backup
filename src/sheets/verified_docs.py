@@ -292,6 +292,11 @@ REFRESH_PER_RUN = 8             # catch-up sweep: students per run, oldest marke
 # every file look replaced, so nothing is replaced (and it is reported) when one student would
 # have more than half of their files replaced, or more than SWEEP_MAX_STUDENTS students would.
 SWEEP_MAX_STUDENTS = 2
+# A student the breaker held back is not fetched again by the sweep the same day (their marker
+# stays as it was, so they are compared again from the next day): "<student>/.sweep_held" holds
+# that day. Without it, held students stay oldest in the queue and every run would download the
+# same ZIPs and never reach anyone else.
+SWEEP_HELD = ".sweep_held"
 # The verified list is implausible (a changed page layout?) when, from LAYOUT_MIN_ROWS rows on,
 # more than LAYOUT_MAX_BLANK of them show no document list or no passport number.
 LAYOUT_MIN_ROWS = 10
@@ -402,6 +407,29 @@ def _read_marker(folder: Path) -> Tuple[str, Optional[str]]:
     if sep and head.strip() == MARKER_VERSION:
         return MARKER_VERSION, rest.strip()
     return "v1", text.strip()
+
+
+def _today() -> str:
+    return date.today().isoformat()
+
+
+def _held_today(folder: Path) -> bool:
+    """Was this student held back by the sweep's circuit breaker today (SWEEP_HELD)?"""
+    try:
+        return (folder / SWEEP_HELD).read_text(encoding="utf-8").strip() == _today()
+    except OSError:
+        return False
+
+
+def _note_held(folder: Path, held: bool) -> None:
+    """Remember (or forget) that the breaker held this student back today. Never raises."""
+    try:
+        if held:
+            (folder / SWEEP_HELD).write_text(_today(), encoding="utf-8")
+        else:
+            (folder / SWEEP_HELD).unlink(missing_ok=True)
+    except OSError as e:
+        logger.warning("could not note the catch-up hold for %s: %s", folder.name, e)
 
 
 def _write_marker(folder: Path, docs: str) -> None:
@@ -562,7 +590,8 @@ async def run_local(root: Path, limit: int = 0, skip_drive_done: bool = True,
     once every entry and the shrinking succeeded, so a run that stops halfway is done again.
     A student whose marker is older than this (no "v2" line) is compared once more by the
     catch-up sweep, REFRESH_PER_RUN a run, oldest marker first, which replaces nothing when the
-    circuit breaker trips (SWEEP_MAX_STUDENTS); such a student's marker is left for the next run.
+    circuit breaker trips (SWEEP_MAX_STUDENTS); such a student's marker is left as it was, and the
+    sweep fetches them again from the next day (SWEEP_HELD).
 
     Returns {"saved": [(program, name, added, shrunk, replaced)] for first downloads,
     "redownloaded": [the same] for students fetched again because their portal files changed,
@@ -619,7 +648,9 @@ async def run_local(root: Path, limit: int = 0, skip_drive_done: bool = True,
                     continue
                 current = was == now if version == MARKER_VERSION else was in ("", "ok", now)
                 if current:
-                    if version != MARKER_VERSION or confirm:
+                    if version != MARKER_VERSION and not confirm and _held_today(folder):
+                        skipped += 1                 # held back by the breaker today: tomorrow again
+                    elif version != MARKER_VERSION or confirm:
                         try:
                             at = (folder / LOCAL_DONE_MARKER).stat().st_mtime
                         except OSError:
@@ -668,7 +699,8 @@ async def _sweep(client, root: Path, queue: List[Tuple[float, int, Dict[str, str
     """The catch-up sweep: students whose marker predates the byte comparison (or, `confirmed`,
     the --confirm-replace students) are fetched again and compared, REFRESH_PER_RUN a run, oldest
     marker first.  Equal files are left alone and the marker is upgraded.  Replacing is held back,
-    files and marker untouched (the student comes back next run), when a student would have more
+    files and marker untouched (the student is compared again from the next day, SWEEP_HELD, so
+    the run's places go to the others meanwhile), when a student would have more
     than half of their files replaced or more than SWEEP_MAX_STUDENTS students would — unless
     `confirmed`.  Adds to result["refreshed"] / result["held"] / result["failed"]; -> failures."""
     queue = sorted(queue, key=lambda c: (c[0], c[1]))
@@ -676,13 +708,14 @@ async def _sweep(client, root: Path, queue: List[Tuple[float, int, Dict[str, str
         queue = queue[:REFRESH_PER_RUN]
     failed = 0
     waiting: List[Tuple[Dict[str, str], Path, _Plan]] = []     # would replace: decided at the end
-    held: List[Tuple[Dict[str, str], int, int]] = []
+    held: List[Tuple[Dict[str, str], Path, int, int]] = []
     would = 0                                                   # students with something to replace
 
     def finish(s, folder, plan):
         added, replaced = _apply(plan, folder, root)
         shrunk = shrink_large_files(folder, root)
         _write_marker(folder, s.get("docs", ""))
+        _note_held(folder, False)
         result["refreshed"].append((program_folder(s), folder_name(s), added, shrunk, replaced))
         print(f"   catch-up {folder_name(s)}: {plan.same} file(s) the same, {added} added, {replaced} replaced"
               + (f", {len(plan.ambiguous)} shrunk copy(ies) without an original left alone"
@@ -697,7 +730,7 @@ async def _sweep(client, root: Path, queue: List[Tuple[float, int, Dict[str, str
             if plan.replaced and not confirmed:
                 would += 1
                 if plan.replaced * 2 > plan.files or would > SWEEP_MAX_STUDENTS:
-                    held.append((s, plan.replaced, plan.files))
+                    held.append((s, folder, plan.replaced, plan.files))
                     continue
                 waiting.append((s, folder, plan))
                 continue
@@ -707,7 +740,7 @@ async def _sweep(client, root: Path, queue: List[Tuple[float, int, Dict[str, str
             result["failed"].append((folder_name(s), str(e)))
             print(f"   catch-up {folder_name(s)}: FAILED - {e}")
     if would > SWEEP_MAX_STUDENTS:                 # too many at once: none is replaced
-        held += [(s, plan.replaced, plan.files) for s, _, plan in waiting]
+        held += [(s, folder, plan.replaced, plan.files) for s, folder, plan in waiting]
         waiting = []
     for s, folder, plan in waiting:
         try:
@@ -716,7 +749,8 @@ async def _sweep(client, root: Path, queue: List[Tuple[float, int, Dict[str, str
             failed += 1
             result["failed"].append((folder_name(s), str(e)))
             print(f"   catch-up {folder_name(s)}: FAILED - {e}")
-    for s, differ, files in held:
+    for s, folder, differ, files in held:
+        _note_held(folder, True)                    # not fetched again until tomorrow
         result["held"].append((program_folder(s), folder_name(s), differ, files))
         print(f"   catch-up {folder_name(s)}: the portal ZIP differs for {differ} of {files} file(s) — "
               "held back, nothing replaced (python -m src.sheets.verified_docs --confirm-replace "

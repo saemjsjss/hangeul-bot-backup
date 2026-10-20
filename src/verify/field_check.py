@@ -239,6 +239,22 @@ def _sex(value: str) -> str:
     return ""
 
 
+def _dob_read(text: str, portal: dt.date) -> str:
+    """The date of birth this document gives instead of the portal's, "" when it gives none
+    that differs: the passport's MRZ date when its check digits can be trusted
+    (doc_verifier.mrz_dob), else the date beside a "Date of Birth" label on a readable
+    document (doc_verifier.labelled_dob). Any other date on the page says nothing."""
+    try:
+        mrz = dv.mrz_dob(dv.passport_mrz(text) or {}, portal)
+    except Exception as e:                    # an MRZ that cannot be parsed is simply not read
+        logger.debug("MRZ not read: %s", e)
+        mrz = None
+    if mrz:
+        return f"{mrz} in its machine-readable line" if mrz != portal else ""
+    found = dv.labelled_dob(text) if readable(text) else None
+    return f"{found} as the date of birth" if found and found != portal else ""
+
+
 def _mrz_sex(text: str) -> str:
     """The sex in the passport's machine-readable line, when the line was read well
     enough to trust (doc_verifier.passport_mrz; "" without it)."""
@@ -344,6 +360,10 @@ def check_field(field: str, value: str, texts: Dict[str, str],
             if re.search(r"P<[A-Z<]{3,}", text.upper()) or "<<<" in text:
                 if d.strftime("%y%m%d") in re.sub(r"[^0-9]", "", text):
                     return MATCH, f"found in the machine-readable line of {name}"
+            if field == "DOB":
+                read = _dob_read(text, d)
+                if read:
+                    differs.append(f"{name} shows {read}")
         elif field in NUMBER_FIELDS:
             flat = re.sub(r"\W", "", norm(text))
             if re.sub(r"\W", "", v).lower() in flat:
@@ -391,6 +411,12 @@ def check_field(field: str, value: str, texts: Dict[str, str],
             other = "expiry" if field == "Passport Issue" else "issue"
             return MATCH, f"consistent with the passport's {other} date ({ok})"
     where = ", ".join(readable_docs)
+    if field == "DOB":
+        # only a date read where the document labels the date of birth (or a trusted MRZ) is a
+        # real difference: a passport's issue or expiry date, or a notary's, is not
+        if differs:
+            return DIFFERS, f"{'; '.join(differs[:2])} instead"
+        return NOT_CONFIRMED, f"not found on {where} (no date of birth could be read there)"
     if field in DATE_FIELDS:
         others_seen = sorted({d.isoformat() for n in readable_docs for d in find_dates(docs[n])})
         if others_seen:

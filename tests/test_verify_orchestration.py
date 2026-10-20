@@ -520,6 +520,53 @@ def test_a_store_restored_from_the_backup_says_so_and_goes_on(world):
     assert set(world.store()["documents"]) == {P1, P2}
 
 
+def test_a_store_restored_from_the_backup_is_written_back_and_said_once(world):
+    world.add(1, {"passport.pdf": "PASS: valid"})
+    av.run()
+    good = av.STORE_PATH.read_text(encoding="utf-8")
+    av._bak_path().write_text(good, encoding="utf-8")
+    av.STORE_PATH.write_text("{corrupt", encoding="utf-8")
+    r1 = av.run()                                                        # an idle pass: nothing to check
+    assert r1["checked"] == [] and "results.json.bak" in r1["store_note"]
+    assert world.store()["documents"] == json.loads(good)["documents"]   # results.json readable again
+    assert json.loads(av._bak_path().read_text(encoding="utf-8")) == json.loads(good)   # the backup left alone
+    r2 = av.run()
+    assert "store_note" not in r2 and av.summary_lines(r2) == []
+    assert [p.read_bytes() for p in av.REPORT_DIR.glob("results.corrupt-*.json")] == [b"{corrupt"]
+
+
+def test_a_store_that_stays_unreadable_gives_the_same_line_and_one_copy(world, monkeypatch):
+    av.STORE_PATH.write_bytes(b"{ broken")
+    errors = []
+    for second in (0, 1, 2):
+        monkeypatch.setattr(av, "_now", lambda s=second: dt.datetime(2026, 10, 21, 9, 0, s))
+        errors.append(av.run()["store_error"])
+    assert errors[0] == errors[1] == errors[2] and "results.corrupt-2026-10-21_090000.json" in errors[0]
+    assert [p.name for p in av.REPORT_DIR.glob("results.corrupt-*.json")] == ["results.corrupt-2026-10-21_090000.json"]
+    from src.sheets import auto_sync
+    state = {}
+    line = av.summary_lines({"store_error": errors[0]})[0]
+    assert auto_sync._once_a_day(state, "verify_stopped", line) == [line]
+    assert auto_sync._once_a_day(state, "verify_stopped", av.summary_lines({"store_error": errors[1]})[0]) == []
+    av.STORE_PATH.write_bytes(b"{ broken differently")                  # other bytes: kept too
+    monkeypatch.setattr(av, "_now", lambda: dt.datetime(2026, 10, 21, 9, 15))
+    av.run()
+    assert len(list(av.REPORT_DIR.glob("results.corrupt-*.json"))) == 2
+
+
+def test_a_long_run_keeps_its_lock_fresh(monkeypatch):
+    av.LOCK_PATH.write_text(str(os.getpid()), encoding="utf-8")
+    os.utime(av.LOCK_PATH, (time.time() - av.LOCK_STALE_SECONDS + 60,) * 2)
+    av.save_store(STORE_ONE)                                             # every student saved touches it
+    assert time.time() - av.LOCK_PATH.stat().st_mtime < 60 and av._lock_held(av.LOCK_PATH)
+    other = str(os.getppid())
+    av.LOCK_PATH.write_text(other, encoding="utf-8")
+    old = time.time() - 3600
+    os.utime(av.LOCK_PATH, (old, old))
+    av.save_store(STORE_ONE)                                             # another process's lock: untouched
+    assert abs(av.LOCK_PATH.stat().st_mtime - old) < 2
+
+
 def test_folders_or_portal_coming_back_nearly_empty_pause_the_pass(world):
     for n in range(1, 7):
         world.add(n, {"passport.pdf": "PASS: valid"})
@@ -985,6 +1032,82 @@ def test_a_fail_row_with_an_error_finding_is_retried(world):
     assert av.pending(world.store(), world.student_folders(), world.portal_students()) == [a]
 
 
+def test_error_rows_kept_with_the_verdict_unchanged_are_told_once(world):
+    a = world.add(1, {"passport.pdf": "FAIL: the passport expires in 5 months"})
+    av.run()
+    world.write(a, "passport.pdf", "FAIL: the passport expires in 5 months\nERROR: the QR reader failed")
+    for _ in range(av.MAX_ERROR_PASSES - 1):
+        assert any(line.startswith("   ⚠️ 1 student(s) hit a read error — retried") for line in av.summary_lines(av.run()))
+    r = av.run()                                                         # kept: FAIL before, FAIL now
+    rec = world.store()["documents"][a]
+    assert rec["verdict"] == "FAIL" and rec["retry"]["final"] and r["errors"] == []
+    assert av.summary_lines(r) == [
+        "🔍 Documents checked: 0 (1 re-checked, verdict unchanged)",
+        "   ⚠️ 1 student(s) could not be checked 3 passes in a row — the ERROR rows are kept until the file "
+        "changes: SAMPLE STUDENT 1 (01 Passport: the QR reader failed)"]
+    assert av.summary_lines(av.run()) == []                              # said once
+
+
+def test_a_new_students_fail_with_a_read_error_names_the_error_when_kept(world):
+    world.add(1, {"passport.pdf": "FAIL: the passport expires in 5 months\nERROR: the QR reader failed"})
+    for _ in range(av.MAX_ERROR_PASSES - 1):
+        av.run()
+    lines = av.summary_lines(av.run())
+    assert lines[:2] == ["🔍 Documents checked: 1",
+                         "   • SAMPLE STUDENT 1 (KLP) — FAIL (01 Passport: the passport expires in 5 months)"]
+    assert lines[2].startswith("   ⚠️ 1 student(s) could not be checked 3 passes in a row")
+
+
+def test_a_file_that_never_opens_is_not_read_again_every_day(world):
+    a = world.add(1, {"passport.pdf": "PASS: valid", "bank.pdf": "LOCKED for good"})
+    for _ in range(av.MAX_ERROR_PASSES):
+        r = av.run()
+    rec = world.store()["documents"][a]
+    assert rec["verdict"] == "ERROR" and rec["retry"]["final"] and rec["retry"]["count"] == av.MAX_ERROR_PASSES
+    assert [(e["verdict"], e["first"]) for e in r["checked"]] == [("ERROR", True)]   # told once, as a first check
+    reads = len(world.reads)
+    for day in (22, 23):                                                 # the daily re-evaluation, then the queue
+        world.set_now(dt.datetime(2026, 10, day, 9, 0))
+        r = av.run(budget=0)
+        rec = world.store()["documents"][a]
+        assert r["errors"] == [] and r["checked"] == [] and av.summary_lines(r) == []
+        assert "needs_ocr" not in rec and rec["retry"]["count"] == av.MAX_ERROR_PASSES and rec["fingerprint"]
+        assert av.pending(world.store(), world.student_folders(), world.portal_students()) == []
+    assert len(world.reads) == reads                                     # never read again
+    world.write(a, "bank.pdf", "PASS: balance above the minimum")        # a new upload is read at once
+    r = av.run()
+    assert [(e["previous"], e["verdict"]) for e in r["checked"]] == [("ERROR", "PASS")]
+
+
+def test_a_record_from_before_this_release_that_hits_a_read_error_is_not_a_first_check(world):
+    a = world.add(1, {"passport.pdf": "FAIL: the passport expired"})
+    av.run()
+    store = world.store()
+    store["documents"][a].pop("first_checked")                           # as the code before this release left it
+    av.STORE_PATH.write_text(json.dumps(store), encoding="utf-8")
+    world.set_now(dt.datetime(2026, 10, 21, 11, 0))
+    world.write(a, "passport.pdf", "LOCKED")
+    assert [e["count"] for e in av.run()["errors"]] == [1]
+    world.set_now(dt.datetime(2026, 10, 21, 12, 0))
+    world.write(a, "passport.pdf", "PASS: valid")
+    r = av.run()
+    assert [(e["previous"], e["verdict"], e["first"]) for e in r["checked"]] == [("FAIL", "PASS", False)]
+    assert av.summary_lines(r)[1] == "   • SAMPLE STUDENT 1 (KLP) — FAIL -> PASS"
+    rec = world.store()["documents"][a]
+    assert rec["previous_verdict"] == "FAIL"
+    assert rec["first_checked"] == "2026-10-21T10:00:00" and rec["checked"] == "2026-10-21T12:00:00"
+
+
+def test_a_new_student_whose_first_read_failed_is_still_a_first_check(world):
+    a = world.add(1, {"passport.pdf": "LOCKED"})
+    av.run()
+    assert world.store()["documents"][a]["first_pending"]
+    world.write(a, "passport.pdf", "PASS: valid")
+    r = av.run()
+    assert [(e["previous"], e["first"]) for e in r["checked"]] == [(None, True)]
+    assert "first_pending" not in world.store()["documents"][a]
+
+
 # --------------------------------------------------------------------------- reports (B14a)
 
 REPORT_STORE = {"documents": {P1: {"student": "SAMPLE STUDENT 1", "program": "KLP", "verdict": "ERROR",
@@ -1108,6 +1231,8 @@ def test_a_roll_out_spans_passes_pauses_the_queue_and_is_announced_once(world):
     assert av.summary_lines(r2) == ["🔍 Documents checked: 1 (1 re-checked, verdict unchanged)",
                                    "   • SAMPLE STUDENT 5 (KLP) — PASS"]
     assert r2["reports_due"]
+    assert world.store()["meta"]["rollout"]["announced"] is None          # handed out, not yet sent
+    assert av.mark_rollout_announced(r2["rollout_complete"])              # auto_sync: Telegram accepted it
     meta = world.store()["meta"]
     assert meta["rules_version"] == VERSION and "rollout" not in meta
     assert meta["last_rollout"]["announced"] and meta["last_rollout"]["needs_ocr"] == [P4]
@@ -1142,12 +1267,45 @@ def test_records_the_saved_text_cannot_update_never_hold_the_queue(world):
         "verdicts stay as they were.",
         "Reports refreshed: DOCUMENT CHECK.xlsx / FIELD CHECK.xlsx"]
     assert [e["passport"] for e in r["checked"]] == [P5, P2]             # the queue resumed at once
+    assert av.mark_rollout_announced(r["rollout_complete"])
     store = world.store()
     assert store["meta"]["rules_version"] == VERSION and store["meta"]["last_rollout"]["skipped"] == [P3, P4]
     assert "rules_version" not in store["documents"][P3] and store["documents"][P3]["reeval_error"]
     assert "rules_version" not in store["documents"][P4]
     r2 = av.run()
     assert r2["rollout_lines"] == [] and "rollout" not in world.store()["meta"]       # not restarted
+
+
+def _gone_world(world, n=8):
+    for i in range(1, n + 1):
+        world.add(i, {"passport.pdf": "PASS: valid\nNEW-RULE FLAG: a rule of the new version"})
+    world.set_now(dt.datetime(2026, 10, 20, 10, 0))
+    av.run(budget=0)
+    world.legacy()
+    world.new_rules = True
+    world.set_now(dt.datetime(2026, 10, 21, 10, 0))
+    return {p: world.students.pop(p) for p in PASSPORTS[4:n]}           # half the list missing
+
+
+def test_many_students_missing_at_once_hold_the_roll_out_for_one_pass(world):
+    missing = _gone_world(world)
+    r1 = av.run()
+    assert r1["rollout_lines"] == [] and world.store()["meta"]["rollout"]["gone"] == sorted(missing)
+    world.students.update(missing)                                       # the full list is back
+    r2 = av.run()
+    assert r2["rollout_lines"][0] == (f"Rules unversioned -> {VERSION}: 8 student(s) re-evaluated from the saved "
+                                      "text (no new OCR).")
+    assert "8 verdict(s) changed:" in r2["rollout_lines"] and not any("could not be re-evaluated" in line
+                                                                      for line in r2["rollout_lines"])
+
+
+def test_students_missing_on_two_passes_in_a_row_are_skipped(world):
+    _gone_world(world)
+    assert av.run()["rollout_lines"] == []
+    r2 = av.run()
+    assert r2["rollout_lines"][0].startswith(f"Rules unversioned -> {VERSION}: 4 student(s) re-evaluated")
+    assert ("4 student(s) could not be re-evaluated (a read error, or no longer on the portal or this PC) — their "
+            "verdicts stay as they were.") in r2["rollout_lines"]
 
 
 def test_a_miss_that_escapes_a_check_still_waits_for_the_queue(world):
@@ -1342,7 +1500,10 @@ def test_a_roll_out_finished_from_the_console_is_handed_out_by_the_next_pass(wor
     av.main(["--recheck"])
     r = av.run()
     assert r["rollout_lines"] and r["rollout_lines"][0].startswith("Rules unversioned -> ")
+    assert av.run()["rollout_lines"] == r["rollout_lines"]               # not sent yet: handed out again
+    assert av.mark_rollout_announced(r["rollout_complete"])
     assert "rollout" not in world.store()["meta"] and av.run()["rollout_lines"] == []
+    assert not av.mark_rollout_announced(r["rollout_complete"])          # nothing left to mark
 
 
 def test_dry_run_refuses_live_data(world, tmp_path, sent, capsys):
@@ -1380,7 +1541,7 @@ def test_a_dry_run_works_on_a_copy_with_the_export_and_sends_nothing(world, tmp_
     assert "After:  FAIL 0, REVIEW 1, INCOMPLETE 0, PASS 3" in summary
     assert (f"   • SAMPLE STUDENT 1 ({P1}, KLP) — PASS -> REVIEW (08 Bank Solvency & Statement: the opening "
             "balance is above the preferred maximum) [rules]") in summary
-    assert "0 ERROR row(s):" in summary and "0 birth-certificate FAIL(s)" in summary
+    assert "0 ERROR row(s):" in summary and "0 birth-certificate date-of-birth FAIL(s)" in summary
     meta = json.loads((copy / "results.json").read_text(encoding="utf-8"))["meta"]
     assert meta["rollout"]["complete"] and not meta["rollout"]["announced"]
     assert _snapshot(live) == live_files                                 # the original untouched

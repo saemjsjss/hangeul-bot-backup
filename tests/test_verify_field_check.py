@@ -262,6 +262,23 @@ def test_dates_still_match_or_differ():
     assert check("DOB", "2005-03-14", {"04 Birth Certificate": NOISE})[0] == fc.UNREADABLE
 
 
+def test_b6_a_date_of_birth_differs_only_where_it_is_labelled():
+    issue_expiry = {"01 Passport": f"{READ} Date of Issue: 01/02/2022 Date of Expiry: 31/01/2032"}
+    result, detail = check("DOB", "2005-03-14", issue_expiry)
+    assert result == fc.NOT_CONFIRMED and "no date of birth could be read" in detail
+    notary = {"04 Birth Certificate": f"{READ} notarised on 10/10/2026"}
+    assert check("DOB", "2005-03-14", notary)[0] == fc.NOT_CONFIRMED
+    result, detail = check("DOB", "2005-03-14", {"01 Passport": f"{READ} Date of Birth: 15/04/2004 "
+                                                                f"Date of Expiry: 31/01/2032"})
+    assert result == fc.DIFFERS and detail == "01 Passport shows 2004-04-15 as the date of birth instead"
+
+
+def test_b6_a_trusted_machine_readable_date_of_birth_that_differs():
+    line1, line2 = mrz_lines(PASSPORTS[0], "2004-04-15", "2031-01-01")
+    result, detail = check("DOB", "2005-03-14", {"01 Passport": f"{READ}\n{line1}\n{line2}"})
+    assert result == fc.DIFFERS and "2004-04-15 in its machine-readable line" in detail
+
+
 def test_a_passport_date_in_the_machine_readable_line():
     line1, line2 = mrz_lines(PASSPORTS[0], "2005-03-14", "2031-01-01")
     texts = {"01 Passport": f"{NOISE}\n{line1}\n{line2}"}

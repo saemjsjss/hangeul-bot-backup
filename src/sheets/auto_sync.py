@@ -478,25 +478,46 @@ def _failure_cleared(state: Dict, key: str, label: str) -> List[str]:
 # The document check's lines that stand until someone acts (results.json unreadable, the check
 # paused): given at most once a day (_once_a_day), under these keys.
 STANDING_CHECK_LINES = (("⚠️ Document check stopped", "verify_stopped"),
-                        ("⚠️ Document check paused", "verify_paused"))
+                        ("⚠️ Document check paused", "verify_paused"),
+                        ("⚠️ results.json", "verify_restored"))
+
+
+def _report_notes(state: Optional[Dict], notes: List[str]) -> List[str]:
+    """av.finish_reports' notes, each at most once a day per report: a report left open in Excel
+    all day is said once, not on every pass that rewrites it (the note's own time is left out of
+    the comparison)."""
+    out = []
+    for note in notes:
+        m = re.match(r"📄 (.+?)\.xlsx", note)
+        stable = re.sub(r"\(updated \d{2}-\d{2}\)", "(updated)", note)
+        if _once_a_day(state, "report_note:" + (m.group(1) if m else "reports"), stable):
+            out.append(note)
+    return out
 
 
 def _verify_step(state: Dict, cloud: Optional[Dict], send: bool) -> List[str]:
     """The document check (verify_docs) and its messages, in this order: the check's own lines
-    under CHECK_TITLE, a rules roll-out's summary under av.ROLLOUT_TITLE, and only then the two
-    reports (av.finish_reports, which never raises), whose note (a report open in Excel was saved
-    under another name) follows under CHECK_TITLE. So a report left open in Excel never holds a
+    under CHECK_TITLE, a rules roll-out's summary under av.ROLLOUT_TITLE (marked sent in
+    results.json only once Telegram accepted it, av.mark_rollout_announced; otherwise the next
+    pass hands it out again), and only then the two reports (av.finish_reports, which never
+    raises), whose note (a report open in Excel was saved under another name) follows under
+    CHECK_TITLE, at most once a day per report. So a report left open in Excel never holds a
     message back. Each message Telegram accepted goes into cloud["sent"]. A check that could not
     run is counted like the other steps (_failure_line: told from the 3rd run in a row on).
     -> every line given."""
     from src.verify import auto_verify as av
 
+    accepted = {}
+
     def give(msg_lines: List[str], title: str) -> List[str]:
         if not msg_lines:
             return []
         print(chr(10).join(msg_lines))
-        if send and notify(msg_lines, title=title) and cloud is not None:
-            cloud["sent"].append((title, list(msg_lines), time.time()))
+        accepted[title] = None
+        if send and notify(msg_lines, title=title):
+            accepted[title] = time.time()
+            if cloud is not None:
+                cloud["sent"].append((title, list(msg_lines), accepted[title]))
         return list(msg_lines)
 
     try:
@@ -514,12 +535,16 @@ def _verify_step(state: Dict, cloud: Optional[Dict], send: bool) -> List[str]:
     rollout = list((result or {}).get("rollout_lines") or [])
     if rollout:
         out += give(rollout, av.ROLLOUT_TITLE)
+        at = accepted.get(av.ROLLOUT_TITLE)
+        if at is not None:              # sent: marked so; refused (or not sending): handed out again next pass
+            av.mark_rollout_announced(result.get("rollout_complete"),
+                                      time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(at)))
     try:
         notes = list(av.finish_reports(result) or [])
     except Exception as e:
         logger.warning("The document check reports could not be written: %s", e)
         notes = []
-    return out + give(notes, CHECK_TITLE)
+    return out + give(_report_notes(state, notes), CHECK_TITLE)
 
 
 def run_once(send: bool = True, verify: bool = True) -> List[str]:

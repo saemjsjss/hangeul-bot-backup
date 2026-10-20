@@ -79,7 +79,7 @@ FIELD_REPORT = REPORT_DIR / "FIELD CHECK.xlsx"
 DRY_RUN_MARKER = "DRY_RUN_COPY"         # the copy step writes it into a dry run's data folder
 KEEP_DAILY_COPIES = 7
 
-# RAFIQ MD MOTIN UR — our head of branch, not an applicant.
+# a staff member's own record, not an applicant
 SKIP_PASSPORTS = {"A00990004"}
 
 PROGRAM_ORDER = ["KLP", "EAP", "BACHELOR", "MASTER"]
@@ -90,6 +90,8 @@ ROLLOUT_TITLE = "🔍 Document check — rules updated"
 DAILY_REEVAL_HOUR = 7       # the daily re-evaluation starts with the first pass from 07:00
 REEVAL_SECONDS = 1200       # re-evaluation time per pass; the rest continues on the next pass
 MAX_ERROR_PASSES = 3        # passes in a row with a read error before the ERROR rows are kept
+ROLLOUT_GONE_ALLOWED = 3    # students missing from the folders or the portal that never hold a roll-out up;
+ROLLOUT_GONE_SHARE = 0.05   # more than this (and 5% of the store) wait one pass in case the list was cut short
 
 # A fault in the rules themselves (not a document problem): the run stops rather than skip
 # every student one by one and leave a report that looks clean and is worthless.
@@ -208,6 +210,17 @@ def _release_lock() -> None:
         pass
 
 
+def _refresh_lock() -> None:
+    """Keep our lock fresh while we work: a long run (the roll-out from the command line) would
+    otherwise pass LOCK_STALE_SECONDS and have its lock cleared under it by a scheduled pass.
+    Called on every save; touches the lock only when it is this process's."""
+    try:
+        if LOCK_PATH.read_text(encoding="utf-8", errors="replace").strip() == str(os.getpid()):
+            os.utime(LOCK_PATH)
+    except OSError:
+        pass
+
+
 def _lock_pid() -> str:
     try:
         return LOCK_PATH.read_text(encoding="utf-8", errors="replace").strip() or "?"
@@ -262,11 +275,38 @@ def _bak_path() -> Path:
     return STORE_PATH.with_name(STORE_PATH.name + ".bak")
 
 
+def _sha1_of(path: Path) -> str:
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _keep_corrupt() -> Path:
+    """results.json, which cannot be read, copied aside as results.corrupt-<time>.json — once:
+    when a copy with the same bytes is already there, that one is the copy. So a store that stays
+    unreadable pass after pass leaves one copy, and the message naming it stays the same (the
+    standing alert is given once a day, auto_sync._once_a_day). -> the copy."""
+    size, digest = STORE_PATH.stat().st_size, None
+    for old in sorted(STORE_PATH.parent.glob("results.corrupt-*.json")):
+        try:
+            if old.stat().st_size == size:
+                digest = digest or _sha1_of(STORE_PATH)
+                if _sha1_of(old) == digest:
+                    return old
+        except OSError:
+            continue
+    keep = STORE_PATH.with_name(f"results.corrupt-{_now():%Y-%m-%d_%H%M%S}.json")
+    shutil.copy2(STORE_PATH, keep)
+    return keep
+
+
 def load_store() -> Dict[str, Any]:
     """results.json. A missing file is a fresh start (an empty store), unless a results.json.bak
     exists: then, as for an unreadable file, the store comes from the backup, with store["_note"]
-    saying so. An unreadable file is first copied to results.corrupt-<time>.json. With no
-    readable backup either: StoreUnreadable, and nothing is touched."""
+    saying so. An unreadable file is first copied to results.corrupt-<time>.json (once for the
+    same bytes). With no readable backup either: StoreUnreadable, and nothing is touched."""
     bak = _bak_path()
     if not STORE_PATH.exists():
         if not bak.exists():
@@ -277,10 +317,8 @@ def load_store() -> Dict[str, Any]:
             return _parse_store(STORE_PATH)
         except Exception as e:
             problem = f"results.json is unreadable ({type(e).__name__}: {_trim(str(e), 120)})"
-            keep = STORE_PATH.with_name(f"results.corrupt-{_now():%Y-%m-%d_%H%M%S}.json")
             try:
-                shutil.copy2(STORE_PATH, keep)
-                problem += f"; it is kept as {keep.name}"
+                problem += f"; it is kept as {_keep_corrupt().name}"
             except OSError as ce:
                 logger.warning("could not keep a copy of the unreadable results.json: %s", ce)
     if not bak.exists():
@@ -355,6 +393,7 @@ def save_store(store: Dict[str, Any], *, allow_shrink: bool = False) -> None:
     os.replace(tmp, STORE_PATH)
     st = STORE_PATH.stat()
     _last_written = (str(STORE_PATH), st.st_mtime_ns, st.st_size)
+    _refresh_lock()
 
 
 # --- before a pass -------------------------------------------------------------------------
@@ -581,7 +620,9 @@ def _evaluate(pas: str, folder: Path, student: Dict[str, str], store: Dict[str, 
     records. `mode` "queue" (the files are new or changed: they are read) or "reeval" (stored
     verdicts tested again, normally from the saved text only).
 
-    -> {"kind": "done", "entry", "change", "republish", "final_error", "field_note"}
+    -> {"kind": "done", "entry", "change", "republish", "final_error", "error", "field_note"}
+                                            (final_error: ERROR rows kept after MAX_ERROR_PASSES,
+                                            error then says which file and why)
      | {"kind": "needs_ocr", "misses"}      cache-only, and some text was never saved: the record
                                             is only marked needs_ocr
      | {"kind": "retry", "error"}           a read error: the old record is kept (fingerprint "")
@@ -612,36 +653,49 @@ def _evaluate(pas: str, folder: Path, student: Dict[str, str], store: Dict[str, 
     prev = docs.get(pas)
     who = {"student": name, "passport": pas, "program": program}
 
+    # ERROR rows kept as final (MAX_ERROR_PASSES) for files that are unchanged: a file that can
+    # never be opened is never in the saved text, and must not be sent back to the queue (and
+    # counted from 1 again) by every daily re-evaluation
+    final = (prev is not None and bool((prev.get("retry") or {}).get("final"))
+             and prev.get("fingerprint") == doc_fp)
     if handle.misses:
+        if mode == "reeval" and final:
+            kept = str((prev.get("retry") or {}).get("error") or "")
+            prev["reeval_error"] = {"at": now, "error": kept}
+            doc, _, msg = kept.partition(": ")
+            return {"kind": "error_kept", "error": {**who, "doc": doc, "msg": msg, "count": 0}}
         if prev is not None:
             prev["needs_ocr"] = True
         return {"kind": "needs_ocr", "misses": list(handle.misses)}
 
     read = mode == "queue" or bool(handle.fresh)
-    retry = None
+    retry = error = None
     if any(C.row_has_error(r) for r in rows):
         doc, msg = _error_of(rows)
         if mode == "reeval" and prev is not None:
             prev["reeval_error"] = {"at": now, "error": f"{doc}: {msg}"}
             return {"kind": "error_kept", "error": {**who, "doc": doc, "msg": msg, "count": 0}}
-        on_retry = prev is not None and not prev.get("fingerprint")
+        on_retry = prev is not None and (not prev.get("fingerprint") or final)
         count = (int((prev.get("retry") or {}).get("count", 0)) if on_retry else 0) + 1
         retry = {"count": count, "error": f"{doc}: {msg}", "at": now}
+        error = {**who, "doc": doc, "msg": msg, "count": count}
         if count < MAX_ERROR_PASSES:
             if prev is not None:                       # the old verdict stands until a clean read
                 prev["retry"], prev["fingerprint"] = retry, ""
-            else:
+            else:                                      # never checked: its first check is still to come
                 docs[pas] = {"fingerprint": "", "portal_fp": pfp, "checked": now, "evaluated_at": now,
                              "rules_version": RULES_VERSION, "max_pages": MAX_PAGES, "engine": engine,
                              "folder": str(folder), "student": name, "program": program,
-                             "verdict": C.student_verdict(rows), "rows": rows, "retry": retry}
+                             "verdict": C.student_verdict(rows), "rows": rows, "retry": retry,
+                             "first_pending": True}
             _store_fields(store, pas, program, name, frows, field_fp, now, read)
-            return {"kind": "retry", "error": {**who, "doc": doc, "msg": msg, "count": count}}
+            return {"kind": "retry", "error": error}
         retry["final"] = True                          # the third pass in a row: kept as found
 
     verdict = C.student_verdict(rows)
-    first = prev is None or (bool(prev.get("retry")) and not prev.get("first_checked")
-                             and not prev.get("fingerprint"))
+    # a first check: never checked, or only ever met read errors (a record from before this
+    # release without first_checked is not one: it has a verdict of its own)
+    first = prev is None or bool(prev.get("first_pending"))
     previous = None if first else prev.get("verdict")
     rows_changed = prev is None or _plain(prev.get("rows")) != _plain(rows)
     rec = {"fingerprint": doc_fp, "portal_fp": pfp,
@@ -670,7 +724,7 @@ def _evaluate(pas: str, folder: Path, student: Dict[str, str], store: Dict[str, 
              "corrected": corrected, "reason": verdict_reason(rec)}
     republish = prev is None or prev.get("rows") != rows or previous != verdict or fields_changed
     return {"kind": "done", "entry": entry, "change": change, "republish": republish,
-            "final_error": retry is not None, "field_note": f"{match} matched, {differs} differ"}
+            "final_error": retry is not None, "error": error, "field_note": f"{match} matched, {differs} differ"}
 
 
 def check_one(pas: str, folder: Path, student: Dict[str, str], store: Dict[str, Dict[str, Any]], *,
@@ -816,20 +870,30 @@ def _close_rollout(store: Dict[str, Any], folders, portal) -> Optional[List[str]
     """Finish the roll-out when every student the saved text can re-evaluate is at RULES_VERSION:
     those whose text was never saved (or whose files changed) are listed in needs_ocr and reach
     the new rules through the OCR queue; those kept on a read error, or no longer in a folder or
-    on the portal, are listed in skipped. None of them holds the queue up. -> the summary lines,
-    or None while students remain."""
+    on the portal, are listed in skipped (when more than a few are missing at once, the roll-out
+    first waits one pass for them). None of them holds the queue up for longer. -> the summary
+    lines, or None while students remain."""
     meta = store["meta"]
     ro = meta["rollout"]
     today = _now().date().isoformat()
-    needs, skipped = [], []
+    needs, skipped, gone = [], [], []
     for pas, rec in store["documents"].items():
         state = _status(pas, rec, folders, portal, today)
         if state in ("needs_ocr", "files"):
             needs.append(pas)
         elif state in ("orphan", "retry", "error"):
             skipped.append(pas)
+            if state == "orphan" and pas not in SKIP_PASSPORTS and rec.get("rules_version") != RULES_VERSION:
+                gone.append(pas)
         elif rec.get("rules_version") != RULES_VERSION:
             return None
+    # Many students missing at once may be a portal list cut short: the roll-out waits one pass
+    # for them, so the one summary is not split. Missing on two passes in a row, they are skipped.
+    if (len(gone) > max(ROLLOUT_GONE_ALLOWED, len(store["documents"]) * ROLLOUT_GONE_SHARE)
+            and not set(gone) <= set(ro.get("gone") or [])):
+        ro["gone"] = sorted(gone)
+        print(f"roll-out: {len(gone)} student(s) not in a folder or on the portal — waiting one pass for them")
+        return None
     ro.update(needs_ocr=sorted(needs), skipped=sorted(skipped), complete=_iso(),
               now=_counts(store["documents"]))
     meta["rules_version"] = RULES_VERSION
@@ -855,6 +919,30 @@ def _unannounced(store: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """The completed roll-out whose summary has not been sent yet, if any."""
     ro = ((store or {}).get("meta") or {}).get("rollout")
     return ro if isinstance(ro, dict) and ro.get("complete") and not ro.get("announced") else None
+
+
+def mark_rollout_announced(complete: Optional[str] = None, at: Optional[str] = None) -> bool:
+    """The scheduled pass handed out a completed roll-out's summary (result["rollout_lines"]) and
+    Telegram accepted it: mark it announced in results.json, under the check's lock. `complete`
+    (result["rollout_complete"]) makes sure it is that roll-out. Until this is called the next
+    pass hands the same summary out again, so a message Telegram refused is never lost.
+    -> whether it was marked. Never raises."""
+    try:
+        with _locked() as ok:
+            if not ok:
+                logger.warning("the roll-out summary could not be marked sent: another check holds the lock")
+                return False
+            store = load_store()
+            store.pop("_note", None)
+            ro = _unannounced(store)
+            if ro is None or (complete and ro.get("complete") != complete):
+                return False
+            _mark_announced(store, at)
+            save_store(store)
+            return True
+    except Exception as e:
+        logger.warning("the roll-out summary could not be marked sent: %s", e)
+        return False
 
 
 # --- the two reports -----------------------------------------------------------------
@@ -1076,7 +1164,7 @@ def finish_reports(result: Optional[Dict[str, Any]]) -> List[str]:
 # --- the pass the scheduler runs ------------------------------------------------------
 def _result() -> Dict[str, Any]:
     return {"checked": [], "reevaluated": [], "rollout_lines": [], "republish": [], "errors": [],
-            "skipped": [], "waiting": 0, "store": None, "reports_due": False}
+            "final_errors": [], "skipped": [], "waiting": 0, "store": None, "reports_due": False}
 
 
 def run(budget: int = DEFAULT_BUDGET, only: List[str] | None = None, recheck: bool = False, *,
@@ -1094,8 +1182,11 @@ def run(budget: int = DEFAULT_BUDGET, only: List[str] | None = None, recheck: bo
     the queue alone. `export_rows` stand in for the portal's student list.
 
     -> {"checked": [entry], "reevaluated": [change], "rollout_lines": [str], "republish": [P],
-        "errors": [entry], "skipped": [str], "waiting": n, "store": store | None,
-        "reports_due": bool, "busy"?, "stopped"?, "store_error"?, "store_note"?}
+        "errors": [error], "final_errors": [error], "skipped": [str], "waiting": n,
+        "store": store | None, "reports_due": bool, "rollout_complete"?, "busy"?, "stopped"?,
+        "store_error"?, "store_note"?}
+    error = {"student", "passport", "program", "doc", "msg", "count"}; final_errors are the ones
+    kept as ERROR after MAX_ERROR_PASSES whose verdict did not change (said once).
     entry = {"student", "passport", "program", "verdict", "previous", "first", "differs",
              "corrected", "reason"}"""
     with _locked() as ok:
@@ -1109,9 +1200,10 @@ def run(budget: int = DEFAULT_BUDGET, only: List[str] | None = None, recheck: bo
 
 def _pass(*, budget: int, only, recheck: bool, force: bool, allow_ocr: bool, reeval: bool,
           reeval_seconds: Optional[float], export_rows, queue: bool, hand_out: bool) -> Dict[str, Any]:
-    """The pass itself, under the lock. `hand_out`: a completed roll-out's summary goes into
-    this result and is marked announced (the scheduled pass; its caller sends it). The command
-    line marks it only once Telegram accepted it (--announce)."""
+    """The pass itself, under the lock. `hand_out`: a completed roll-out's summary that was not
+    sent yet goes into this result, with result["rollout_complete"] (the scheduled pass; its
+    caller sends it and then calls mark_rollout_announced). The command line marks it itself once
+    Telegram accepted it (--announce)."""
     global _issue_memo
     from src.verify import doc_verifier as dv
     result = _result()
@@ -1131,6 +1223,12 @@ def _pass(*, budget: int, only, recheck: bool, force: bool, allow_ocr: bool, ree
     if note:
         result["store_note"] = note
         print(note)
+        # results.json is written back from the backup at once, so the next pass reads it and the
+        # warning is given once (save_store never copies an unreadable file over the backup)
+        try:
+            save_store(store)
+        except Exception as e:
+            logger.warning("results.json could not be written back from the backup: %s", e)
     portal = dv.portal_students(rows=export_rows) if export_rows is not None else dv.portal_students()
     folders = dv.student_folders(portal)
     odd = _implausible(store, folders, portal)
@@ -1190,10 +1288,12 @@ def _work(result: Dict[str, Any], store: Dict[str, Any], folders, portal, *, bud
                 result["reports_due"] = True
         else:
             result["reevaluated"] = list(reev["changed"])
-    if hand_out and _unannounced(store):
-        result["rollout_lines"] = list(result["rollout_lines"] or _unannounced(store).get("lines")
-                                       or rollout_lines(_unannounced(store)))
-        _mark_announced(store)
+    ro = _unannounced(store)
+    if hand_out and ro:
+        # handed to the caller, and marked announced only once Telegram accepted it
+        # (mark_rollout_announced): a refused message is handed out again by the next pass
+        result["rollout_lines"] = list(result["rollout_lines"] or ro.get("lines") or rollout_lines(ro))
+        result["rollout_complete"] = ro.get("complete")
     if json.dumps(meta, sort_keys=True, default=str) != meta_before:
         save_store(store)
 
@@ -1233,6 +1333,10 @@ def _work(result: Dict[str, Any], store: Dict[str, Any], folders, portal, *, bud
             continue
         entry = out["entry"]
         result["checked"].append(entry)
+        if out.get("final_error") and out.get("error") and not (_announced(entry) and entry["verdict"] == "ERROR"):
+            # ERROR findings kept after MAX_ERROR_PASSES that the student's own line does not
+            # name (the verdict unchanged, or a FAIL that also holds a read error): said once, here
+            result["final_errors"].append(out["error"])
         print(f"[{i}/{len(todo)}] {name[:30]:32} {entry['verdict']:11} {out['field_note']}"
               + (f" | {entry['corrected']} portal field(s) changed since last check" if entry["corrected"] else ""),
               flush=True)
@@ -1247,6 +1351,7 @@ def _work(result: Dict[str, Any], store: Dict[str, Any], folders, portal, *, bud
 
 # --- the Telegram lines --------------------------------------------------------------------
 _FINDING = re.compile(r"^(PASS|NOTE|FLAG|FAIL|ERROR|MISSING):\s*(.*)$", re.S)
+_B4_FAIL = "the birth certificate gives date of birth"      # doc_verifier.birth_date_check's FAIL
 _NEW_ORDER = {"PASS": 0, "REVIEW": 1, "INCOMPLETE": 2, "FAIL": 3, "ERROR": 4}     # roll-out list order
 _SEVERITY = {"PASS": 0, "REVIEW": 1, "ERROR": 2, "FAIL": 3, "INCOMPLETE": 4}     # student_verdict's order
 _WHY = {"daily": " [re-checked: today's date]", "portal": " [portal values changed]",
@@ -1384,6 +1489,11 @@ def _first_check(d: Dict[str, Any]) -> bool:
     return d.get("previous") is None if first is None else bool(first)
 
 
+def _announced(d: Dict[str, Any]) -> bool:
+    """Is this checked student named in the message: a first check or a verdict change."""
+    return _first_check(d) or d.get("previous") != d.get("verdict")
+
+
 def summary_lines(result: Dict[str, Any]) -> List[str]:
     """The document check's part of the Telegram message. A student is announced only on a first
     check or a verdict change, each with its reason; students read again with an unchanged
@@ -1397,13 +1507,14 @@ def summary_lines(result: Dict[str, Any]) -> List[str]:
         return []
     docs = ((result.get("store") or {}).get("documents") or {})
     checked = list(result.get("checked") or [])
-    told = [d for d in checked if _first_check(d) or d.get("previous") != d.get("verdict")]
+    told = [d for d in checked if _announced(d)]
     same = [d for d in checked if d not in told]
     changes = list(result.get("reevaluated") or [])
     errors = [e for e in result.get("errors") or [] if isinstance(e, dict)]
+    final = [e for e in result.get("final_errors") or [] if isinstance(e, dict)]
     skipped = list(result.get("skipped") or [])
     note = result.get("store_note")
-    if not (told or changes or errors or skipped or note):
+    if not (told or changes or errors or final or skipped or note):
         return []
 
     def reason(passport: str, verdict: str, fallback: str) -> str:
@@ -1432,6 +1543,11 @@ def summary_lines(result: Dict[str, Any]) -> List[str]:
         listed = "; ".join(f"{e.get('student')} ({e.get('doc')}: {e.get('msg')})" for e in errors[:5])
         more = f"; … and {len(errors) - 5} more" if len(errors) > 5 else ""
         out.append(f"   ⚠️ {len(errors)} student(s) hit a read error — retried on the next pass: {listed}{more}")
+    if final:
+        listed = "; ".join(f"{e.get('student')} ({e.get('doc')}: {e.get('msg')})" for e in final[:5])
+        more = f"; … and {len(final) - 5} more" if len(final) > 5 else ""
+        out.append(f"   ⚠️ {len(final)} student(s) could not be checked {MAX_ERROR_PASSES} passes in a row — "
+                   f"the ERROR rows are kept until the file changes: {listed}{more}")
     if skipped:
         more = f"; … and {len(skipped) - 5} more" if len(skipped) > 5 else ""
         out.append(f"   ⚠️ {len(skipped)} student(s) could not be checked: {'; '.join(skipped[:5])}{more}")
@@ -1530,7 +1646,8 @@ def _show(passports: List[str]) -> None:
 def _dry_run_summary(before: Dict[str, int], result: Dict[str, Any]) -> Path:
     """rollout_summary.txt in the dry run's data folder, for the go/no-go review: the verdicts
     before and after, the roll-out message, every change with its reason, every ERROR row, the
-    students whose text was never saved, and every birth-certificate FAIL to spot-check."""
+    students whose text was never saved, and every FAIL of the birth certificate's date-of-birth
+    rule (B4) to spot-check."""
     store = result.get("store") or _empty_store()
     docs = store["documents"]
     meta = store.get("meta") or {}
@@ -1552,10 +1669,13 @@ def _dry_run_summary(before: Dict[str, int], result: Dict[str, Any]) -> Path:
     needs = sorted(p for p, rec in docs.items() if rec.get("needs_ocr"))
     lines += ["", f"{len(needs)} student(s) whose text was never saved (needs_ocr):"]
     lines += [f"   • {docs[p].get('student', '')} ({p})" for p in needs]
-    births = [(rec.get("student", ""), pas, r) for pas, rec in sorted(docs.items()) for r in rec.get("rows") or []
-              if r.get("verdict") == "FAIL" and (r.get("key") == "birth_cert" or str(r.get("doc", "")).startswith("04 "))]
-    lines += ["", f"{len(births)} birth-certificate FAIL(s) — spot-check each:"]
-    lines += [f"   • {s} ({p}) — {_first_fail([r])}" for s, p, r in births]
+    # B4: the date of birth rule's FAILs (not the birth certificate's other FAILs, e.g. notarisation)
+    births = [(rec.get("student", ""), pas, r.get("doc", ""), text)
+              for pas, rec in sorted(docs.items()) for r in rec.get("rows") or []
+              if r.get("key") == "birth_cert" or str(r.get("doc", "")).startswith("04 ")
+              for v, text in _findings(r.get("detail")) if v == "FAIL" and text.startswith(_B4_FAIL)]
+    lines += ["", f"{len(births)} birth-certificate date-of-birth FAIL(s) — spot-check each:"]
+    lines += [f"   • {s} ({p}) — {doc}: {text}" for s, p, doc, text in births]
     reev_errors = list((result.get("reeval") or {}).get("errors") or [])
     if reev_errors:
         lines += ["", f"{len(reev_errors)} student(s) could not be re-evaluated:"] + [f"   • {e}" for e in reev_errors]

@@ -151,6 +151,18 @@ def test_b3_opening_balance_klp_has_no_maximum_and_an_unlabelled_one_is_a_note()
     assert dv.opening_balance(FILLER) == (None, False)
 
 
+@pytest.mark.parametrize("text, value", [
+    ("Opening Balance as on 2026-04-01: 2,400,000.00", 2_400_000),     # a year-first date is not the balance
+    ("Balance B/F 2026 2,400,000.00", 2_400_000),                       # nor a year
+    ("Opening Balance A/C 1234567890 2,400,000.00", None),              # nor an account number (then unlabelled)
+])
+def test_b3_the_opening_balance_is_the_money_after_its_label(text, value):
+    got, labelled = dv.opening_balance(text)
+    assert (got, labelled) == ((value, True) if value else (None, False))
+    (v, msg), = dv.opening_balance_check(text, "BACHELOR")
+    assert v in (C.PASS, C.NOTE) and "2,026" not in msg and "1,234,567,890" not in msg
+
+
 @pytest.mark.parametrize("period, verdict", [
     ("Statement Period: 01/07/2026 to 30/09/2026", C.FLAG),
     ("Statement Period: 01/04/2026 to 30/09/2026", C.PASS),
@@ -443,6 +455,14 @@ def test_a22_gpa_is_compared_as_a_number(text, gpa, found):
     assert dv.gpa_on(text, gpa) is found
 
 
+def test_a22_a_labelled_gpa_outranks_a_subjects_grade_point():
+    text = "Secondary School Certificate GPA 4.50 Bangla 5.00 English 4.00 Mathematics 5.00"
+    assert dv.gpa_on(text, "5.00") is False and dv.gpa_on(text, "4.50") is True
+    out = dv.check_academic(f"apostille {text} {FILLER}", student(SSC_GPA="5.00", HSC_GPA=""), [])
+    assert (C.FLAG, "portal SSC GPA 5.00 not found in the certificate text") in out
+    assert dv.gpa_on("Bangla 5.00 English 4.00", "5.00") is True              # no GPA label: any decimal
+
+
 def test_a22_check_academic_does_not_find_5_00_in_55():
     out = dv.check_academic(f"apostille SSC result GPA 55 {FILLER}", student(SSC_GPA="5.00", HSC_GPA=""), [])
     assert (C.FLAG, "portal SSC GPA 5.00 not found in the certificate text") in out
@@ -499,6 +519,23 @@ def test_b10_tax_paid(text, verdict, words):
     assert v == verdict and words in t
 
 
+@pytest.mark.parametrize("text", [
+    "Income tax certificate. Tax paid vide Challan No 123456789 on 01/09/2026",
+    "Tax payment by challan No. 2026123456 dated 01/09/2026",
+    "Paid amount (TIN 123456789012)",
+    "Tax paid vide challan 123456789",
+])
+def test_b10_a_challan_tin_or_reference_number_is_never_the_tax_paid(text):
+    assert dv.labelled_amounts(text, R.TAX_PAID_LABELS, plain=True) == []
+    v, t = dv.check_income_tax(f"{text} {FILLER}", student(), [], "BACHELOR")[0]
+    assert v == C.FLAG and "no amount labelled as tax paid" in t
+
+
+def test_b10_a_plain_amount_beside_its_challan_still_counts():
+    assert dv.labelled_amounts("Tax paid 15000 vide Challan No 123456789", R.TAX_PAID_LABELS, plain=True) == [15000]
+    assert dv.labelled_amounts("Tax paid (challan no 123456) amount Tk 15,000", R.TAX_PAID_LABELS, plain=True) == [15000]
+
+
 def test_b10_net_wealth_is_unchanged_for_masters():
     out = dv.check_income_tax(f"Net wealth 60,00,000 Tax paid 20,000.00 {FILLER}", student(), [], "MASTER")
     assert out[0] == (C.PASS, "net wealth figure 6,000,000 BDT meets the 50 lakh guideline")
@@ -516,6 +553,16 @@ def test_b10_net_wealth_is_unchanged_for_masters():
 def test_b12_issue_date_labelled(text, source, date):
     assert dv.issue_date_labelled(text) == (date, source)
     assert dv.issue_date(text) == date
+
+
+def test_b12_a_word_holding_date_or_ref_is_no_label():
+    text = ("This candidate was born on 12/03/2025 and the family lives here, therefore the update is final. "
+            f"{FILLER} notary 01/10/2026")
+    assert dv.issue_date_labelled(text) == (dt.date(2026, 10, 1), "fallback")
+    assert dv.check_family_cert(text, student(), [])[0][0] == C.FLAG
+    assert dv.issue_date_labelled(f"Date of Birth: 12/03/2025 {FILLER}")[1] == "fallback"   # never a birth date
+    assert dv.issue_date_labelled(f"Dated: 01/10/2026 {FILLER}") == (dt.date(2026, 10, 1), "label")
+    assert dv.issue_date_labelled(f"Reference No. 77, 01/10/2026 {FILLER}") == (dt.date(2026, 10, 1), "label")
 
 
 def test_b12_family_certificate_dates():
@@ -587,6 +634,23 @@ def test_b14c_a_broken_pdf_is_unreadable_and_read_pages_raises(tmp_path):
     assert dv.read_document(p)[0].startswith("[unreadable:")
     with pytest.raises(C.CheckError):
         dv.read_pages(p)
+
+
+def test_b14c_an_error_message_never_carries_the_students_folder(tmp_path, no_images, monkeypatch):
+    d = folder(tmp_path, KLP, "SAMPLE STUDENT ONE", "A99900001", {"PASSPORT.pdf": None})
+    broken = d / "PERSONAL STATEMENT.docx"
+    broken.write_bytes(b"not a document pymupdf can open")
+    text, _ = dv.read_document(broken)
+    assert text.startswith("[unreadable:") and str(d) not in text and repr(str(d))[1:-1] not in text
+    full = d / "PASSPORT.pdf"
+
+    def reader(path, max_pages=20):
+        raise OSError(f"Failed to open file '{repr(str(full))[1:-1]}' as type pdf.")
+
+    monkeypatch.setattr(dv, "read_document", reader)
+    row, = [r for r in dv.verify_student(d, student(), "KLP") if r["key"] == "passport"]
+    assert row["verdict"] == C.ERROR and "'PASSPORT.pdf'" in row["detail"]
+    assert "SAMPLE STUDENT ONE" not in row["detail"] and str(tmp_path) not in row["detail"]
 
 
 def test_b14c_other_exceptions_are_errors_but_code_faults_stop_the_run(tmp_path, no_images, monkeypatch):

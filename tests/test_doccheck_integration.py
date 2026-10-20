@@ -125,6 +125,7 @@ def test_a_first_check_then_a_roll_out_from_the_saved_text(check, monkeypatch):
     assert after["meta"]["rules_version"] == C.RULES_VERSION
     assert after["documents"][P1]["rules_version"] == C.RULES_VERSION
     assert after["documents"][P1]["rows"] == rows                        # same rules, same rows
+    assert av.mark_rollout_announced(again["rollout_complete"])          # Telegram accepted it
     assert av.run(budget=5, export_rows=[row])["rollout_lines"] == []    # never twice
 
 

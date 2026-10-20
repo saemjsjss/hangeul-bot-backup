@@ -103,6 +103,18 @@ def _ocr_image(arr, turned=None) -> str:
     return best
 
 
+def _no_path(message: Any, path: Path) -> str:
+    """A reader's error message with the file's full path cut down to its name: the message
+    goes into the report and Telegram, where the student's folder path is only noise (as
+    page_checks._why does)."""
+    msg = str(message)
+    path = Path(path)
+    for full in (str(path), repr(str(path))[1:-1]):
+        if full:
+            msg = msg.replace(full, path.name)
+    return msg
+
+
 def read_pages(path: Path, max_pages: int = 20, sideways: Optional[List[int]] = None) -> List[str]:
     """The text of each page on its own, in order.  Needed where page ORDER matters — an
     e-Apostille and the certificate that follows it.
@@ -115,7 +127,7 @@ def read_pages(path: Path, max_pages: int = 20, sideways: Optional[List[int]] = 
     try:
         doc = pymupdf.open(str(path))
     except Exception as e:
-        raise CheckError(f"could not open {path.name}: {type(e).__name__}: {e}") from e
+        raise CheckError(f"could not open {path.name}: {type(e).__name__}: {_no_path(e, path)}") from e
     out: List[str] = []
     try:
         for i, page in enumerate(doc):
@@ -150,7 +162,7 @@ def read_document(path: Path, max_pages: int = 20) -> Tuple[str, List[Tuple[int,
     try:
         doc = pymupdf.open(str(path))
     except Exception as e:
-        return f"[unreadable: {e}]", []
+        return f"[unreadable: {_no_path(e, path)}]", []
     for i, page in enumerate(doc):
         if i >= max_pages:
             break
@@ -326,8 +338,11 @@ _MONEY_RE = re.compile(
     + r"|(?:(?<![a-z])(?:tk|bdt|taka)\.?|৳)\s*[:=]?\s*(?P<pre>\d+)" + _NOT_AFTER
     + r"|" + _NOT_BEFORE + r"(?P<post>\d+)\s*(?:/-\s*)?(?:tk|bdt|taka)(?![a-z])",
     re.I)
-# A plain number, for a field whose label already says it is an amount ("Tax paid 15000").
-_PLAIN_RE = re.compile(_NOT_BEFORE + r"\d{3,}" + _NOT_AFTER)
+# A plain number, for a field whose label already says it is an amount ("Tax paid 15000"): at
+# most 9 digits (a longer run is a TIN, challan or reference number), and never one written
+# after an ID label or a challan's ("Tax paid vide Challan No 123456789").
+_PLAIN_RE = re.compile(_NOT_BEFORE + r"\d{3,9}" + _NOT_AFTER)
+_PLAIN_ID_LABELS = ["challan"]
 _YEAR_RE = re.compile(r"(?:19|20)\d{2}")
 # Words that make the figure after an "Account …" label money after all ("Account Balance").
 _MONEY_WORDS = re.compile(r"balance|amount|paid|tk|taka|bdt|৳", re.I)
@@ -357,12 +372,18 @@ def money_figures(text: str) -> List[Tuple[int, float]]:
     for m in _MONEY_RE.finditer(text):
         group = next(g for g in ("sep", "dec", "pre", "post") if m.group(g) is not None)
         pos = m.start(group)
-        if any(0 <= pos - end <= _ID_AFTER and not _MONEY_WORDS.search(text[end:pos]) for end in ids):
+        if _after_id(text, ids, pos):
             continue
         v = money_value(m.group(group))
         if v is not None:
             out.append((pos, v))
     return out
+
+
+def _after_id(text: str, ids: List[int], pos: int) -> bool:
+    """Is the figure at `pos` written right after an ID label (one of `ids`, their end positions)
+    with no money word between: that number, not money."""
+    return any(0 <= pos - end <= _ID_AFTER and not _MONEY_WORDS.search(text[end:pos]) for end in ids)
 
 
 def _opening_spans(text: str) -> List[Tuple[int, int]]:
@@ -373,14 +394,17 @@ def _labelled_figures(text: str, labels: List[str], window: int = 60,
                       plain: bool = False) -> List[Tuple[int, float]]:
     """(position, value) of the first money figure within `window` characters after each
     of `labels`. A label that is part of an opening-balance label ("Opening Balance",
-    "Balance B/F") is not the balance. `plain` also takes a bare number of 3 digits or
-    more that is not a year, for a label that already says the figure is an amount."""
+    "Balance B/F") is not the balance. `plain` also takes a bare number of 3 to 9 digits
+    that is not a year, for a label that already says the figure is an amount — unless an
+    ID or challan label comes right before it (that number is the ID)."""
     text = text or ""
     figures = money_figures(text)
     if plain:
         seen = {p for p, _ in figures}
+        ids = [m.end() for m in _label_re(R.ID_NUMBER_LABELS + _PLAIN_ID_LABELS).finditer(text)]
         for m in _PLAIN_RE.finditer(text):
-            if m.start() not in seen and not _YEAR_RE.fullmatch(m.group()):
+            if (m.start() not in seen and not _YEAR_RE.fullmatch(m.group())
+                    and not _after_id(text, ids, m.start())):
                 figures.append((m.start(), float(m.group())))
         figures.sort()
     opening = _opening_spans(text)
@@ -619,7 +643,7 @@ def check_photo(text: str, student: Dict[str, str], sizes, path: Optional[Path] 
     except CODE_FAULTS:
         raise
     except Exception as e:                 # locked, truncated or not an image: not a photo problem
-        out.append((ERROR, f"could not open the image ({type(e).__name__}: {e})"))
+        out.append((ERROR, f"could not open the image ({type(e).__name__}: {_no_path(e, path)})"))
     if path.suffix.lower() not in R.PHOTO_FORMATS:
         out.append((FAIL, f"photo is {path.suffix} — reviewer requires JPG/JPEG"))
     if (student.get("Gender") or "").upper().startswith("F"):
@@ -742,7 +766,7 @@ def check_nid(text: str, student, sizes, whose: str, path=None, others=None) -> 
         except CODE_FAULTS:
             raise
         except Exception as e:
-            out.append((ERROR, f"could not read the NID page by page ({e})"))
+            out.append((ERROR, f"could not read the NID page by page ({_no_path(e, path)})"))
     per_page = [set(nid_numbers(t)) for t in pages]
     every = sorted({n for s in per_page for n in s}) or nid_numbers(text)
 
@@ -809,7 +833,9 @@ def issue_date_labelled(text: str) -> Tuple[Optional[dt.date], str]:
     Never a family member's date of birth: only dates of the last 3 years count."""
     text = text or ""
     head = text[:1200]
-    m = re.search(r"(date|ref|memo|serial)[^\n]{0,90}", head, re.I)
+    # whole words only ("candidate", "update", "therefore" are no label), never "date of birth"
+    m = re.search(r"\b(?:dated?(?!\s*of\s*birth)|ref(?:erence)?|memo|serial)\b\.?\s*(?:no\b\.?)?\s*[:.\-]?"
+                  r"[^\n]{0,90}", head, re.I)
     if m:
         got = [d for d in find_dates(m.group(0)) if 0 <= (TODAY - d).days <= 3 * 365]
         if got:                       # a date on the header line, but never a birth date
@@ -878,7 +904,7 @@ def check_academic(text: str, student, sizes, path=None, others=None) -> List[Tu
         except CODE_FAULTS:
             raise
         except Exception as e:
-            out.append((ERROR, f"could not check the e-Apostille pages ({e})"))
+            out.append((ERROR, f"could not check the e-Apostille pages ({_no_path(e, path)})"))
     elif has_any(text, R.APOSTILLE_WORDS):
         out.append((PASS, "e-apostille wording found"))
     else:
@@ -913,13 +939,16 @@ _GPA_NUMBER_RE = re.compile(r"(?<![\d.])(\d\.\d{1,2})(?![\d]|\.\d)")
 def gpa_on(text: str, gpa: str) -> bool:
     """Whether the certificate shows the portal's GPA, compared as a number to 2 decimals:
     "5.00" is found as "5.00", "5.0" or a labelled "GPA: 5", never inside "55", "15.00" or
-    "5.25". A bare whole number counts only beside a GPA label."""
+    "5.25". A bare whole number counts only beside a GPA label. When the text labels any GPA,
+    only the labelled values count: a transcript's subject grade points (5.00, 4.00) are
+    decimals too (as field_check does)."""
     try:
         want = round(float(gpa), 2)
     except ValueError:
         return bool(re.search(rf"(?<![\w.]){re.escape(gpa)}(?![\w]|\.\d)", text or ""))
     found = [m.group(1) for m in _GPA_LABEL_RE.finditer(text or "")]
-    found += _GPA_NUMBER_RE.findall(text or "")
+    if not found:
+        found = _GPA_NUMBER_RE.findall(text or "")
     return any(round(float(v), 2) == want for v in found)
 
 
@@ -949,14 +978,16 @@ def opening_balance(text: str) -> Tuple[Optional[int], bool]:
 
     Bangladeshi banks label it differently — Opening Balance, Previous Balance, B/F,
     Brought Forward — and some print no label at all, in which case the balance on the
-    first transaction row is the opening figure (unlabelled: a guess, never judged)."""
-    for label in R.OPENING_BALANCE_WORDS:
-        m = re.search(re.escape(label).replace(r"\ ", r"\s*") + r"\D{0,40}?([\d,]{4,15}(?:\.\d{1,2})?)",
-                      text or "", re.I)
-        if m:
-            v = money_value(m.group(1))
-            if v is not None:
-                return int(v), True
+    first transaction row is the opening figure (unlabelled: a guess, never judged).
+
+    The labelled value is the first figure written like money within 60 characters after the
+    label (money_figures): a date ("as on 2026-04-01"), a year or an account number printed
+    between is never taken for it."""
+    figures = money_figures(text)
+    for m in _label_re(R.OPENING_BALANCE_WORDS).finditer(text or ""):
+        after = [v for pos, v in figures if m.end() <= pos <= m.end() + 60]
+        if after:
+            return int(after[0]), True
     # no label: take the balance on the first transaction row
     for line in (text or "").splitlines():
         if not re.search(r"\d{1,2}[./-]\w{2,9}[./-]\d{2,4}", line):
@@ -1147,7 +1178,7 @@ def check_bank(text: str, student, sizes, program: str, path=None, others=None) 
         except CODE_FAULTS:
             raise
         except Exception as e:
-            out.append((ERROR, f"could not read the bank file page by page ({e})"))
+            out.append((ERROR, f"could not read the bank file page by page ({_no_path(e, path)})"))
     if len(pages) >= 2:
         sol = document_date(pages[0])
         stm = statement_date(pages[1:])
@@ -1508,7 +1539,7 @@ def _error_row(title: str, path: Path, key: str, msg: str) -> Dict[str, Any]:
     """The file could not be checked at all (locked, unrenderable, OCR broke): ERROR, never
     a verdict on the document, and retried on the next pass."""
     return {"doc": title, "file": path.name, "key": key, "verdict": ERROR, "has_error": True,
-            "detail": f"ERROR: could not check this file ({msg}) — it is retried on the next pass"}
+            "detail": f"ERROR: could not check this file ({_no_path(msg, path)}) — it is retried on the next pass"}
 
 
 def _stand_ins(program: str, files: Dict[str, List[Path]]) -> Dict[str, str]:
@@ -1544,7 +1575,7 @@ def _check_file(path: Path, key: str, title: str, student: Dict[str, str], progr
     except CheckError as e:
         return _error_row(title, path, key, str(e) or type(e).__name__)
     except Exception as e:
-        return _error_row(title, path, key, f"{type(e).__name__}: {e}")
+        return _error_row(title, path, key, f"{type(e).__name__}: {_no_path(e, path)}")
     return _row(title, path.name, key, results)
 
 
