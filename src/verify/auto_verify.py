@@ -1010,6 +1010,11 @@ def _remove(path: Path) -> None:
         pass
 
 
+def _unwritten(name: str, e: Exception) -> str:
+    return (f"📄 {name}.xlsx could not be written ({type(e).__name__}: {_trim(str(e), 120)}) — "
+            "the next pass tries again.")
+
+
 def _save_report(writer, store: Dict[str, Any], path: Path) -> str:
     """Write one report through "<NAME>.tmp.xlsx" and move it into place. When the usual file is
     open in Excel, the new report is kept as "<NAME> (updated HH-MM).xlsx" instead (replacing
@@ -1022,7 +1027,7 @@ def _save_report(writer, store: Dict[str, Any], path: Path) -> str:
     except Exception as e:
         logger.warning("%s could not be written: %s", path.name, e)
         _remove(tmp)
-        return f"📄 {name}.xlsx could not be written ({type(e).__name__}: {_trim(str(e), 120)}) — the next pass tries again."
+        return _unwritten(name, e)
     try:
         os.replace(tmp, path)
     except PermissionError:
@@ -1040,7 +1045,7 @@ def _save_report(writer, store: Dict[str, Any], path: Path) -> str:
                 "next pass writes the usual file again.")
     except OSError as e:
         _remove(tmp)
-        return f"📄 {name}.xlsx could not be written ({type(e).__name__}: {_trim(str(e), 120)}) — the next pass tries again."
+        return _unwritten(name, e)
     for old in stale():                                # the usual file is current again
         _remove(old)
     return ""
