@@ -1389,6 +1389,20 @@ def test_a_running_check_makes_the_command_line_wait_or_give_up(world, monkeypat
     assert slept == [av.LOCK_POLL_SECONDS] and not av.LOCK_PATH.exists()
 
 
+def test_a_data_dir_brings_its_own_apostille_subjects(tmp_path, monkeypatch):
+    monkeypatch.setattr(PC, "APOSTILLE_SUBJECTS", PC.APOSTILLE_SUBJECTS)
+    live = PC.APOSTILLE_SUBJECTS
+    av.use_data_dir(tmp_path / "bare")
+    assert PC.APOSTILLE_SUBJECTS == live and av.STORE_PATH == tmp_path / "bare" / "results.json"
+    copy = tmp_path / "copy"
+    copy.mkdir()
+    (copy / "apostille.json").write_text(json.dumps({"1234567": "HSC"}), encoding="utf-8")
+    av.use_data_dir(copy)
+    assert PC.APOSTILLE_SUBJECTS == copy / "apostille.json"
+    assert PC.apostille_subject("https://apostille.example/verify/1234567") == "HSC"
+    assert (tc.TEXT_DIR, tc.IMAGES_DIR, av.LOCK_PATH) == (copy / "text", copy / "images", copy / "auto_verify.lock")
+
+
 def test_recheck_all_sets_the_results_aside(world, sent):
     world.add(1, {"passport.pdf": "PASS: valid"})
     av.run()

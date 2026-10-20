@@ -113,7 +113,9 @@ def _trim(text: str, n: int) -> str:
 
 def use_data_dir(path) -> Path:
     """Point every file of the check at `path` instead of data/verification: results.json, the
-    text and image caches, the lock and both reports (--data-dir, the dry run)."""
+    text and image caches, the lock and both reports (--data-dir, the dry run). The e-Apostille
+    subjects looked up before (apostille.json) are read from there too when the folder has them,
+    so a dry run from another checkout judges the academic files as the live check does."""
     global REPORT_DIR, STORE_PATH, TEXT_DIR, IMAGES_DIR, LOCK_PATH, DOC_REPORT, FIELD_REPORT
     REPORT_DIR = Path(path)
     STORE_PATH = REPORT_DIR / "results.json"
@@ -123,6 +125,9 @@ def use_data_dir(path) -> Path:
     DOC_REPORT = REPORT_DIR / "DOCUMENT CHECK.xlsx"
     FIELD_REPORT = REPORT_DIR / "FIELD CHECK.xlsx"
     text_cache.TEXT_DIR, text_cache.IMAGES_DIR = TEXT_DIR, IMAGES_DIR
+    if (REPORT_DIR / "apostille.json").exists():
+        from src.verify import page_checks as PC
+        PC.APOSTILLE_SUBJECTS = REPORT_DIR / "apostille.json"
     return REPORT_DIR
 
 
