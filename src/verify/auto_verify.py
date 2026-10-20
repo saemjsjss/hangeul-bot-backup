@@ -1749,8 +1749,6 @@ def _cli(args, passports: List[str], export_rows) -> int:
     if rerun:
         print(f"\nre-evaluated {len(reev.get('evaluated') or [])} student(s); "
               f"{len(reev.get('needs_ocr') or [])} need a fresh read; {len(reev.get('errors') or [])} error(s)")
-        for c in result.get("reevaluated") or []:
-            print(f"   • {c['student']} ({c['program']}) — {c['old']} -> {c['new']} ({c.get('reason') or ''})")
         for e in reev.get("errors") or []:
             print(f"   ⚠️ {e}")
     if result.get("rollout_lines"):
