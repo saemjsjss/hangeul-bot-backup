@@ -291,6 +291,8 @@ class World:
             key = f.stem.lower()
             present.add(key)
             title = TITLES.get(key, f.stem)
+            if key == "father":
+                dv.read_pages(f, 8)              # outside any try, as a careless check might
             try:
                 text, _ = dv.read_document(f)
                 PC.inspect(f)
@@ -1117,6 +1119,21 @@ def test_records_the_saved_text_cannot_update_never_hold_the_queue(world):
     assert "rules_version" not in store["documents"][P4]
     r2 = av.run()
     assert r2["rollout_lines"] == [] and "rollout" not in world.store()["meta"]       # not restarted
+
+
+def test_a_miss_that_escapes_a_check_still_waits_for_the_queue(world):
+    a = world.add(1, {"passport.pdf": "PASS: valid", "father.pdf": "FATHER SAMPLE FATHER"})
+    av.run()
+    cache = av.TEXT_DIR / f"{a}.json"
+    kept = {k: v for k, v in json.loads(cache.read_text(encoding="utf-8")).items() if "father.pdf" not in k}
+    cache.write_text(json.dumps(kept), encoding="utf-8")                  # its text was never saved
+    before = world.store()["documents"][a]
+    world.set_now(dt.datetime(2026, 10, 22, 8, 0))
+    r = av.run(budget=0)
+    rec = world.store()["documents"][a]
+    assert r["reeval"]["needs_ocr"] == [a] and r["reeval"]["errors"] == []
+    assert [e["passport"] for e in r["checked"]] == [a] and "needs_ocr" not in rec   # read again at once
+    assert rec["rows"] == before["rows"] and rec["evaluated_at"] == "2026-10-22T08:00:00"
 
 
 def test_a_fresh_store_has_nothing_to_roll_out(world):

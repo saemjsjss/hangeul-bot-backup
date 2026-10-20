@@ -592,8 +592,13 @@ def _evaluate(pas: str, folder: Path, student: Dict[str, str], store: Dict[str, 
 
     handle = install_text_cache(pas, cache_only=cache_only)
     try:
-        rows = dv.verify_student(folder, student, program)
-        frows = fc.check_student(pas, folder, student)
+        try:
+            rows = dv.verify_student(folder, student, program)
+            frows = fc.check_student(pas, folder, student)
+        except C.NotCached:
+            if not handle.misses:              # never ours: let it surface
+                raise
+            rows, frows = [], []               # a check let the miss through: the same as a missed row
     finally:
         save_text_cache(handle)
     now = _iso()
@@ -1137,7 +1142,6 @@ def _pass(*, budget: int, only, recheck: bool, force: bool, allow_ocr: bool, ree
 
 def _work(result: Dict[str, Any], store: Dict[str, Any], folders, portal, *, budget, only, recheck,
           force, allow_ocr, reeval, reeval_seconds, queue, hand_out) -> None:
-    from src.verify import doc_verifier as dv
     meta = store.setdefault("meta", {})
     meta_before = json.dumps(meta, sort_keys=True, default=str)
     now = _now()
