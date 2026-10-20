@@ -7,6 +7,11 @@ every document-check test builds on (tests/verify_fixtures.py).
   parts), the portal's Sponsor values, and Levenshtein distance. doc_verifier still
   exports norm, name_tokens, name_in and student_verdict under their old names.
 
+  rules.py and classify: every portal key form and every ZIP title files under the right
+  document key; REQUIRED unchanged (P2: Master's keeps income tax, P4: no study plan);
+  P1: a parent's death certificate in place of their NID, in all four combinations;
+  P3: the ID card / CV recorded as present and never read.
+
 Every name, passport and number here is invented (SAMPLE names, A9990000n passports);
 every file is written under tmp_path.
 

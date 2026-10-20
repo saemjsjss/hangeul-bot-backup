@@ -337,6 +337,18 @@ def test_b13_an_mrz_expiry_the_portal_does_not_share_is_a_flag_and_the_mrz_decid
     assert (C.FLAG, "portal expiry 2031-01-01, the passport's MRZ reads 2027-03-01 — correct the portal") in out
 
 
+def test_b13_an_mrz_expiry_with_one_lucky_check_digit_does_not_override_the_portal():
+    l1, l2 = mrz_lines("A99900001", "2005-03-14", "2027-03-01")
+    weak = l2[:9] + "9" + l2[10:19] + "9" + l2[20:43] + "9"           # only the expiry digit agrees
+    mrz = dv.passport_mrz(weak)
+    assert mrz["expiry_ok"] and mrz["checks"] == 1
+    assert dv.mrz_expiry(mrz, dt.date(2031, 1, 1)) is None
+    assert dv.mrz_expiry(mrz, dt.date(2027, 3, 1)) == dt.date(2027, 3, 1)      # it is the portal's own
+    out = dv.check_passport(f"{FILLER}\n{l1}\n{weak}", student(), [])
+    assert out[0] == (C.PASS, "valid until 2031-01-01 (50 months left)")
+    assert not any("MRZ reads" in t for t in only(out, C.FLAG))
+
+
 def test_b13_without_an_mrz_the_portal_expiry_is_used_and_said_so():
     out = dv.check_passport(f"PASSPORT A99900001 {FILLER}", student(), [])
     assert out[0] == (C.PASS, "valid until 2031-01-01 (50 months left)")
@@ -359,7 +371,7 @@ def test_b13_a_different_mrz_valid_number_is_a_flag():
 
 
 def test_b13_an_unrelated_number_is_a_flag():
-    out = dv.check_passport(f"Passport No B12345678 {FILLER}", student(), [])
+    out = dv.check_passport(f"Passport No Z00000000 {FILLER}", student(), [])
     assert (C.FLAG, "portal passport number A99900001 not found in the scan text") in out
 
 
@@ -389,12 +401,12 @@ def test_b7_the_full_name_with_honorifics_anywhere_passes():
 
 
 def test_b7_academic_papers_need_the_whole_name():
-    s = student(Mother="SAMPLE SAMPLE", Father="SAMPLE KARIM")
-    out = dv.check_academic(f"Certificate. Name: SAMPLE STUDENT ONE. Father's name MD. SAMPLE KARIM. "
+    s = student(Mother="SAMPLE LADY", Father="SAMPLE PARENT ONE")
+    out = dv.check_academic(f"Certificate. Name: SAMPLE STUDENT ONE. Father's name MD. SAMPLE PARENT ONE. "
                             f"Mother's name OTHER SAMPLE. apostille {FILLER}", s, [])
     assert (C.PASS, "student's name (SAMPLE STUDENT ONE) appears on the academic papers") in out
-    assert (C.PASS, "father's name (SAMPLE KARIM) appears on the academic papers") in out
-    assert (C.FLAG, "mother's name 'SAMPLE SAMPLE' not found on the academic papers") in out
+    assert (C.PASS, "father's name (SAMPLE PARENT ONE) appears on the academic papers") in out
+    assert (C.FLAG, "mother's name 'SAMPLE LADY' not found on the academic papers") in out
 
 
 def test_b7_family_certificate_name_at_the_top():
@@ -705,7 +717,7 @@ def test_verify_student_end_to_end(tmp_path, no_images, no_ocr):
                                f"Statement Generation Date: 15/10/2026 Statement Period: 01/04/2026 to "
                                f"30/09/2026\nOpening Balance 2,000,000.00\n{FILLER}"],
         "TRADE LICENSE.pdf": f"Trade licence of SAMPLE FATHER. Fiscal Year: 2026-2027. Notary. {FILLER}",
-        "ID CARD CV.pdf": f"Curriculum vitae of OTHER PERSON, passport B12345678. {FILLER}",
+        "ID CARD CV.pdf": f"Curriculum vitae of OTHER PERSON, passport Z00000000. {FILLER}",
         ".download_complete": "v2",
     })
     rows = dv.verify_student(d, student(), "KLP")
@@ -755,5 +767,21 @@ def test_verify_student_end_to_end(tmp_path, no_images, no_ocr):
         ("CROSS-CHECK passport number", "", "PASS: passport number A99900001 appears on: 01 Passport"),
     ]
     # the CV is never read: its other name and passport reach no row
-    assert "OTHER PERSON" not in str(rows) and "B12345678" not in str(rows)
+    assert "OTHER PERSON" not in str(rows) and "Z00000000" not in str(rows)
     assert dv.student_verdict(rows) == C.PASS
+
+
+def test_the_cli_report_writes_error_rows(tmp_path):
+    from openpyxl import load_workbook
+    base = {"student": "SAMPLE STUDENT ONE", "passport": "A99900001", "program": "KLP", "student_verdict": C.ERROR}
+    rows = [{**base, "doc": "01 Passport", "file": "PASSPORT.pdf", "key": "passport", "verdict": C.PASS,
+             "detail": "PASS: ok"},
+            {**base, "doc": "08 Bank Solvency & Statement", "file": "BANK STATEMENT.pdf", "key": "bank",
+             "verdict": C.ERROR, "has_error": True, "detail": "ERROR: could not check this file (locked)"}]
+    out = dv.write_report(rows, tmp_path / "report.xlsx")
+    wb = load_workbook(out)
+    assert [c.value for c in wb["Documents"][3]][4:7] == ["08 Bank Solvency & Statement", "BANK STATEMENT.pdf",
+                                                          "ERROR"]
+    assert [c.value for c in wb["Summary"][1]] == ["Student", "Passport", "Program", "Verdict", "Missing", "Fail",
+                                                   "Flag", "Pass", "Error"]
+    assert [c.value for c in wb["Summary"][2]] == ["SAMPLE STUDENT ONE", "A99900001", "KLP", "ERROR", 0, 0, 0, 1, 1]

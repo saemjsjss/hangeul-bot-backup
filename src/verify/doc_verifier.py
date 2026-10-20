@@ -487,8 +487,17 @@ def mrz_dob(mrz: Dict[str, Any], portal_dob: Optional[dt.date] = None) -> Option
     """The MRZ's date of birth when it can be trusted: its check digit agrees AND the line
     is whole, or at least 2 check digits agree, or it is the portal's own date of birth.
     One agreeing digit alone is a 1-in-10 chance."""
-    d = _iso(mrz.get("dob")) if mrz.get("dob_ok") else None
-    if d and (mrz.get("line2_ok") or (mrz.get("checks") or 0) >= 2 or d == portal_dob):
+    return _trusted(mrz, "dob", portal_dob)
+
+
+def mrz_expiry(mrz: Dict[str, Any], portal_expiry: Optional[dt.date] = None) -> Optional[dt.date]:
+    """The MRZ's expiry date, trusted on the same terms as its date of birth."""
+    return _trusted(mrz, "expiry", portal_expiry)
+
+
+def _trusted(mrz: Dict[str, Any], field: str, portal: Optional[dt.date]) -> Optional[dt.date]:
+    d = _iso(mrz.get(field)) if mrz.get(f"{field}_ok") else None
+    if d and (mrz.get("line2_ok") or (mrz.get("checks") or 0) >= 2 or d == portal):
         return d
     return None
 
@@ -529,8 +538,8 @@ def check_passport(text: str, student: Dict[str, str], sizes, path: Optional[Pat
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", expiry or ""):
         portal_exp = dt.date.fromisoformat(expiry)
     # The validity is read from the passport itself when its MRZ expiry is check-digit
-    # valid; the portal's value is what a consultant typed.
-    exp_date = _iso(mrz.get("expiry")) if mrz.get("expiry_ok") else None
+    # valid (and not a lone lucky digit); the portal's value is what a consultant typed.
+    exp_date = mrz_expiry(mrz, portal_exp)
     notes = []
     if exp_date:
         if portal_exp and portal_exp != exp_date:
