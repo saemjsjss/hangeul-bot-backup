@@ -160,13 +160,14 @@ def originals_of(w, folder):
 def test_the_marker_records_its_format_and_the_portals_document_list(tmp_path):
     assert vd._read_marker(tmp_path) == ("", None)                       # never downloaded
     vd._write_marker(tmp_path, "academic_1_100.pdf|passport_1_100.jpg")
-    assert (tmp_path / vd.LOCAL_DONE_MARKER).read_text(encoding="utf-8") == \
-        "v2\nacademic_1_100.pdf|passport_1_100.jpg"
+    assert (tmp_path / vd.LOCAL_DONE_MARKER).read_bytes() == b"v2\nacademic_1_100.pdf|passport_1_100.jpg"  # no \r
     assert vd._read_marker(tmp_path) == ("v2", "academic_1_100.pdf|passport_1_100.jpg")
     assert not (tmp_path / (vd.LOCAL_DONE_MARKER + ".part")).exists()
     for legacy, docs in (("passport_1_100.jpg", "passport_1_100.jpg"), ("ok", "ok"), ("", "")):
         (tmp_path / vd.LOCAL_DONE_MARKER).write_text(legacy, encoding="utf-8")
         assert vd._read_marker(tmp_path) == ("v1", docs)
+    (tmp_path / vd.LOCAL_DONE_MARKER).write_bytes(b"v2\r\npassport_1_100.jpg")       # edited by hand on Windows
+    assert vd._read_marker(tmp_path) == ("v2", "passport_1_100.jpg")
 
 
 # --------------------------------------------------------------------------- replaced documents (B1)

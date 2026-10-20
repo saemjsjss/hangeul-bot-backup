@@ -405,8 +405,9 @@ def _read_marker(folder: Path) -> Tuple[str, Optional[str]]:
 
 
 def _write_marker(folder: Path, docs: str) -> None:
+    """Exactly "v2\\n<docs>" (bytes, so Windows writes no \\r), through .part and a rename."""
     tmp = folder / (LOCAL_DONE_MARKER + ".part")
-    tmp.write_text(f"{MARKER_VERSION}\n{docs}", encoding="utf-8")
+    tmp.write_bytes(f"{MARKER_VERSION}\n{docs}".encode("utf-8"))
     tmp.replace(folder / LOCAL_DONE_MARKER)
 
 
