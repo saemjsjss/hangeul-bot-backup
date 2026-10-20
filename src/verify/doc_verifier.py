@@ -16,8 +16,8 @@ What it does per student:
 Verdicts: PASS · FLAG (needs a human eye) · FAIL · MISSING
 
 CLI (run from the BOT folder):
-  python -m src.verify.doc_verifier --student "NAHID SAFWANUL ISLAM"
-  python -m src.verify.doc_verifier --passport A00990016
+  python -m src.verify.doc_verifier --student "SAMPLE STUDENT ONE"
+  python -m src.verify.doc_verifier --passport A99900001
   python -m src.verify.doc_verifier --all                  # every downloaded student
   python -m src.verify.doc_verifier --all --since 2026-09-01
 """
@@ -34,15 +34,16 @@ from typing import Any, Dict, List, Optional, Tuple
 from src.config import settings
 from src.verify import page_checks as PC
 from src.verify import rules as R
+# The verdict names and the name rules live in common, shared with field_check and
+# auto_verify; norm, name_tokens, name_in and student_verdict stay importable from here.
+from src.verify.common import (ERROR, FAIL, FLAG, MISSING, NOTE, PASS,  # noqa: F401
+                               name_in, name_tokens, norm, student_verdict)
 
 logger = logging.getLogger(__name__)
 
 DOCS_ROOTS = [settings.docs_root(), settings.konyang_root()]   # an absent one is skipped
 REPORT_DIR = settings.verification_dir()
 TODAY = dt.date.today()
-
-PASS, FLAG, FAIL, MISSING = "PASS", "FLAG", "FAIL", "MISSING"
-NOTE = "NOTE"        # worth a glance, not a finding — never changes a verdict
 
 
 # --- text extraction ---------------------------------------------------------------
@@ -148,10 +149,6 @@ def read_document(path: Path, max_pages: int = 20) -> Tuple[str, List[Tuple[int,
             text.append(_ocr_image(arr[:, :, :3]))
     doc.close()
     return "\n".join(text), sizes
-
-
-def norm(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "")).strip().lower()
 
 
 def notarised(text: str, path: Optional[Path]) -> bool:
@@ -773,7 +770,7 @@ def taxpayer_name(text: str) -> str:
     """The person a TIN certificate is issued to.
 
     Bangladeshi TIN certificates carry no "Taxpayer's Name" field.  The name appears in a
-    sentence: "This is to Certify that MST. KEYA ANJUM is a Registered Taxpayer of
+    sentence: "This is to Certify that MST. SAMPLE MOTHER is a Registered Taxpayer of
     National Board of Revenue ...".  Some also print it beside a label, so both are tried.
     """
     patterns = (
@@ -927,12 +924,6 @@ CHECKS = {
 
 
 # --- cross-document consistency (the reviewer's first rule) --------------------------
-def name_tokens(name: str) -> List[str]:
-    """Meaningful parts of a name: drops titles like MD / MST and initials."""
-    skip = {"md", "mst", "most", "mohammad", "mohammed", "sk", "mr", "mrs", "late"}
-    return [t for t in norm(name).split() if len(t) > 2 and t not in skip]
-
-
 def readable(text: str) -> bool:
     """Whether OCR produced usable words. Bangladeshi passport data pages and heavy
     stamps often come out as noise, and a name must not be judged 'missing' on those."""
@@ -941,16 +932,6 @@ def readable(text: str) -> bool:
         return False
     vowelly = sum(1 for w in words if re.search(r"[aeiou]", w, re.I))
     return vowelly / len(words) > 0.6
-
-
-def name_in(text: str, name: str) -> Optional[bool]:
-    """True/False if we can judge, None when the name is unknown."""
-    toks = name_tokens(name)
-    if not toks:
-        return None
-    t = norm(text)
-    hits = sum(1 for tok in toks if tok in t)
-    return hits >= max(1, len(toks) - 1)
 
 
 def cross_checks(texts: Dict[str, str], student: Dict[str, str]) -> List[Dict[str, Any]]:
@@ -1084,16 +1065,6 @@ def verify_student(folder: Path, student: Dict[str, str], program: str) -> List[
                          "detail": " | ".join(f"{v}: {d}" for v, d in results)})
     rows += cross_checks(texts, student)
     return rows
-
-
-def student_verdict(rows: List[Dict[str, Any]]) -> str:
-    if any(r["verdict"] == MISSING for r in rows):
-        return "INCOMPLETE"
-    if any(r["verdict"] == FAIL for r in rows):
-        return "FAIL"
-    if any(r["verdict"] == FLAG for r in rows):
-        return "REVIEW"
-    return "PASS"
 
 
 # --- finding students and writing the report ---------------------------------------
