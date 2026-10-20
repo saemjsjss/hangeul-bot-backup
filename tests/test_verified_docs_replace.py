@@ -424,6 +424,28 @@ def test_confirm_replace_replaces_what_the_breaker_held_back_for_that_student_on
     assert files(other) == {"PASSPORT.jpg": b"x1"}
 
 
+def test_confirm_replace_from_the_command_line_takes_the_syncs_lock(monkeypatch, tmp_path, capsys):
+    lock = tmp_path / "data" / "auto_sync.lock"
+    monkeypatch.setattr(auto_sync, "LOCK_PATH", lock)
+    seen = []
+
+    async def run_local(root, limit=0, skip_drive_done=True, confirm_replace=()):
+        seen.append((root, list(confirm_replace), lock.read_text(encoding="utf-8")))
+        return {}
+
+    monkeypatch.setattr(vd, "run_local", run_local)
+    argv = ["verified_docs", "--local", str(tmp_path / "docs"), "--confirm-replace", "A99900001,A99900002"]
+    monkeypatch.setattr(sys, "argv", argv)
+    vd.main()
+    assert seen == [(tmp_path / "docs", ["A99900001", "A99900002"], str(os.getpid()))]
+    assert not lock.exists()                                             # given back
+
+    lock.write_text(str(os.getpid()), encoding="utf-8")                  # a sync (or a pause) holds it
+    vd.main()
+    assert len(seen) == 1 and "try again in a few minutes" in capsys.readouterr().out
+    assert lock.read_text(encoding="utf-8") == str(os.getpid())          # not taken from its holder
+
+
 # --------------------------------------------------------------------------- Google Drive (B2)
 
 def test_a_good_drive_lookup_is_saved_and_its_finished_students_skipped(world, monkeypatch):

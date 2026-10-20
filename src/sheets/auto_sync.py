@@ -292,9 +292,8 @@ def sync_docs(cloud: Optional[Dict] = None, state: Optional[Dict] = None) -> Lis
             cloud["docs_error"] = RuntimeError(result["layout_alert"])
         else:
             cloud["documents"], cloud["documents_at"] = result.get("students"), started
-    if result.get("drive_lookup_error"):
-        print(f"   Google Drive was not asked which folders are finished ({result['drive_lookup_error']}) "
-              "- the list saved earlier was used")
+    # result["drive_lookup_error"] (Google Drive could not be asked; run_local logged it and used the
+    # list saved earlier) is no news for Telegram
     return doc_lines(result, state)
 
 
