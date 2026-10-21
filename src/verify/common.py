@@ -22,7 +22,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 # Bump whenever any rule in rules / doc_verifier / page_checks / field_check changes: every
 # stored verdict made under another version is re-evaluated from the saved text.
-RULES_VERSION = "2026-10-21.2"
+RULES_VERSION = "2026-10-21.3"
 
 PASS, FLAG, FAIL, MISSING, NOTE, ERROR = "PASS", "FLAG", "FAIL", "MISSING", "NOTE", "ERROR"
 INCOMPLETE, REVIEW = "INCOMPLETE", "REVIEW"

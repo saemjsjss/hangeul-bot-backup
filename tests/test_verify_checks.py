@@ -280,10 +280,35 @@ def test_b3_check_bank_reads_the_statement_from_page_two(tmp_path, no_images):
     out = dv.check_bank(dv.read_document(p)[0], student(), [], "BACHELOR", p, {})
     assert (C.PASS, "balance 2,500,000 BDT meets the 2,500,000 BDT minimum") in out
     assert (C.PASS, "opening balance 2,400,000 BDT is within the expected range") in out
-    assert (C.PASS, "the statement covers 6 months (2026-04-01 to 2026-09-30)") in out
+    assert not [t for _, t in out if "statement covers" in t or "statement period" in t]  # rule out (owner)
     assert (C.PASS, "solvency certificate and statement both dated 2026-10-15") in out
     assert (C.PASS, "account appears to be in the name of SAMPLE FATHER") in out
     assert C.FAIL not in verdicts(out) and C.ERROR not in verdicts(out)
+
+
+def test_the_statement_period_is_not_checked_on_a_bank_file(tmp_path, no_images):
+    p = make_pdf(tmp_path / "BANK STATEMENT.pdf", [
+        f"SOLVENCY CERTIFICATE To whom it may concern. Date: 15/10/2026. This is to certify that "
+        f"SAMPLE FATHER holds an account with a balance of Tk 25,00,000.00 (USD 20,491.80). {FILLER}",
+        f"STATEMENT OF ACCOUNT Statement Period: 01/10/2026 to 14/10/2026\n{FILLER}",   # two weeks
+    ])
+    out = dv.check_bank(dv.read_document(p)[0], student(), [], "BACHELOR", p, {})
+    assert not [t for _, t in out if "statement covers" in t or "statement period" in t]
+
+
+def test_family_cert_a_cited_recent_affidavit_proves_it_is_recent_and_an_old_one_never_fails():
+    recent = (dv.TODAY - dt.timedelta(days=40)).strftime("%d/%m/%Y")
+    old = (dv.TODAY - dt.timedelta(days=200)).strftime("%d/%m/%Y")
+    stu = student()
+    out = dv.check_family_cert(f"according to the affidavit (No-01, Date: {recent}, Notary Public) {FILLER}",
+                               stu, [])
+    assert out[0][0] == C.PASS and "cites an affidavit dated" in out[0][1]
+    out = dv.check_family_cert(f"according to the affidavit (No-01, Date: {old}, Notary Public) {FILLER}",
+                               stu, [])
+    assert out[0][0] == C.FLAG                                         # proves nothing: never a FAIL
+    labelled = (dv.TODAY - dt.timedelta(days=150)).strftime("%d/%m/%Y")
+    out = dv.check_family_cert(f"Date: {labelled}\naccording to the affidavit (Date: {recent}) {FILLER}", stu, [])
+    assert out[0][0] == C.FAIL                                         # its own issue date decides
 
 
 def test_b3_the_opening_balance_and_period_rules_never_fail():
@@ -1014,7 +1039,6 @@ def test_verify_student_end_to_end(tmp_path, no_images, no_ocr):
         "PASS: balance 2,500,000 BDT meets the 1,800,000 BDT minimum | PASS: solvency amount stated in USD | "
         "PASS: carries a seal and signature | PASS: solvency certificate and statement both dated 2026-10-15 | "
         "PASS: opening balance 2,000,000 BDT is within the expected range | "
-        "PASS: the statement covers 6 months (2026-04-01 to 2026-09-30) | "
         "PASS: account appears to be in the name of SAMPLE FATHER")
     assert "PASS: licence fiscal year 2026-2027 is the current 2026-2027" in by_key["trade_license"]["detail"]
     assert "PASS: SSC GPA 5.00 matches the portal" in by_key["academic"]["detail"]

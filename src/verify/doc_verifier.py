@@ -920,10 +920,27 @@ def issue_date(text: str) -> Optional[dt.date]:
     return issue_date_labelled(text)[0]
 
 
+_CITED_AFFIDAVIT = re.compile(r"affidavit[^\n]{0,120}", re.I)
+
+
+def cited_affidavit_date(text: str) -> Optional[dt.date]:
+    """The latest date of the last 3 years on a line that cites an affidavit (the certificate is
+    issued after the affidavit it cites, so the certificate is at most that old), else None."""
+    got = [d for m in _CITED_AFFIDAVIT.finditer(text or "") for d in find_dates(m.group(0)) if _issue_recent(d)]
+    return max(got) if got else None
+
+
 def check_family_cert(text: str, student, sizes, path=None) -> List[Tuple[str, str]]:
     out = []
     recent, source = issue_date_labelled(text)
-    if recent and source == "fallback":
+    # No issue date of its own: an affidavit it cites, dated within the validity, proves it is
+    # recent (owner, 21 Oct 2026). An older cited affidavit proves nothing either way.
+    cited = cited_affidavit_date(text) if source in ("fallback", "") else None
+    if cited and months_between(cited, TODAY) <= R.FAMILY_CERT_MAX_MONTHS:
+        out.append((PASS, f"no issue date line could be read, but it cites an affidavit dated {cited} "
+                          f"({months_between(cited, TODAY)} month(s) ago) — issued after it, so within "
+                          "the 3-month validity"))
+    elif recent and source == "fallback":
         out.append((FLAG, f"no Date/Ref line could be read; the latest recent date on the certificate is "
                           f"{recent}, which may be the notary date — check the issue date (3-month "
                           "validity) by eye"))
@@ -1440,11 +1457,12 @@ def check_bank(text: str, student, sizes, program: str, path=None, others=None) 
     elif pages:
         out.append((FLAG, "the bank file has only one page, so it cannot hold both a solvency "
                           "certificate and a statement"))
-    # The statement's own rules (opening balance, the months it covers) are read from the
-    # statement pages; a file read as one block of text is all there is to go on.
+    # The statement's own rule (the opening balance) is read from the statement pages; a file
+    # read as one block of text is all there is to go on. The months a statement covers are
+    # not checked: the owner took that rule out on 21 Oct 2026 (statement_period_check stays
+    # for when it comes back).
     statement = pages[1:] if len(pages) >= 2 else [text]
     out += opening_balance_check("\n".join(statement), program)
-    out += statement_period_check(statement)
 
     if holder:
         ctx["_account_holder"] = holder
