@@ -428,13 +428,19 @@ def labelled_amounts(text: str, labels: List[str], window: int = 60, plain: bool
 
 # --- dates of birth, the passport's MRZ and its number ------------------------------
 _DOB_LABEL_RE = re.compile(r"(?<![a-z])(?:date\s*of\s*birth|birth\s*date|d\.?\s?o\.?\s?b)(?![a-z])\.?", re.I)
+# The online BRIS certificate's table header: "DATE OF BIRTH | BIRTH REGISTRATION NUMBER | SEX",
+# with the values on the row below.
+_BRIS_HEADER = re.compile(r"[\s:|.\-]*(?:birth\s*)?registration\s*(?:number|no)\b", re.I)
+_ROW_END = re.compile(r"date|issue", re.I)
 
 
 def labelled_dob(text: str) -> Optional[dt.date]:
     """The date printed beside a "Date of Birth" / "Birth Date" / "DOB" label: the first
     date within 60 characters after it (digits printed one per box included), read only
     up to the next label ("Date of Registration", "Issue Date") so that date is never
-    taken for the birth date."""
+    taken for the birth date. When the label is the head of the BRIS table ("DATE OF BIRTH
+    BIRTH REGISTRATION NUMBER SEX"), the date is read from the row below, up to the next
+    "Date" / "Issue" word."""
     stop = _label_re(R.DOB_STOP_LABELS)
     for m in _DOB_LABEL_RE.finditer(text or ""):
         window = text[m.end():m.end() + 60]
@@ -442,6 +448,13 @@ def labelled_dob(text: str) -> Optional[dt.date]:
         found = find_dates(window[:cut.start()] if cut else window)
         if found:
             return found[0]
+        hdr = _BRIS_HEADER.match(text, m.end())
+        if hdr:                                     # a table header: the value is on the next row
+            row = text[hdr.end():hdr.end() + 100]
+            end = _ROW_END.search(row)              # never run into "Date of Registration/Issue"
+            found = find_dates(row[:end.start()] if end else row)
+            if found:
+                return found[0]
     return None
 
 
@@ -672,15 +685,26 @@ def birth_date_check(cert_text: str, passport_text: str, student) -> List[Tuple[
     Each side is read where it is labelled: the certificate's "Date of Birth" field, the
     passport's MRZ (when its check digits can be trusted) or else its "Date of Birth"
     field. FAIL only when both are read and differ and the passport's date is sure (a
-    trusted MRZ, or a labelled date that is also the portal's); anything less is a FLAG."""
+    trusted MRZ, or a labelled date that is also the portal's); anything less is a FLAG.
+
+    One PASS does not need the passport's own field to be read: the certificate's labelled
+    date is the portal's, that exact date is printed on the passport scan, and no MRZ (even an
+    untrusted one) gives a different date."""
     if not passport_text:
         return [(FLAG, "no passport on file to check the date of birth against")]
     portal = _iso(student.get("DOB"))
     cert = labelled_dob(cert_text)
-    mrz = mrz_dob(passport_mrz(passport_text), portal)
+    raw = passport_mrz(passport_text)
+    mrz = mrz_dob(raw, portal)
     passport = mrz or labelled_dob(passport_text)
     if cert and passport and cert == passport:
         return [(PASS, f"date of birth {cert} is the same on the birth certificate and the passport")]
+    if (cert and not passport and portal and cert == portal
+            and portal in find_dates(passport_text)
+            and _iso(raw.get("dob")) in (None, portal)):
+        return [(PASS, f"date of birth {cert} on the birth certificate is the portal's date of birth, "
+                       "and the passport shows the same date (its date-of-birth field could not be "
+                       "read on its own)")]
     if not cert or not passport:
         unread = ("the birth certificate" if not cert else "") + \
                  (" and " if not cert and not passport else "") + ("the passport" if not passport else "")

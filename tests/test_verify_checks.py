@@ -397,6 +397,60 @@ def test_a9_an_mrz_birth_date_with_one_agreeing_digit_is_trusted_only_when_it_is
     assert dob_check("Date of Birth: 14/03/2006", weak)[0] == C.FLAG
 
 
+B4_CERT = ("Birth Registration Certificate Name SAMPLE STUDENT Date of Birth: 15/03/2004 "
+           "Date of Registration 02/01/2010")
+B4_PASSPORT_NO_FIELD = ("PEOPLE'S REPUBLIC OF BANGLADESH PASSPORT SAMPLE STUDENT 15 MAR 2004 DHAKA "
+                        "01 JAN 2020 31 DEC 2029")
+
+
+def test_b4_passport_field_unread_but_portal_date_on_passport_passes():
+    v, text = dob_check(B4_CERT, B4_PASSPORT_NO_FIELD, dob="2004-03-15")
+    assert v == C.PASS and "2004-03-15" in text and "could not be read on its own" in text
+
+
+def test_b4_passport_unread_and_date_not_on_passport_flags():
+    passport = "PEOPLE'S REPUBLIC OF BANGLADESH PASSPORT SAMPLE STUDENT DHAKA 01 JAN 2020 31 DEC 2029"
+    v, text = dob_check(B4_CERT, passport, dob="2004-03-15")
+    assert v == C.FLAG and text.startswith(
+        "could not read the date of birth on the passport; the birth certificate's 2004-03-15 is the portal's")
+
+
+def test_b4_certificate_not_portal_flags():
+    cert = B4_CERT.replace("15/03/2004", "16/03/2004")
+    passport = B4_PASSPORT_NO_FIELD.replace("15 MAR 2004", "16 MAR 2004")
+    assert dob_check(cert, passport, dob="2004-03-15")[0] == C.FLAG
+
+
+def test_b4_no_portal_dob_flags():
+    assert dob_check(B4_CERT, B4_PASSPORT_NO_FIELD, dob="")[0] == C.FLAG
+
+
+def test_b4_untrusted_mrz_other_date_blocks_pass(monkeypatch):
+    monkeypatch.setattr(dv, "passport_mrz", lambda text: {"dob": "2004-05-15", "dob_ok": False})
+    assert dob_check(B4_CERT, B4_PASSPORT_NO_FIELD, dob="2004-03-15")[0] == C.FLAG
+
+
+def test_b4_labelled_passport_still_plain_pass():
+    passport = B4_PASSPORT_NO_FIELD + " Date of Birth 15 MAR 2004"
+    assert dob_check(B4_CERT, passport, dob="2004-03-15") == (
+        C.PASS, "date of birth 2004-03-15 is the same on the birth certificate and the passport")
+
+
+def test_b4_labelled_dob_bris_table_header():
+    text = ("DATE OF BIRTH BIRTH REGISTRATION NUMBER SEX 15 MARCH 2004 20041234567890123 MALE "
+            "DATE OF REGISTRATION DATE OF ISSUE 02 JANUARY 2010 05 MAY 2021")
+    assert dv.labelled_dob(text) == dt.date(2004, 3, 15)
+
+
+@pytest.mark.parametrize("text", [
+    "Date of Birth: Registration Date 02/01/2010",
+    "Date of Birth : Date of Registration 02/01/2010",
+    "Date of Birth: Birth Registration No. Date of Issue 05/05/2021",
+])
+def test_b4_labelled_dob_never_takes_registration_or_issue_date(text):
+    assert dv.labelled_dob(text) is None
+
+
 def test_b4_check_birth_cert_uses_the_passport_already_read():
     out = dv.check_birth_cert("BDRIS online birth registration. Notary public. Date of Birth: 14/03/2005",
                               student(), [], None, {"passport": PASSPORT_OK})
