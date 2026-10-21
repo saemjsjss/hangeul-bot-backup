@@ -37,7 +37,7 @@ from verify_fixtures import (FILLER, PASSPORTS, folder, make_image, make_pdf, ma
 # --------------------------------------------------------------------------- the contract
 
 def test_rules_version_and_verdict_names():
-    assert C.RULES_VERSION == "2026-10-21.1"
+    assert C.RULES_VERSION == "2026-10-21.2"
     assert (C.PASS, C.FLAG, C.FAIL, C.MISSING, C.NOTE, C.ERROR) == (
         "PASS", "FLAG", "FAIL", "MISSING", "NOTE", "ERROR")
     assert (C.INCOMPLETE, C.REVIEW) == ("INCOMPLETE", "REVIEW")
