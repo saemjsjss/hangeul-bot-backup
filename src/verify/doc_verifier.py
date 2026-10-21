@@ -973,6 +973,14 @@ def document_date(text: str) -> Optional[dt.date]:
     return dates[-1] if dates else None
 
 
+_ROW_DATE_AT = re.compile(r"\d{1,2}\s*[./-]\s*(?:\d{1,2}|[a-z]{3,9})\s*[./-]\s*\d{2,4}"
+                          r"|\d{4}[./-]\d{1,2}[./-]\d{1,2}", re.I)
+_ROW_STOP = re.compile(r"balance|closing|branch|total", re.I)
+_ZERO_AFTER = re.compile(r"\s*[:=]?\s*0[.,]00(?!\d)")
+_OTHER_BALANCE_BEFORE = re.compile(r"(?:closing|current|available|ledger|present|total)\s*balance\W{0,5}$"
+                                   r"|total\W{0,5}$", re.I)
+
+
 def opening_balance(text: str) -> Tuple[Optional[int], bool]:
     """The balance a statement starts from, and whether the statement labels it.
 
@@ -980,14 +988,39 @@ def opening_balance(text: str) -> Tuple[Optional[int], bool]:
     Brought Forward — and some print no label at all, in which case the balance on the
     first transaction row is the opening figure (unlabelled: a guess, never judged).
 
-    The labelled value is the first figure written like money within 60 characters after the
-    label (money_figures): a date ("as on 2026-04-01"), a year or an account number printed
-    between is never taken for it."""
-    figures = money_figures(text)
-    for m in _label_re(R.OPENING_BALANCE_WORDS).finditer(text or ""):
-        after = [v for pos, v in figures if m.end() <= pos <= m.end() + 60]
-        if after:
-            return int(after[0]), True
+    The labelled value is read from the label's own row, as these statements lay it out:
+      - a plausible balance (1 lakh or more) printed just before the label, with at most a date
+        between ("Debit Credit Balance 2,740,217.50 Opening Balance", "24,93,857.00 15-09-2026
+        OPENING BALANCE") — not one labelled as another balance or a total;
+      - else the first balance of 1 lakh or more after it, skipping a value date and an "as on"
+        date, up to the next date or label ("OPENING BALANCE 0.00 0.00 2,004,865.00 CR");
+      - else exactly 0.00 and nothing else (a new account).
+    A debit or credit beside the label (under 1 lakh), a year, a date or an account number is
+    never taken for it; a label whose row holds none of these is not read."""
+    text = text or ""
+    ids = [m.end() for m in _id_label_re().finditer(text)]
+    figures = [(p, v) for p, v in plausible_money(text) if not _after_id(text, ids, p)]
+    for m in _label_re(R.OPENING_BALANCE_WORDS).finditer(text):
+        before = [(p, v) for p, v in figures if m.start() - 40 <= p < m.start() and v >= _BALANCE_FLOOR]
+        if before:
+            p, v = before[-1]
+            gap = _ROW_DATE_AT.sub("", re.sub(r"^[\d,.]+", "", text[p:m.start()]), count=1)
+            if re.fullmatch(r"[\s|=\-:CRcr]*", gap) and not _OTHER_BALANCE_BEFORE.search(text[max(0, p - 30):p]):
+                return int(v), True
+        start = m.end()
+        lead = re.match(r"\s*(?:as\s*(?:on|at)|on|dated?)?\W{0,3}", text[start:start + 16])
+        first = _ROW_DATE_AT.match(text, start + lead.end())
+        if first:
+            start = first.end()
+        end = start + 60
+        for stop in (_ROW_DATE_AT.search(text, start, end), _ROW_STOP.search(text, start, end)):
+            if stop:
+                end = min(end, stop.start())
+        row = [v for p, v in figures if start <= p < end and v >= _BALANCE_FLOOR]
+        if row:
+            return int(row[0]), True
+        if _ZERO_AFTER.match(text, m.end()) and not [v for p, v in figures if m.end() <= p < end]:
+            return 0, True
     # no label: take the balance on the first transaction row
     for line in (text or "").splitlines():
         if not re.search(r"\d{1,2}[./-]\w{2,9}[./-]\d{2,4}", line):
@@ -1060,29 +1093,171 @@ def statement_period_check(pages: List[str]) -> List[Tuple[str, str]]:
     return [(PASS, f"the statement covers {months} months ({start} to {end})")]
 
 
-def balance_check(text: str, program: str) -> List[Tuple[str, str]]:
-    """The minimum balance. Only a figure the document LABELS as the balance can pass or
-    fail it; an unlabelled amount (a credit total, a deposit) is shown for a human to
-    judge, never taken for the balance."""
+# --- the bank balance (B3) ----------------------------------------------------------
+# Money on a bank file is plausible only when written like money AND sized like money: 10,000
+# to 10 crore taka, in a real digit grouping (western 3-3-3 or lakh 2-2-3; OCR may print the
+# separators as dots). A balance is at least 1 lakh: "Balance 0", "SL 124" and column headers are
+# not balances. Certificates print the taka amount with its USD equivalent at their own exchange
+# rate (BDT 115-130 per USD in this corpus); a statement never does.
+_PLAUSIBLE_MONEY = (10_000, 100_000_000)
+_BALANCE_FLOOR = 100_000
+_USD_RATE = (115, 130)
+_USD_WINDOW = 260                       # the USD figure follows the amount and its amount in words
+_CERT_WORDS = re.compile(r"solven|to\s*whom|whom\s*it|financially\s*sound|this\s*is\s*to\s*certify"
+                         r"|balance\s*confirmation|balance\s*certificate", re.I)
+_CERT_LABELS = ["balance", "amount", "total", "sum of", "bdt", "tk"]     # figure within 120 chars
+_CERT_TAKA_LABELS = ["taka"]            # "(Taka Twenty Lac ...)" are words: the figure must follow at once
+_CLOSING_LABELS = ["closing balance", "current balance", "available balance", "ledger balance",
+                   "present balance", "balance as on", "balance as at"]
+_BANK_MONEY_RE = re.compile(
+    _NOT_BEFORE + r"(?:(?P<sep>\d{1,3}(?:,\d{2,3})+(?:[.,]\d{1,2})?|\d{1,3}(?:[.,]\d{2,3}){2,}[.,]\d{2})"
+    + r"|(?P<dec>\d+\.\d{1,2}))" + _NOT_AFTER
+    + r"|(?:(?<![a-z])(?:tk|bdt|taka)\.?|৳)[ \t]*[:=\-]?[ \t]*(?P<pre>\d{1,8})" + _NOT_AFTER
+    + r"|" + _NOT_BEFORE + r"(?P<post>\d{1,8})[ \t]*(?:/-[ \t]*)?(?:tk|bdt|taka)(?![a-z])", re.I)
+_USD_BEFORE = re.compile(r"(?:usd|dollar|\$|u\.s\.)[^a-z0-9]{0,4}$", re.I)
+_USD_MARK = re.compile(r"us[d0o]|dollar|\$", re.I)
+_ANY_NUMBER = re.compile(r"(?<![\d,.])(\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,4})?|\d{3,6}(?:[.,]\d{1,4})?)(?!\d)")
+
+
+def grouped_value(raw: str) -> Optional[float]:
+    """'25,73,067.50', '2,573,067.50', OCR '25.73.067.50' or '30.07,200.00' -> the value; None when
+    the digit groups are neither western (3-3-3) nor lakh (2-2-3). A last group of 1-2 digits is the
+    paisa, whichever mark OCR printed before it."""
+    toks = re.split(r"[.,]", (raw or "").strip())
+    if not all(t.isdigit() for t in toks):
+        return None
+    dec = ""
+    if len(toks) > 1 and len(toks[-1]) <= 2:
+        dec, toks = toks[-1], toks[:-1]
+    if len(toks) > 1:
+        first, rest = toks[0], toks[1:]
+        western = all(len(t) == 3 for t in rest)
+        lakh = all(len(t) == 2 for t in rest[:-1]) and len(rest[-1]) == 3
+        if not 1 <= len(first) <= 3 or not (western or lakh):
+            return None
+    return float("".join(toks) + ("." + dec if dec else ""))
+
+
+def plausible_money(text: str) -> List[Tuple[int, float]]:
+    """(position, value) of every figure on a bank file that can be a taka amount: written like
+    money, a real digit grouping, 10,000 to 10 crore, not marked as USD, and not right after an ID
+    label -- unless it carries thousands separators (an account number never does, and certificate
+    tables print the amount straight after the account number)."""
+    text = text or ""
+    ids = [m.end() for m in _id_label_re().finditer(text)]
+    out: List[Tuple[int, float]] = []
+    for m in _BANK_MONEY_RE.finditer(text):
+        group = next(g for g in ("sep", "dec", "pre", "post") if m.group(g) is not None)
+        pos = m.start(group)
+        if group != "sep" and _after_id(text, ids, pos):
+            continue
+        if _USD_BEFORE.search(text[max(0, m.start() - 14):m.start()]):
+            continue
+        v = grouped_value(m.group(group))
+        if v is not None and _PLAUSIBLE_MONEY[0] <= v <= _PLAUSIBLE_MONEY[1]:
+            out.append((pos, v))
+    return out
+
+
+def _labelled_balances(page: str, labels: List[str], window: int) -> List[Tuple[int, float]]:
+    """The first plausible figure within `window` characters after each label (not an opening-
+    balance label), when it is at least 1 lakh and not the USD equivalent of another figure."""
+    figures = plausible_money(page)
+    values = [v for _, v in figures]
+    opening = _opening_spans(page)
+    out: Dict[int, float] = {}
+    for m in _label_re(labels).finditer(page or ""):
+        if any(a < m.end() and m.start() < b for a, b in opening):
+            continue
+        for pos, v in figures:
+            if pos >= m.end():
+                if pos - m.end() <= window:
+                    out[pos] = v
+                break
+    return [(p, v) for p, v in sorted(out.items())
+            if v >= _BALANCE_FLOOR and not any(80 <= w / v <= 140 for w in values)]
+
+
+def usd_confirms(page: str, pos: int, value: float, marked: bool = False) -> bool:
+    """Is the taka figure at `pos` followed (within _USD_WINDOW characters) by a figure it is
+    _USD_RATE times -- its own USD equivalent, so the taka figure was read whole? `marked`: a
+    USD / dollar / $ mark must also sit within 200 characters before the figure or between."""
+    page = page or ""
+    for m in _ANY_NUMBER.finditer(page[pos:pos + _USD_WINDOW]):
+        if marked and not _USD_MARK.search(page[max(0, pos - 200):pos + m.start()]):
+            continue
+        w = grouped_value(m.group(1))
+        if w and _USD_RATE[0] <= value / w <= _USD_RATE[1]:
+            return True
+    return False
+
+
+def _one_amount(values: List[float]) -> bool:
+    """One amount (repeated or OCR'd twice within 1%), or the largest is the total of the rest."""
+    top = max(values)
+    others = sorted({round(v) for v in values if v < top * 0.99})
+    return not others or abs(sum(others) - top) <= top * 0.01
+
+
+def balance_check(text: str, program: str, pages: Optional[List[str]] = None) -> List[Tuple[str, str]]:
+    """The minimum balance, read in this order:
+      1. the amount the solvency certificate states: on pages with certificate wording ("solvency",
+         "to whom it may concern", "this is to certify", ...), the figure after a balance / amount /
+         total / BDT / Tk label (straight after "Taka"); with no such page, the figure after a
+         balance label on any page that is not a statement;
+      2. a taka figure the file converts to USD (only certificates do);
+      3. the statement's labelled closing / current / available / ledger / present balance.
+    Only these can PASS. Anything else is a FLAG showing the largest plausible amount. A FAIL needs
+    clear evidence: the certificate's own stated amount, below the minimum, one amount (or the total
+    of the others), confirmed by its USD equivalent or printed twice, and no plausible figure at or
+    above the minimum anywhere in the file; every other low reading is a FLAG."""
     need = R.MIN_BANK_TAKA[program]
-    figures = money_figures(text)
-    labelled = _labelled_figures(text, R.BALANCE_LABELS)
-    at = {p for p, _ in labelled}
-    unlabelled = [v for p, v in figures if p not in at]
-    if labelled:
-        top = int(max(v for _, v in labelled))
-        if top >= need:
-            return [(PASS, f"balance {top:,} BDT meets the {need:,} BDT minimum")]
-        above = [int(v) for v in unlabelled if v >= need]
-        if above:
-            return [(FLAG, f"the balance reads {top:,} BDT — below the {need:,} BDT minimum for "
-                           f"{program} — but {max(above):,} BDT also appears unlabelled; check which is "
-                           "the balance")]
-        return [(FAIL, f"the balance is {top:,} BDT — below the {need:,} BDT minimum for {program}")]
-    if unlabelled:
-        top = int(max(unlabelled))
-        return [(FLAG, f"no figure is labelled as the balance; the largest amount is {top:,} BDT — check "
-                       f"the balance against the {need:,} BDT minimum for {program} by eye")]
+    pages = [p for p in (pages or []) if p] or [text or ""]
+    every = [v for p in pages for _, v in plausible_money(p)]
+    top = int(max(every)) if every else None
+    cert = [j for j, p in enumerate(pages) if _CERT_WORDS.search(p)]
+    pure = [j for j in cert if not looks_like_statement(pages[j])]
+    if cert:
+        stated = [(j, p, v) for j in (pure or cert)
+                  for p, v in sorted(set(_labelled_balances(pages[j], _CERT_LABELS, 120))
+                                     | set(_labelled_balances(pages[j], _CERT_TAKA_LABELS, 25)))]
+    else:
+        stated = [(j, p, v) for j, pg in enumerate(pages) if not looks_like_statement(pg)
+                  for p, v in _labelled_balances(pg, R.BALANCE_LABELS, 60)]
+    from_cert = bool(stated)
+    if not stated:
+        stated = [(j, p, v) for j, pg in enumerate(pages)
+                  if not looks_like_statement(pg) or _CERT_WORDS.search(pg)
+                  for p, v in plausible_money(pg) if v >= _BALANCE_FLOOR and usd_confirms(pg, p, v, marked=True)]
+        if not stated and text and pages != [text]:
+            pages = pages + [text]          # the whole-file read may hold a figure a page read garbled
+            stated = [(len(pages) - 1, p, v) for p, v in plausible_money(text)
+                      if v >= _BALANCE_FLOOR and usd_confirms(text, p, v, marked=True)]
+    if stated:
+        j, pos, s = max(stated, key=lambda x: x[2])
+        s = int(s)
+        if s >= need:
+            return [(PASS, f"balance {s:,} BDT meets the {need:,} BDT minimum")]
+        if top is not None and top >= need:
+            return [(FLAG, f"the balance reads {s:,} BDT — below the {need:,} BDT minimum for {program} — but "
+                           f"{top:,} BDT also appears in the file; check which is the balance")]
+        values = [v for _, _, v in stated]
+        confirmed = usd_confirms(pages[j], pos, s) or [round(v) for v in values].count(s) >= 2
+        if from_cert and j in pure and _one_amount(values) and confirmed:
+            return [(FAIL, f"the balance is {s:,} BDT — below the {need:,} BDT minimum for {program}")]
+        return [(FLAG, f"the balance reads {s:,} BDT — below the {need:,} BDT minimum for {program} — but it "
+                       "could not be confirmed on the solvency certificate; check by eye")]
+    close = [(p, v) for pg in pages for p, v in _labelled_balances(pg, _CLOSING_LABELS, 60)]
+    if close:
+        c = int(max(v for _, v in close))
+        if c >= need:
+            return [(PASS, f"balance {c:,} BDT meets the {need:,} BDT minimum")]
+        more = f" — but {top:,} BDT also appears in the file" if top is not None and top >= need else ""
+        return [(FLAG, f"the statement's closing balance reads {c:,} BDT — below the {need:,} BDT minimum for "
+                       f"{program}{more}; no solvency amount could be read, check by eye")]
+    if top is not None:
+        return [(FLAG, f"no figure is labelled as the balance; the largest amount is {top:,} BDT — check the "
+                       f"balance against the {need:,} BDT minimum for {program} by eye")]
     return [(FLAG, "no balance amount could be read")]
 
 
@@ -1139,7 +1314,21 @@ def statement_date(pages: List[str]) -> Optional[dt.date]:
 
 
 def check_bank(text: str, student, sizes, program: str, path=None, others=None) -> List[Tuple[str, str]]:
-    out = balance_check(text, program)
+    # The file always has the solvency certificate on page 1 and the statement from
+    # page 2 onwards (or the other way round), so the balance and the two dates are read
+    # from their own pages rather than guessed out of one merged block of text.
+    pages: List[str] = []
+    page_error = None
+    if path is not None:
+        try:
+            pages = read_pages(path, max_pages=10)
+        except CODE_FAULTS:
+            raise
+        except Exception as e:
+            page_error = (ERROR, f"could not read the bank file page by page ({_no_path(e, path)})")
+    out = balance_check(text, program, pages)
+    if page_error:
+        out.append(page_error)
     # The USD total belongs on the solvency certificate; a statement never carries one.
     if looks_like_solvency(text):
         out.append((PASS, "solvency amount stated in USD") if has_any(text, R.USD_WORDS)
@@ -1168,17 +1357,6 @@ def check_bank(text: str, student, sizes, program: str, path=None, others=None) 
     _, who = sponsor_holder(student, text)
     holder = who or student.get("Full Name", "")
 
-    # The file always has the solvency certificate on page 1 and the statement from
-    # page 2 onwards, so the two dates can be read from their own pages rather than
-    # guessed out of one merged block of text.
-    pages: List[str] = []
-    if path is not None:
-        try:
-            pages = read_pages(path, max_pages=10)
-        except CODE_FAULTS:
-            raise
-        except Exception as e:
-            out.append((ERROR, f"could not read the bank file page by page ({_no_path(e, path)})"))
     if len(pages) >= 2:
         sol = document_date(pages[0])
         stm = statement_date(pages[1:])

@@ -97,9 +97,93 @@ def test_b3_a_labelled_balance_in_lakh_grouping_passes():
         (C.PASS, "balance 2,500,000 BDT meets the 1,800,000 BDT minimum")]
 
 
-def test_b3_a_labelled_balance_below_the_minimum_with_nothing_else_fails():
-    (v, text), = dv.balance_check(f"Solvency certificate. {FILLER} Available balance: 1,500,000.00", "BACHELOR")
+def test_b3_a_certificate_amount_below_the_minimum_confirmed_by_its_usd_equivalent_fails():
+    (v, text), = dv.balance_check(f"Solvency certificate. {FILLER} Available balance: 1,500,000.00 "
+                                  "equivalent to USD 12,195.12", "BACHELOR")
     assert v == C.FAIL and "1,500,000" in text and "2,500,000" in text and "BACHELOR" in text
+
+
+def test_b3_a_low_certificate_amount_without_usd_or_repeat_is_only_a_flag():
+    (v, text), = dv.balance_check(f"Solvency certificate. {FILLER} Available balance: 1,500,000.00", "BACHELOR")
+    assert v == C.FLAG and "1,500,000" in text and "could not be confirmed" in text
+
+
+def test_b3_a_low_certificate_amount_printed_twice_fails():
+    text = ("To whom it may concern. This is to certify that SAMPLE FATHER maintains an account. "
+            "Account Balance (BDT) 0123456789012 Savings Bank Account 20,04,220.00 Total 20,04,220.00")
+    assert verdicts(dv.balance_check(text, "BACHELOR")) == [C.FAIL]
+
+
+def test_b3_serials_headers_and_account_numbers_are_never_the_balance():
+    text = ("SOLVENCY CERTIFICATE SL No. 124 Balance 0 A/C No 70800000300 Account 241052311 "
+            "The present balance of the account is Tk.25,65,090.00 (Taka Twenty Five Lac Sixty Five "
+            "Thousand Ninety) equivalent to US Dollar 20,561.84")
+    assert dv.balance_check(text, "MASTER") == [(C.PASS, "balance 2,565,090 BDT meets the 2,500,000 BDT minimum")]
+    (v, msg), = dv.balance_check("Customer ID 31500000966 Account 70800000300 Balance 124", "KLP")
+    assert v == C.FLAG and "31,500,000,966" not in msg and "124 BDT" not in msg
+
+
+def test_b3_the_certificate_table_amount_and_its_usd_column():
+    text = ("TO WHOM IT MAY CONCERN This is to certify ... Account Balance (BDT) Equivalent (USD) "
+            "0123456789012 17 September, 2026 Savings Bank Account 30.07,200.00 24,154.22 "
+            "Total 30,07,200.00 24,154.22")
+    assert dv.balance_check(text, "MASTER") == [(C.PASS, "balance 3,007,200 BDT meets the 2,500,000 BDT minimum")]
+
+
+def test_b3_the_amount_in_words_does_not_carry_the_taka_label_to_a_statement_figure():
+    text = ("TO WHOM IT MAY CONCERN the balance of the account is Tk. 20,04,220.00 (Taka Twenty Lac Four "
+            "Thousand) equivalent to USD 16,264.23. STATEMENT debit credit 01-08-2026 cash 26,04,220.00")
+    (v, msg), = dv.balance_check(text, "BACHELOR")
+    assert v == C.FLAG and "2,004,220" in msg and "2,604,220" in msg
+
+
+def test_b3_a_low_certificate_amount_with_a_higher_figure_elsewhere_is_a_flag():
+    pages = ["SOLVENCY CERTIFICATE present balance Tk 23,12,200.00 USD 18,571.89",
+             "STATEMENT OF ACCOUNT Date Particulars Debit Credit Balance 01-08-2026 CASH 25,12,200.00"]
+    (v, msg), = dv.balance_check("\n".join(pages), "BACHELOR", pages)
+    assert v == C.FLAG and "2,312,200" in msg and "2,512,200" in msg
+
+
+def test_b3_the_certificate_is_read_wherever_it_sits_in_the_file():
+    pages = ["STATEMENT OF ACCOUNT Date Particulars Debit Credit Balance 01-08-2026 CASH 2,00,000.00 19,00,000.00",
+             "SOLVENCY CERTIFICATE The balance of the said account is BDT 27,22,442.50 equivalent to USD 22,005.20"]
+    assert dv.balance_check("\n".join(pages), "BACHELOR", pages) == [
+        (C.PASS, "balance 2,722,442 BDT meets the 2,500,000 BDT minimum")]
+
+
+def test_b3_a_garbled_balance_label_is_read_through_its_usd_conversion_but_never_fails():
+    text = "This is to certify ... the present batance of the Account is B0T. 22,32,540.07 (...) equivatent t0 US0 18,011.62"
+    assert verdicts(dv.balance_check(text, "KLP")) == [C.PASS]
+    assert verdicts(dv.balance_check(text, "BACHELOR")) == [C.FLAG]
+
+
+def test_b3_a_statement_alone_passes_only_on_its_labelled_closing_balance():
+    stmt = ("STATEMENT OF ACCOUNT Debit Credit Balance 01-08-2026 OPENING BALANCE 20,00,762.00 "
+            "16-08-2026 CASH 2,50,000.00 22,50,762.00 Closing Balance 22,50,762.00")
+    assert verdicts(dv.balance_check(stmt, "KLP")) == [C.PASS]
+    (v, msg), = dv.balance_check(stmt.replace("Closing Balance 22,50,762.00", ""), "KLP")
+    assert v == C.FLAG and "no figure is labelled as the balance" in msg
+
+
+@pytest.mark.parametrize("text, value", [
+    ("Debit Credit Balance 01-08-2026 OPENING BALANCE 0.00 0.00 2,004,865.00 CR 02-08-2026 CASH", 2_004_865),
+    ("Debit Credit Balance 2,740,217.50 Opening Balance 19/08/2026 SELF 20,000.00 2,720,217.50", 2_740_217),
+    ("24,93,857.00 15-09-2026 OPENING BALANCE 9,850.00 25,03,707.00 15-09-2026 TFR", 2_493_857),
+    ("Balance Brought Forward 30-05-2026 2,593,705.54 02-06-2026 CASH DEPOSIT 30,000.00", 2_593_705),
+    ("OPENING BALANCE 0.00 BRANCH NAME X CLOSING BALANCE 25,01,767.50", 0),
+    ("Closing Balance 2,600,000.00 Opening Balance 2,000,000.00", 2_000_000),
+    ("OPENING BALANCE 1,805.660.00 CLOSING BALANCE 2,414,569,80", 1_805_660),
+])
+def test_b3_the_opening_balance_is_read_from_its_own_row(text, value):
+    assert dv.opening_balance(text) == (value, True)
+
+
+def test_b3_a_debit_or_credit_beside_the_opening_label_is_not_the_opening_balance():
+    for text in ("Opening Balance 19/08/2026 SELF 20,000.00", "OPENING BALANCE 27-09-2026 CASH 27-09-2026 50,000.00",
+                 "Opening Balance TRF Charge 80.00 0.00"):
+        value, labelled = dv.opening_balance(text)
+        assert not labelled
+        assert C.FLAG not in verdicts(dv.opening_balance_check(text, "KLP"))
 
 
 def test_b3_only_unlabelled_money_is_a_flag_whatever_its_size():
