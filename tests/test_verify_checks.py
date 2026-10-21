@@ -680,6 +680,66 @@ def test_b12_fiscal_year_forms():
     assert dv.current_fiscal_year() == "2026-2027"
 
 
+@pytest.mark.parametrize("text, date", [
+    (f"Certificate No 123 Dale: 23-08-2026 This is to certify {FILLER}", dt.date(2026, 8, 23)),   # OCR "Dale"
+    (f"Issue Datex 20/08/2026 FAMILY CERTIFICATE {FILLER} ATTESTED 8 SEP 2026", dt.date(2026, 8, 20)),
+    (f"Datc; 23/09/2026 FAMILY CERTIFICATE {FILLER} 29 SEP 2026", dt.date(2026, 9, 23)),
+    ("Dhaka Ref " + "x " * 60 + " Memo No 5 Date: 06-09-2026 " + FILLER, dt.date(2026, 9, 6)),  # first label empty
+    (f"REF: 129/2026 NOTARY DATE: 01-09-2026 PUBLIC {FILLER}", dt.date(2026, 9, 1)),   # a stamp word is fine
+    ("Advocate & Notary\nCertificate No: 1\nDate of Issue: 30th September 2026\n" + FILLER,
+     dt.date(2026, 9, 30)),                                                            # lookback stays on its line
+])
+def test_b12_ocr_spellings_and_later_labels_are_read(text, date):
+    assert dv.issue_date_labelled(text) == (date, "label")
+
+
+def test_b12_the_certificate_line_is_read_after_a_notary_page():
+    page = "NOTARY PUBLIC ATTESTED 15 SEP 2026 " + FILLER * 10
+    assert len(page) > 1200
+    assert dv.issue_date_labelled(page + " Family Certificate Certificate No 4567 Date: 17-08-2026") == (
+        dt.date(2026, 8, 17), "label")
+
+
+@pytest.mark.parametrize("text", [
+    f"according to the affidavit (No-01, Date: 07/05/2026, Notary Public) {FILLER}",
+    f"(Notary Public No: 47, Date: 25/08/2026) {FILLER}",
+    f"affidavit issued by Adv. Sample Advocate (Ref- 06, Date-14.05.2026.) {FILLER}",
+    FILLER * 10 + " Translation Certificate No 7 Date: 01/10/2026",
+    "Date ol Birth 12/03/2025 " + FILLER,
+])
+def test_b12_another_papers_date_is_never_the_issue_date(text):
+    assert dv.issue_date_labelled(text)[1] == "fallback"
+
+
+def test_b12_a_cited_affidavits_old_date_is_a_flag_never_a_fail():
+    for text in (f"according to the affidavit (No-01, Date: 07/05/2026, Notary Public) {FILLER}",
+                 f"affidavit issued by Adv. Sample Advocate (Ref- 06, Date-14.05.2026.) {FILLER}"):
+        v, msg = dv.check_family_cert(text, student(), [])[0]
+        assert v == C.FLAG and "may be the notary date" in msg
+
+
+def test_b12_a_future_date_or_a_certificate_number_is_never_the_issue_date():
+    assert dv.issue_date_labelled(f"Ref: 2026 Date: 2302 2027 {FILLER}") == (None, "")
+    assert dv.issue_date_labelled(f"Certificate No: UC-2201-2026-0292 Date: 13 2026 {FILLER}") == (None, "")
+
+
+@pytest.mark.parametrize("text, verdict", [
+    (f"business for 2026-2027 financial year {FILLER} for the financial year 2025-2026.", C.PASS),
+    ("Fiscal Year 2026 2027 (b) Business", C.PASS),                       # OCR dropped the dash
+    ("Fiscal Year 2024 2025 (b) Business", C.FAIL),
+    ("Validity: 1ST JULY 2025 AD TO 30TH JUNE 2026 AD", C.FAIL),
+    ("Validity of this trade license 1st July 2026 t0 30th June 2027", C.PASS),
+])
+def test_b12_fiscal_year_ocr_and_layout_forms(text, verdict):
+    (v, _), = dv.fiscal_year_check(text)
+    assert v == verdict
+
+
+def test_b12_bare_years_count_only_beside_a_label():
+    assert dv.fiscal_year_check(f"{FILLER} 2026 2027") == [(C.FLAG, "no fiscal year found on the trade licence")]
+    assert [fy for _, _, fy in dv.fiscal_years("1st July 2025 AD to 30th June 2026")] == ["2025-2026"]
+
+
 # --------------------------------------------------------------------------- B14c errors
 
 def test_b14c_a_reader_raising_check_error_gives_an_error_row(tmp_path, no_images, monkeypatch):

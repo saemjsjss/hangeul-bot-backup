@@ -820,36 +820,74 @@ def nid_number_agreement(per_page: List[set], every: List[str]) -> List[Tuple[st
     return out
 
 
+_DATE_WORD = r"(?:dated?|datc|dale|datex)"          # OCR: "Datc", "Dale", "Issue Datex"
+_NOT_BIRTH = r"(?!\s*o[fl]\s*birth)"                # "Date of Birth", OCR "Date ol Birth"
+# whole words only ("candidate", "update", "therefore" are no label), never "date of birth"
+_ISSUE_LABEL = re.compile(
+    r"\b(?:" + _DATE_WORD + _NOT_BIRTH + r"|ref(?:erence)?|memo|serial)\b\.?\s*(?:no\b\.?)?\s*[:.\-]?"
+    r"[^\n]{0,90}", re.I)
+# The certificate's own number-and-date line, searched in the WHOLE text because a notary or
+# translation page often comes first. Only the 25 characters after the date word are read, never
+# the certificate number (a number like "UC-2201-2026-.." would otherwise give label-digits 22-01-2026).
+_STRONG_ISSUE_LABEL = re.compile(
+    r"(?:\bcerti\w{2,8}\s*no\b[^\n]{0,40}?\b" + _DATE_WORD + _NOT_BIRTH +
+    r"|\bdate\s*of\s*issue|\bissue\s*" + _DATE_WORD + r")\b(?P<rest>\s*[:.;\-]?[^\n]{0,25})", re.I)
+# Dates that belong to another paper: an affidavit the certificate cites, the notary's register,
+# the advocate's attestation, the translator.
+_NOT_ISSUE = re.compile(r"affidavit|notary\s*public\s*(?:no|:)|notari[sz]ed|\badv(?:ocate)?\b|attest|translat",
+                        re.I)
+_NOT_ISSUE_BEFORE = 90      # how far back on the same line that context is looked for
+
+
+def _issue_recent(d: dt.date) -> bool:
+    return 0 <= (TODAY - d).days <= 3 * 365          # never a future date, never a birth date
+
+
+def _issue_date_in(window: str) -> Tuple[Optional[dt.date], str]:
+    cut = _NOT_ISSUE.search(window)
+    if cut:
+        window = window[:cut.start()]               # the line runs on into the notary's part
+    got = [d for d in find_dates(window) if _issue_recent(d)]
+    if got:
+        return max(got), "label"
+    digits = re.sub(r"\D", "", window)
+    for i in range(len(digits) - 7):                # find DDMMYYYY inside the digit run
+        chunk = digits[i:i + 8]
+        try:
+            d = dt.date(int(chunk[4:]), int(chunk[2:4]), int(chunk[:2]))
+        except ValueError:
+            continue
+        if _issue_recent(d):                        # was abs(): 2027-02-23 passed as "-5 months ago"
+            return d, "label-digits"
+    return None, ""
+
+
 def issue_date_labelled(text: str) -> Tuple[Optional[dt.date], str]:
     """The date a certificate was issued, and where it was read:
 
-      "label"         a date on the 'Date'/'Ref'/'Memo'/'Serial' line near the top
+      "label"         a date on a 'Date'/'Ref'/'Memo'/'Serial' line near the top, or on the
+                      certificate's own "Certificate No .. Date" / "Date of Issue" / "Issue Date"
+                      line anywhere in the text (a notary or translation page often comes first)
       "label-digits"  DDMMYYYY found in that line's digits (OCR often inserts stray dots:
                       "302.083.2026")
       "fallback"      no such line: the latest date of the last 3 years anywhere on the
                       page — which may be the notary's date, not the issue date
       ""              no date at all
 
-    Never a family member's date of birth: only dates of the last 3 years count."""
+    Every label in the first 1200 characters is tried, not only the first. A date written after
+    "affidavit", "Notary Public No", "Adv.", "attested" or "translation" on the same line is never
+    the issue date. Never a family member's date of birth and never a future date: only dates of
+    the last 3 years count."""
     text = text or ""
-    head = text[:1200]
-    # whole words only ("candidate", "update", "therefore" are no label), never "date of birth"
-    m = re.search(r"\b(?:dated?(?!\s*of\s*birth)|ref(?:erence)?|memo|serial)\b\.?\s*(?:no\b\.?)?\s*[:.\-]?"
-                  r"[^\n]{0,90}", head, re.I)
-    if m:
-        got = [d for d in find_dates(m.group(0)) if 0 <= (TODAY - d).days <= 3 * 365]
-        if got:                       # a date on the header line, but never a birth date
-            return max(got), "label"
-        digits = re.sub(r"\D", "", m.group(0))
-        for i in range(len(digits) - 7):          # find DDMMYYYY inside the digit run
-            chunk = digits[i:i + 8]
-            try:
-                d = dt.date(int(chunk[4:]), int(chunk[2:4]), int(chunk[:2]))
-            except ValueError:
-                continue
-            if abs((TODAY - d).days) <= 3 * 365:
-                return d, "label-digits"
-    recent = [d for d in find_dates(text) if 0 <= (TODAY - d).days <= 3 * 365]
+    for rx, where in ((_ISSUE_LABEL, text[:1200]), (_STRONG_ISSUE_LABEL, text)):
+        for m in rx.finditer(where):
+            line_start = where.rfind("\n", 0, m.start()) + 1
+            if _NOT_ISSUE.search(where[max(line_start, m.start() - _NOT_ISSUE_BEFORE):m.start()]):
+                continue                            # the affidavit's / notary's / translator's date
+            d, src = _issue_date_in(m.group("rest") if rx is _STRONG_ISSUE_LABEL else m.group(0))
+            if d:
+                return d, src
+    recent = [d for d in find_dates(text) if _issue_recent(d)]
     return (max(recent), "fallback") if recent else (None, "")
 
 
@@ -1400,9 +1438,13 @@ def current_fiscal_year() -> str:
 
 
 _FY_RE = re.compile(r"(?<!\d)(20\d{2})\s*[-–/]\s*(20\d{2}|\d{2})(?![\d]|[-–/.]\d)"
-                    r"|(?<!\d)(20\d{2})\s*(?:to|till|until)\s*(?:\d{1,2}\w{0,2}\s+\w+,?\s+)?(20\d{2})(?!\d)",
-                    re.I)
+                    r"|(?<!\d)(20\d{2})\s*(?:a\.?\s?d\b\.?\s*)?(?:t[o0]|till|until)\s*"
+                    r"(?:\d{1,2}\w{0,2}\s+\w+,?\s+)?(20\d{2})(?!\d)",
+                    re.I)                       # "1st July 2025 AD to 30th June 2026", OCR "t0"
 _FY_NEAR = 40
+# "Fiscal Year 2026 2027": OCR dropped the dash. Two bare years count only beside a label.
+_FY_BARE = re.compile(r"(?<![\d/.-])(20\d{2})\s+(20\d{2})(?![\d]|[-–/.]\d)")
+_FY_BEFORE = 15     # "for 2026-2027 financial year": the year just before its label
 
 
 def fiscal_years(text: str) -> List[Tuple[int, int, str]]:
@@ -1423,11 +1465,20 @@ def fiscal_year_check(text: str) -> List[Tuple[str, str]]:
     """A trade licence must be renewed for the current fiscal year (July-June). The year
     beside a Fiscal Year / Renewal / Validity label decides; with none labelled, the
     current year written anywhere is enough; any other year alone is only a FLAG (it may
-    be a footer, a previous renewal or the form's print year)."""
+    be a footer, a previous renewal or the form's print year). A year counts as labelled within
+    _FY_NEAR characters after its label or _FY_BEFORE characters before it ("for 2026-2027
+    financial year"); two bare years ("Fiscal Year 2026 2027") count only when labelled."""
     want = current_fiscal_year()
     years = fiscal_years(text)
-    labels = [m.end() for m in _label_re(R.FISCAL_LABELS).finditer(text or "")]
-    labelled = [fy for start, _, fy in years if any(0 <= start - end <= _FY_NEAR for end in labels)]
+    labels = [(m.start(), m.end()) for m in _label_re(R.FISCAL_LABELS).finditer(text or "")]
+
+    def beside(start: int, end: int) -> bool:
+        return any(0 <= start - le <= _FY_NEAR or 0 <= ls - end <= _FY_BEFORE for ls, le in labels)
+
+    years = sorted(years + [(m.start(), m.end(), f"{m.group(1)}-{m.group(2)}")
+                            for m in _FY_BARE.finditer(text or "")
+                            if int(m.group(2)) == int(m.group(1)) + 1 and beside(m.start(), m.end())])
+    labelled = [fy for start, end, fy in years if beside(start, end)]
     if labelled:
         return [(PASS, f"licence fiscal year {want} is the current {want}") if want in labelled
                 else (FAIL, f"licence fiscal year {labelled[0]} is not the current fiscal year ({want})")]
