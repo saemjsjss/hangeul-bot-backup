@@ -934,7 +934,8 @@ def test_review_lines_carry_two_flags_and_incomplete_lines_the_missing_documents
                   "father.pdf": "FLAG: a third document is not listed"})
     world.add(2, {"bank.pdf": "FAIL: the balance is below the minimum"})
     lines = av.summary_lines(av.run())
-    assert lines[1] == (f"   • SAMPLE STUDENT 1 (KLP) — REVIEW (08 Bank Solvency & Statement: {long_flag[:89]}…; "
+    assert lines[1] == ("   • SAMPLE STUDENT 1 (KLP) — REVIEW (08 Bank Solvency & Statement: the statement covers "
+                        "only 3 months of transactions the statement covers only 3 months of…; "
                         "06 Family Relationship Certificate: issued 4 months ago)")
     assert lines[2] == ("   • SAMPLE STUDENT 2 (KLP) — INCOMPLETE (missing: 01 Passport, "
                         "06 Family Relationship Certificate; plus 1 FAIL)")
@@ -1092,7 +1093,7 @@ def test_a_record_from_before_this_release_that_hits_a_read_error_is_not_a_first
     world.write(a, "passport.pdf", "PASS: valid")
     r = av.run()
     assert [(e["previous"], e["verdict"], e["first"]) for e in r["checked"]] == [("FAIL", "PASS", False)]
-    assert av.summary_lines(r)[1] == "   • SAMPLE STUDENT 1 (KLP) — FAIL -> PASS"
+    assert av.summary_lines(r)[1] == "   • SAMPLE STUDENT 1 (KLP) — FAIL -> PASS (cleared: 01 Passport: the passport expired)"
     rec = world.store()["documents"][a]
     assert rec["previous_verdict"] == "FAIL"
     assert rec["first_checked"] == "2026-10-21T10:00:00" and rec["checked"] == "2026-10-21T12:00:00"
@@ -1379,17 +1380,102 @@ def test_change_reasons():
     nid_missing = _rec("INCOMPLETE", ("05 Father NID", "MISSING", "required by the guideline but not uploaded"))
     death = _rec("PASS", ("05 Father Death Certificate", "PASS",
                           "PASS: present — accepted in place of the father's NID (05 Father NID not needed)"))
-    assert av.change_reason(nid_missing, death) == "05 Father NID: death certificate accepted"
+    assert av.change_reason(nid_missing, death) == "cleared: 05 Father NID: death certificate accepted"
     failed = _rec("FAIL", ("01 Passport", "FAIL", "PASS: readable | FAIL: expires in 5 months"))
     flagged = _rec("REVIEW", ("04 Birth Certificate", "FLAG", "FLAG: the DOB could not be read"))
-    assert av.change_reason(failed, flagged) == "cleared: 01 Passport: expires in 5 months"
+    assert av.change_reason(failed, flagged) == ("cleared: 01 Passport: expires in 5 months; "
+                                                 "now: 04 Birth Certificate: the DOB could not be read")
     assert av.change_reason(flagged, failed) == "01 Passport: expires in 5 months"
     assert av.change_reason(_rec("PASS"), flagged) == "04 Birth Certificate: the DOB could not be read"
     assert av.change_reason(flagged, _rec("PASS")) == "cleared: 04 Birth Certificate: the DOB could not be read"
     error = _rec("ERROR", ("07 Academic Certificate & Transcript", "ERROR",
                            "ERROR: could not check this file (pyzbar failed) — it is retried on the next pass"))
     assert av.change_reason(flagged, error) == "07 Academic Certificate & Transcript: pyzbar failed"
+    assert av.change_reason(error, _rec("PASS")) == "cleared: 07 Academic Certificate & Transcript: read error"
     assert av.change_reason(None, failed) == "01 Passport: expires in 5 months"
+
+
+_DEATH_ROW = ("05 Father Death Certificate", "PASS",
+              "PASS: present — accepted in place of the father's NID (05 Father NID not needed)")
+
+
+def test_a_change_to_fail_leads_with_the_fail_even_from_incomplete():
+    """INCOMPLETE -> FAIL is a change for the worse to the reader: the FAIL comes first, then what
+    stopped the student being INCOMPLETE — not only "death certificate accepted"."""
+    old = _rec("INCOMPLETE", ("05 Father NID", "MISSING", "MISSING: required by the guideline but not uploaded"),
+               ("08 Bank Solvency & Statement", "FAIL", "FAIL: the balance is below the minimum"))
+    new = _rec("FAIL", _DEATH_ROW, ("08 Bank Solvency & Statement", "FAIL", "FAIL: the balance is below the minimum"))
+    assert av.change_reason(old, new) == ("08 Bank Solvency & Statement: the balance is below the minimum; "
+                                          "cleared: 05 Father NID: death certificate accepted")
+    uploaded = _rec("FAIL", ("05 Father NID", "PASS", "PASS: readable"),
+                    ("08 Bank Solvency & Statement", "FAIL", "FAIL: the balance is below the minimum"))
+    assert av.change_reason(old, uploaded) == ("08 Bank Solvency & Statement: the balance is below the minimum; "
+                                               "cleared: 05 Father NID: uploaded")
+
+
+def test_incomplete_to_review_names_the_flag_that_remains():
+    old = _rec("INCOMPLETE", ("05 Father NID", "MISSING", "MISSING: required by the guideline but not uploaded"))
+    new = _rec("REVIEW", _DEATH_ROW, ("02 Photo", "FLAG", "FLAG: the ratio differs from 3.5x4.5"))
+    assert av.change_reason(old, new) == ("cleared: 05 Father NID: death certificate accepted; "
+                                          "now: 02 Photo: the ratio differs from 3.5x4.5")
+
+
+def test_a_fail_that_became_a_flag_on_the_same_document_names_it_once():
+    old = _rec("FAIL", ("04 Birth Certificate", "FAIL", "FAIL: no date on the certificate matches the passport"))
+    new = _rec("REVIEW", ("04 Birth Certificate", "FLAG", "FLAG: the date of birth could not be read"))
+    assert av.change_reason(old, new) == ("cleared: 04 Birth Certificate: no date on the certificate matches the "
+                                          "passport; now: the date of birth could not be read")
+
+
+def test_a_finding_still_there_is_never_called_cleared():
+    flag = ("05 Father NID", "FLAG", "FLAG: the name could not be found on the passport")
+    old = _rec("REVIEW", flag)
+    new = _rec("FAIL", flag, ("06 Family Relationship Certificate", "FAIL", "FAIL: older than 3 months"))
+    assert av.change_reason(old, new) == "06 Family Relationship Certificate: older than 3 months"
+    gone = _rec("FAIL", ("06 Family Relationship Certificate", "FAIL", "FAIL: older than 3 months"))
+    assert av.change_reason(old, gone) == "06 Family Relationship Certificate: older than 3 months"  # worse: no "cleared"
+    still_flagged = _rec("REVIEW", ("04 Birth Certificate", "FLAG", "FLAG: the DOB could not be read"))
+    failed = _rec("FAIL", ("04 Birth Certificate", "FLAG", "FLAG: the DOB could not be read"),
+                  ("01 Passport", "FAIL", "FAIL: expires in 5 months"))
+    assert av.change_reason(failed, still_flagged) == ("cleared: 01 Passport: expires in 5 months; "
+                                                       "now: 04 Birth Certificate: the DOB could not be read")
+
+
+def test_long_reasons_are_cut_between_words():
+    assert av._trim("short", 10) == "short"
+    assert av._trim("one two three four five six seven", 20) == "one two three four…"
+    assert len(av._trim("word " * 40, 90)) <= 90 and av._trim("word " * 40, 90).endswith("word…")
+    assert av._trim("x" * 50, 10) == "x" * 9 + "…"                       # no space: cut where it must
+    old = _rec("FAIL", ("04 Birth Certificate", "FAIL", "FAIL: " + "a long finding about dates " * 8))
+    reason = av.change_reason(old, _rec("PASS"))
+    assert reason.startswith("cleared: 04 Birth Certificate: a long finding") and reason.endswith("…")
+    assert len(reason) <= len("cleared: ") + av._CLEARED_CHARS
+
+
+def test_a_roll_out_of_long_reasons_goes_to_telegram_in_whole_lines():
+    from src.bot.replies import CHUNK_CHARS, split_text, telegram_len
+    reason = "08 Bank Solvency & Statement: " + "the balance is below the minimum " * 6
+    ro = {"from": ["unversioned"], "to": "2026-10-21.1", "done": [str(i) for i in range(182)],
+          "before": {"FAIL": 182}, "now": {"REVIEW": 182},
+          "changes": [{"passport": f"P{i}", "student": f"SAMPLE STUDENT {i}", "program": "KLP", "old": "FAIL",
+                       "new": "REVIEW", "reason": f"cleared: {reason}; now: {reason}"} for i in range(182)]}
+    lines = av.rollout_lines(ro)
+    pieces = split_text(av.ROLLOUT_TITLE + "\n\n" + "\n".join(lines))
+    assert len(pieces) > 1 and all(telegram_len(p) <= CHUNK_CHARS for p in pieces)
+    assert {l for p in pieces for l in p.split("\n")} >= set(lines)         # no line is cut
+
+
+def test_a_per_pass_change_says_why_the_new_verdict_and_what_cleared(world):
+    world.required = ["passport", "family"]
+    a = world.add(1, {"passport.pdf": "PASS: valid", "bank.pdf": "FAIL: the balance is below the minimum"})
+    assert av.run()["checked"][0]["verdict"] == "INCOMPLETE"
+    world.set_now(dt.datetime(2026, 10, 21, 11, 0))
+    world.write(a, "family.pdf", "PASS: issued last month")
+    r = av.run()
+    assert [(e["previous"], e["verdict"]) for e in r["checked"]] == [("INCOMPLETE", "FAIL")]
+    assert av.summary_lines(r)[1] == ("   • SAMPLE STUDENT 1 (KLP) — INCOMPLETE -> FAIL (08 Bank Solvency & "
+                                      "Statement: the balance is below the minimum; cleared: 06 Family "
+                                      "Relationship Certificate: uploaded)")
 
 
 # --------------------------------------------------------------------------- the command line (B17)

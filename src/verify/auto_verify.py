@@ -109,8 +109,14 @@ def _iso(when: Optional[dt.datetime] = None) -> str:
 
 
 def _trim(text: str, n: int) -> str:
+    """`text` in at most `n` characters: cut at the last space when there is one in the last 40%
+    (so a word is not cut in half), and "…" added."""
     text = str(text or "").strip()
-    return text if len(text) <= n else text[:n - 1] + "…"
+    if len(text) <= n:
+        return text
+    cut = text.rfind(" ", 0, n)
+    head = text[:cut] if cut >= n * 0.6 else text[:n - 1]
+    return head.rstrip(" ,;:—-(") + "…"
 
 
 def use_data_dir(path) -> Path:
@@ -721,7 +727,8 @@ def _evaluate(pas: str, folder: Path, student: Dict[str, str], store: Dict[str, 
         change = {"passport": pas, "student": name, "program": program, "old": previous, "new": verdict,
                   "reason": change_reason(prev, rec), "why": ""}
     entry = {**who, "verdict": verdict, "previous": previous, "first": first, "differs": differs,
-             "corrected": corrected, "reason": verdict_reason(rec)}
+             "corrected": corrected, "reason": verdict_reason(rec),
+             "change_reason": change["reason"] if change else ""}
     republish = prev is None or prev.get("rows") != rows or previous != verdict or fields_changed
     return {"kind": "done", "entry": entry, "change": change, "republish": republish,
             "final_error": retry is not None, "error": error, "field_note": f"{match} matched, {differs} differ"}
@@ -1353,7 +1360,6 @@ def _work(result: Dict[str, Any], store: Dict[str, Any], folders, portal, *, bud
 _FINDING = re.compile(r"^(PASS|NOTE|FLAG|FAIL|ERROR|MISSING):\s*(.*)$", re.S)
 _B4_FAIL = "the birth certificate gives date of birth"      # doc_verifier.birth_date_check's FAIL
 _NEW_ORDER = {"PASS": 0, "REVIEW": 1, "INCOMPLETE": 2, "FAIL": 3, "ERROR": 4}     # roll-out list order
-_SEVERITY = {"PASS": 0, "REVIEW": 1, "ERROR": 2, "FAIL": 3, "INCOMPLETE": 4}     # student_verdict's order
 _WHY = {"daily": " [re-checked: today's date]", "portal": " [portal values changed]",
         "rules": " [rules updated]"}
 
@@ -1466,20 +1472,68 @@ def _accepted_instead(old_rec: Dict[str, Any], new_rec: Dict[str, Any]) -> str:
     return ""
 
 
+# How bad a verdict reads in a message. Not student_verdict's order, where a missing
+# upload outranks everything: for the reader a failed rule is the worst news, so INCOMPLETE -> FAIL
+# is a change for the worse and leads with the FAIL.
+_MSG_ORDER = {"PASS": 0, "REVIEW": 1, "ERROR": 2, "INCOMPLETE": 3, "FAIL": 4}
+_CLEARED_CHARS = 100
+
+
+def _top(rec: Optional[Dict[str, Any]]) -> Optional[Tuple[str, str, str]]:
+    """(document, kind, text) of the finding that holds a FAIL, REVIEW or ERROR verdict, else None."""
+    verdict, rows = (rec or {}).get("verdict"), (rec or {}).get("rows") or []
+    want = {"FAIL": "FAIL", "REVIEW": "FLAG", "ERROR": "ERROR"}.get(str(verdict))
+    for r in rows if want else []:
+        if r.get("verdict") == want or (want == "ERROR" and C.row_has_error(r)):
+            text = next((t for v, t in _findings(r.get("detail")) if v == want), "") or str(r.get("detail", ""))
+            return str(r.get("doc", "")), want, text
+    return None
+
+
+def _cleared(old_rec: Dict[str, Any], new_rec: Dict[str, Any]) -> Tuple[str, str]:
+    """(document, what) that held the old verdict and is gone from the new rows, else ("", ""): a
+    required document now covered by its alternative ("05 Father NID", "death certificate
+    accepted"), the documents no longer missing ("uploaded"), or the old top finding when no row
+    of that document still carries it (a FLAG still there under a new FAIL is not "cleared")."""
+    instead = _accepted_instead(old_rec, new_rec)
+    if instead:
+        doc, _, what = instead.partition(": ")
+        return doc, what
+    new_rows = new_rec.get("rows") or []
+    if old_rec.get("verdict") == "INCOMPLETE":
+        still = set(_missing(new_rows))
+        gone = [d for d in _missing(old_rec.get("rows") or []) if d not in still]
+        return (", ".join(gone), "uploaded") if gone else ("", "")
+    top = _top(old_rec)
+    if not top:
+        return "", ""
+    doc, kind, text = top
+    if any(str(r.get("doc", "")) == doc and t == text
+           for r in new_rows for v, t in _findings(r.get("detail")) if v in ("FAIL", "FLAG", "ERROR")):
+        return "", ""
+    return doc, ("read error" if kind == "ERROR" else text)
+
+
 def change_reason(old_rec: Optional[Dict[str, Any]], new_rec: Dict[str, Any]) -> str:
-    """Why a verdict changed: when it got worse, what now holds it (the first FAIL, the missing
-    documents, the top FLAG, the read error); when it got better, "cleared: " and what held it
-    before (a deceased parent shows as "05 Father NID: death certificate accepted")."""
+    """Why a verdict changed.
+    Worse (by _MSG_ORDER, so INCOMPLETE -> FAIL too): what holds the new verdict (the first FAIL,
+    the missing documents, the top FLAG, the read error); coming from INCOMPLETE, then
+    "; cleared: " and the document no longer missing ("05 Father NID: death certificate accepted").
+    Better: "cleared: " and what held the old verdict; unless the new verdict is PASS, then
+    "; now: " and what holds the new one (without the document's name when it is the same one)."""
+    now = _blocking(new_rec)
     if not old_rec:
-        return _blocking(new_rec)
-    old, new = _SEVERITY.get(str(old_rec.get("verdict")), 0), _SEVERITY.get(str(new_rec.get("verdict")), 0)
-    if new < old:
-        instead = _accepted_instead(old_rec, new_rec)
-        if instead:
-            return instead
-        before = _blocking(old_rec)
-        return f"cleared: {before}" if before else "cleared"
-    return _blocking(new_rec)
+        return now
+    doc, what = _cleared(old_rec, new_rec)
+    cleared = _trim(f"{doc}: {what}".strip(": "), _CLEARED_CHARS) if (doc or what) else ""
+    if _MSG_ORDER.get(str(new_rec.get("verdict")), 0) >= _MSG_ORDER.get(str(old_rec.get("verdict")), 0):
+        if cleared and old_rec.get("verdict") == "INCOMPLETE":
+            return f"{now}; cleared: {cleared}" if now else f"cleared: {cleared}"
+        return now
+    head = f"cleared: {cleared}" if cleared else "cleared"
+    if doc and now.startswith(f"{doc}: "):
+        now = now[len(doc) + 2:]
+    return f"{head}; now: {now}" if now else head
 
 
 def _first_check(d: Dict[str, Any]) -> bool:
@@ -1529,16 +1583,22 @@ def summary_lines(result: Dict[str, Any]) -> List[str]:
         out.append(f"🔍 Documents checked: {len(told) + len(changes)}"
                    + (f" ({len(same)} re-checked, verdict unchanged)" if same else ""))
     for d in told:
-        bits = (d["verdict"] if _first_check(d) else f"{d.get('previous')} -> {d['verdict']}") \
-            + reason(d.get("passport"), d["verdict"], d.get("reason"))
+        if _first_check(d):
+            bits = d["verdict"] + reason(d.get("passport"), d["verdict"], d.get("reason"))
+        else:                                   # a change: what holds the new verdict / what cleared
+            bits = f"{d.get('previous')} -> {d['verdict']}" + (
+                f" ({d['change_reason']})" if d.get("change_reason") and d["verdict"] != "ERROR"
+                else reason(d.get("passport"), d["verdict"], d.get("reason")))
         if d.get("differs"):
             bits += f", {d['differs']} field(s) differ from the portal"
         if d.get("corrected"):
             bits += f", {d['corrected']} portal field(s) corrected since last check"
         out.append(f"   • {d['student']} ({d['program']}) — {bits}")
     for c in changes:
-        out.append(f"   • {c['student']} ({c['program']}) — {c['old']} -> {c['new']}"
-                   + reason(c.get("passport"), c["new"], c.get("reason")) + _WHY.get(c.get("why", ""), ""))
+        why = (f" ({c['reason']})" if c.get("reason") and c["new"] != "ERROR"     # ERROR: + retry state
+               else reason(c.get("passport"), c["new"], c.get("reason")))
+        out.append(f"   • {c['student']} ({c['program']}) — {c['old']} -> {c['new']}{why}"
+                   + _WHY.get(c.get("why", ""), ""))
     if errors:
         listed = "; ".join(f"{e.get('student')} ({e.get('doc')}: {e.get('msg')})" for e in errors[:5])
         more = f"; … and {len(errors) - 5} more" if len(errors) > 5 else ""
