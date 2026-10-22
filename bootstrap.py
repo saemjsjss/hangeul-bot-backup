@@ -92,7 +92,9 @@ def phase_3() -> bool:
 
 def phase_4() -> bool:
     return run("PHASE 5 of 6 — verify every document",
-               ["-m", "src.verify.auto_verify", "--recheck", "--budget", "0"],
+               # a normal pass with no limit: every student in the queue is read (--recheck
+               # would only re-evaluate stored results from saved text, and there are none yet)
+               ["-m", "src.verify.auto_verify", "--budget", "0"],
                "Reads every document (PDF text layer first, OCR for scans), checks it\n"
                "against the programme guidelines, then compares the portal's fields\n"
                "against what the documents actually say. Writes DOCUMENT CHECK.xlsx\n"

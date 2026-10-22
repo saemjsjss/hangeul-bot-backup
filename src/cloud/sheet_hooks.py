@@ -4,6 +4,8 @@ The four subprocess jobs call one function here as their very last step, after D
 the .xlsx files and Telegram:
 
   src.sheets.auto_sync (every 15 min)            after_sync             job portal_sync
+  src.verify.auto_verify --publish (a CLI run)   after_verify_refresh   job portal_sync
+  src.verify.auto_verify --announce              after_verify_notice    (without --publish)
   src.sheets.missing_report (09:05)              after_missing_daily    job missing_report
                                                  after_missing_failed   (the report could not be built)
   src.sheets.missing_report --program (/missing) after_missing_program  job missing_report
@@ -46,6 +48,14 @@ JOB_ISSUE = "issue_refresh"
 # Passports of the document check whose records Supabase never accepted (a publish that failed,
 # or the checks made before publishing began), sent a few a run beside the ones just checked.
 CATCH_UP_PASSPORTS = 6
+
+# The failed read of a run whose results.json could not be read before the document check: the
+# check stopped (auto_verify's store_error) and left the file as it was; or it went on from
+# results.json.bak (store_note); or (store_ok False only: the check before the store had a
+# backup) from an empty store. The store-wide kinds wait for a run that read the file itself.
+STORE_STOPPED = "results.json: unreadable before the document check (the check stopped; nothing was overwritten)"
+STORE_RESTORED = "results.json: unreadable before the document check (the check went on from its backup)"
+STORE_EMPTY = "results.json: unreadable before the document check (it started from an empty store)"
 
 Batches = List[Dict[str, Any]]
 Built = Tuple[Batches, List[str]]
@@ -202,7 +212,7 @@ def sync_batches(cloud: Mapping[str, Any]) -> Built:
 
     if cloud.get("verify") is not None:
         ids = student_ids(docs or [], rows or [])
-        b, f = verify_batches(cloud["verify"], bool(cloud.get("store_ok", True)), ids=ids)
+        b, f = verify_batches(cloud["verify"], bool(cloud.get("store_ok", True)), ids=ids, export=rows)
         out += b
         failed += f
     elif cloud.get("verify_error") is not None:
@@ -263,15 +273,65 @@ def _page_texts(passport: str, name: str, folders: Mapping[str, Any], failed: Li
     return records.doc_page_texts(passport, cache, name, _folder_files(folder), read_at, ids)
 
 
+def _passports(items: Any) -> List[str]:
+    """The passports of a result's list (its "checked" entries, or "republish"'s passports), in
+    order, each once."""
+    out = []
+    for c in items or []:
+        p = c.get("passport") if isinstance(c, Mapping) else c
+        if p:
+            out.append(str(p))
+    return list(dict.fromkeys(out))
+
+
+def _folder_of(entry: Any) -> Optional[Path]:
+    """The student folder a document-check record was checked from (results.json's rec["folder"],
+    a path; None when the record does not say)."""
+    folder = entry.get("folder") if isinstance(entry, Mapping) else None
+    if isinstance(folder, (list, tuple)):
+        folder = folder[0] if folder else None
+    return Path(folder) if isinstance(folder, (str, Path)) and str(folder).strip() else None
+
+
+def check_folders(passports: Sequence[str], docs: Mapping[str, Any],
+                  export: Optional[Sequence[Mapping[str, Any]]] = None) -> Dict[str, Tuple[Path, str]]:
+    """{passport: (folder, folder name)} of the passports whose OCR text is sent: the folder the
+    check itself used (rec["folder"]), else the one doc_verifier.student_folders picks with this
+    run's portal rows (`export`: two folders for one passport, the portal's program wins); a
+    passport neither gives is left out (its text then is the newest version cached), never
+    guessed without its portal row."""
+    out: Dict[str, Tuple[Path, str]] = {}
+    for p in passports:
+        folder = _folder_of(docs.get(p))
+        if folder is not None:
+            out[p] = (folder, folder.name)
+    rest = [p for p in passports if p not in out]
+    if rest and export:
+        try:
+            from src.verify import doc_verifier as dv
+            found = dv.student_folders(dv.portal_students(rows=export))
+            out.update({p: found[p] for p in rest if p in found})
+        except Exception:
+            pass
+    return out
+
+
 def verify_batches(result: Mapping[str, Any], store_ok: bool = True, folders: Optional[Mapping[str, Any]] = None,
-                   ids: Optional[Mapping[str, Tuple[str, str]]] = None) -> Built:
+                   ids: Optional[Mapping[str, Tuple[str, str]]] = None,
+                   export: Optional[Sequence[Mapping[str, Any]]] = None) -> Built:
     """auto_verify.run's result -> the document check's batches: doc_verdict, field_check and
     doc_page_text of the passports it just checked (and a few that Supabase never accepted), each
-    passport its own complete scope; then, from the whole store (results.json, the whole truth of
-    the check), doc_check (complete), field_correction (append-only) and the DOCUMENT CHECK and
-    FIELD CHECK reports. `store_ok` False (results.json was unreadable, so auto_verify started from
-    an empty store): the store-wide kinds are not sent. `ids` ({passport: (uid, HNG id)}, by
-    default the student index as kept) gives each record its student."""
+    passport its own complete scope, and doc_verdict and field_check of the passports a
+    re-evaluation changed (result["republish"]: their rows changed, their files did not, so no
+    doc_page_text); then, from the whole store (results.json, the whole truth of the check),
+    doc_check (complete), field_correction (append-only) and the DOCUMENT CHECK and FIELD CHECK
+    reports. `store_ok` False (results.json was unreadable before the check), result["store_note"]
+    (the check went on from results.json.bak) or result["store_error"] (it could not be read at
+    all, and the check stopped): the store-wide kinds are not sent this run, and why is a failed
+    read. result["store"] may be None.
+    `ids` ({passport: (uid, HNG id)}, by default the student index as kept) gives each record its
+    student; `folders` ({passport: (folder, name)}, by default check_folders with `export`, the
+    run's portal rows) the version of each file whose OCR text is sent."""
     from src.cloud import records
     from src.sheets.passport_issue import passport_key
     if ids is None:
@@ -283,9 +343,14 @@ def verify_batches(result: Mapping[str, Any], store_ok: bool = True, folders: Op
     fields = {p: e for p, e in (store.get("fields") or {}).items() if isinstance(e, Mapping)}
     out: Batches = []
     failed: List[str] = []
+    stopped = bool(result.get("store_error"))
+    restored = bool(result.get("store_note"))     # read from results.json.bak (unreadable or missing)
+    store_ok = bool(store_ok) and not stopped and not restored
 
-    passports = list(dict.fromkeys(str(c.get("passport")) for c in result.get("checked") or []
-                                   if isinstance(c, Mapping) and c.get("passport")))
+    checked = _passports(result.get("checked"))
+    republish = [p for p in _passports(result.get("republish")) if p not in checked]
+    passports = checked + republish
+    texts_for = list(checked)                     # the passports whose OCR text is sent
     if store_ok:
         try:
             from src.cloud import publish
@@ -297,13 +362,11 @@ def verify_batches(result: Mapping[str, Any], store_ok: bool = True, folders: Op
                      and (passport_key(p) or p) not in known
                      and ((docs.get(p) or {}).get("rows") or (fields.get(p) or {}).get("rows"))]
             passports += never[:CATCH_UP_PASSPORTS]
+            texts_for += never[:CATCH_UP_PASSPORTS]
 
-    if passports and folders is None:
-        try:
-            from src.verify import doc_verifier as dv
-            folders = dv.student_folders()
-        except Exception:
-            folders = {}
+    with_text = set(texts_for)
+    if texts_for and folders is None:
+        folders = check_folders(texts_for, docs, export)
     verdicts, checks, texts = [], [], []
     for p in passports:
         who = ids.get(passport_key(p) or p)
@@ -311,15 +374,16 @@ def verify_batches(result: Mapping[str, Any], store_ok: bool = True, folders: Op
             verdicts += records.doc_verdicts(p, docs[p], who)
         if p in fields:
             checks += records.field_checks(p, fields[p], who)
-        name = (docs.get(p) or fields.get(p) or {}).get("student") or ""
-        texts += _page_texts(p, name, folders or {}, failed, who)
+        if p in with_text:
+            name = (docs.get(p) or fields.get(p) or {}).get("student") or ""
+            texts += _page_texts(p, name, folders or {}, failed, who)
     # Each passport's details before the store-wide kinds: a run cut short never leaves doc_check
     # newer than the rows it counts.
     out += [records.batches("doc_verdict", verdicts, True), records.batches("field_check", checks, True),
             records.batches("doc_page_text", texts, True)]
 
     if not store_ok:
-        failed.append("results.json: unreadable before the document check (it started from an empty store)")
+        failed.append(STORE_STOPPED if stopped else STORE_RESTORED if restored else STORE_EMPTY)
         return out, failed
     if docs:
         out.append(records.batch("doc_check", "all", records.doc_checks(docs, fields, ids), True, read_at=read_at))
@@ -441,6 +505,31 @@ def issue_batches(by_passport: Mapping[str, Any], pages: Optional[Mapping[str, T
 def after_sync(cloud: Mapping[str, Any]) -> Optional[Path]:
     """auto_sync.run_once, last of all."""
     return hand_over(JOB_SYNC, lambda: sync_batches(cloud))
+
+
+def refresh_batches(result: Mapping[str, Any], sent: Sequence[Tuple[str, Sequence[str], Optional[float]]] = ()) -> Built:
+    """A document check run from the command line (auto_verify --publish) -> verify_batches of its
+    result (its own results.json, read whole: store_ok), and a notification for each notice in
+    `sent` ([(title, lines, epoch)]: those Telegram accepted, e.g. the --announce roll-out summary)."""
+    out, failed = verify_batches(result, True)
+    for title, lines, at in sent or []:
+        out.append(_notification("\n".join(lines), at, "auto_verify", title))
+    return out, failed
+
+
+def after_verify_refresh(result: Mapping[str, Any],
+                         sent: Sequence[Tuple[str, Sequence[str], Optional[float]]] = ()) -> Optional[Path]:
+    """auto_verify --publish (the roll-out, --recheck, --passport --force), after its reports and
+    messages: the re-evaluated passports' doc_verdict and field_check (result["republish"]), the
+    checked ones' OCR text too, the whole store's doc_check, corrections and both reports, and
+    each notice in `sent` — job portal_sync, as the pass that would have sent them. Never raises."""
+    return hand_over(JOB_SYNC, lambda: refresh_batches(result, sent))
+
+
+def after_verify_notice(title: str, lines: Sequence[str], sent_at: Optional[float]) -> Optional[Path]:
+    """auto_verify --announce without --publish, once Telegram accepted the notice (the roll-out
+    summary): its notification, job portal_sync. Never raises."""
+    return hand_over(JOB_SYNC, lambda: ([_notification("\n".join(lines), sent_at, "auto_verify", title)], []))
 
 
 def after_missing_daily(lines: Sequence[str], rows: Sequence[Sequence[Any]], sent_at: Optional[float]) -> Optional[Path]:

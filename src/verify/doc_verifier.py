@@ -13,11 +13,12 @@ What it does per student:
   4. Writes an Excel report: one row per document with verdict + reason, and a
      summary sheet for the whole run.
 
-Verdicts: PASS · FLAG (needs a human eye) · FAIL · MISSING
+Verdicts: PASS · FLAG (needs a human eye) · FAIL · MISSING · ERROR (the file could not be
+checked — locked, unrenderable, OCR broke; never a document problem, retried next pass)
 
 CLI (run from the BOT folder):
-  python -m src.verify.doc_verifier --student "NAHID SAFWANUL ISLAM"
-  python -m src.verify.doc_verifier --passport A00990016
+  python -m src.verify.doc_verifier --student "SAMPLE STUDENT ONE"
+  python -m src.verify.doc_verifier --passport A99900001
   python -m src.verify.doc_verifier --all                  # every downloaded student
   python -m src.verify.doc_verifier --all --since 2026-09-01
 """
@@ -29,11 +30,16 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from src.config import settings
 from src.verify import page_checks as PC
 from src.verify import rules as R
+# The verdict names and the name rules live in common, shared with field_check and
+# auto_verify; norm, name_tokens, name_in and student_verdict stay importable from here.
+from src.verify.common import (ERROR, FAIL, FLAG, MISSING, NOTE, PASS,  # noqa: F401
+                               CheckError, edit_distance, has_error, name_in, name_tokens, norm,
+                               row_verdict, sponsor_kind, student_verdict)
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +47,16 @@ DOCS_ROOTS = [settings.docs_root(), settings.konyang_root()]   # an absent one i
 REPORT_DIR = settings.verification_dir()
 TODAY = dt.date.today()
 
-PASS, FLAG, FAIL, MISSING = "PASS", "FLAG", "FAIL", "MISSING"
-NOTE = "NOTE"        # worth a glance, not a finding — never changes a verdict
+# The portal fields the document check reads.  A change to any of them means the stored
+# verdict must be re-evaluated (auto_verify fingerprints exactly these).
+PORTAL_KEYS_READ = ("Full Name", "Father", "Mother", "DOB", "Gender", "Passport No", "Passport Expiry",
+                    "Sponsor", "SSC GPA", "HSC GPA", "Program")
+
+# Faults in this code, not in a file: they must stop the run, never become an ERROR row.
+CODE_FAULTS = (NameError, AttributeError, ImportError, TypeError)
+
+# The `key` of a row that compares documents with each other rather than checking one.
+CROSS_CHECK = "cross_check"
 
 
 # --- text extraction ---------------------------------------------------------------
@@ -89,16 +103,31 @@ def _ocr_image(arr, turned=None) -> str:
     return best
 
 
+def _no_path(message: Any, path: Path) -> str:
+    """A reader's error message with the file's full path cut down to its name: the message
+    goes into the report and Telegram, where the student's folder path is only noise (as
+    page_checks._why does)."""
+    msg = str(message)
+    path = Path(path)
+    for full in (str(path), repr(str(path))[1:-1]):
+        if full:
+            msg = msg.replace(full, path.name)
+    return msg
+
+
 def read_pages(path: Path, max_pages: int = 20, sideways: Optional[List[int]] = None) -> List[str]:
     """The text of each page on its own, in order.  Needed where page ORDER matters — an
-    e-Apostille and the certificate that follows it."""
+    e-Apostille and the certificate that follows it.
+
+    A file that cannot be opened raises CheckError: an empty page list would read as "no
+    number on any page" and be judged, where the truth is that nothing was read."""
     import pymupdf
     if path.suffix.lower() in (".jpg", ".jpeg", ".png"):
         return [" ".join(_ocr_reader().readtext(str(path), detail=0))]
     try:
         doc = pymupdf.open(str(path))
-    except Exception:
-        return []
+    except Exception as e:
+        raise CheckError(f"could not open {path.name}: {type(e).__name__}: {_no_path(e, path)}") from e
     out: List[str] = []
     try:
         for i, page in enumerate(doc):
@@ -133,7 +162,7 @@ def read_document(path: Path, max_pages: int = 20) -> Tuple[str, List[Tuple[int,
     try:
         doc = pymupdf.open(str(path))
     except Exception as e:
-        return f"[unreadable: {e}]", []
+        return f"[unreadable: {_no_path(e, path)}]", []
     for i, page in enumerate(doc):
         if i >= max_pages:
             break
@@ -148,10 +177,6 @@ def read_document(path: Path, max_pages: int = 20) -> Tuple[str, List[Tuple[int,
             text.append(_ocr_image(arr[:, :, :3]))
     doc.close()
     return "\n".join(text), sizes
-
-
-def norm(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "")).strip().lower()
 
 
 def notarised(text: str, path: Optional[Path]) -> bool:
@@ -303,16 +328,266 @@ def months_between(a: dt.date, b: dt.date) -> int:
     return (b.year - a.year) * 12 + (b.month - a.month) - (1 if b.day < a.day else 0)
 
 
+# A figure counts as money only when it is written like money: thousands separators
+# ("25,00,000", "2,500,000.00"), decimals ("2500000.00"), or a Tk / BDT / taka / ৳ marker.
+# A bare digit run is an account, customer, cheque or phone number far more often.
+_NOT_BEFORE = r"(?<![\d,/])(?<!\d[.-])"        # not the middle of a date or a longer number
+_NOT_AFTER = r"(?!\d|[.,/-]\d|\s*%)"
+_MONEY_RE = re.compile(
+    _NOT_BEFORE + r"(?:(?P<sep>\d{1,3}(?:,\d{2,3})+(?:[.,]\d{1,2})?)|(?P<dec>\d+\.\d{1,2}))" + _NOT_AFTER
+    + r"|(?:(?<![a-z])(?:tk|bdt|taka)\.?|৳)\s*[:=]?\s*(?P<pre>\d+)" + _NOT_AFTER
+    + r"|" + _NOT_BEFORE + r"(?P<post>\d+)\s*(?:/-\s*)?(?:tk|bdt|taka)(?![a-z])",
+    re.I)
+# A plain number, for a field whose label already says it is an amount ("Tax paid 15000"): at
+# most 9 digits (a longer run is a TIN, challan or reference number), and never one written
+# after an ID label or a challan's ("Tax paid vide Challan No 123456789").
+_PLAIN_RE = re.compile(_NOT_BEFORE + r"\d{3,9}" + _NOT_AFTER)
+_PLAIN_ID_LABELS = ["challan"]
+_YEAR_RE = re.compile(r"(?:19|20)\d{2}")
+# Words that make the figure after an "Account …" label money after all ("Account Balance").
+_MONEY_WORDS = re.compile(r"balance|amount|paid|tk|taka|bdt|৳", re.I)
+_ID_AFTER = 25                 # a figure this close after an ID label is that ID
+
+
+def _label_re(labels: List[str]) -> "re.Pattern[str]":
+    """Any of `labels` as a whole word (spaces in a label match any spacing)."""
+    alts = sorted({re.escape(l).replace(r"\ ", r"\s*") for l in labels}, key=len, reverse=True)
+    return re.compile(r"(?<![a-z0-9])(?:" + "|".join(alts) + r")(?![a-z0-9])\.?", re.I)
+
+
+def _id_label_re() -> "re.Pattern[str]":
+    return _label_re(R.ID_NUMBER_LABELS)
+
+
+def money_figures(text: str) -> List[Tuple[int, float]]:
+    """(position, value) of every figure written like money, in reading order.
+
+    A figure within 25 characters after an account / customer / ID / number / phone label
+    is that number, not money — unless a money word ("balance", "amount", "paid", "Tk")
+    sits between, as in "Account Balance: Tk 25,00,000.00". Labels are whole words, so
+    "Paid" holds no "id" and "Nominee" no "no"."""
+    text = text or ""
+    ids = [m.end() for m in _id_label_re().finditer(text)]
+    out: List[Tuple[int, float]] = []
+    for m in _MONEY_RE.finditer(text):
+        group = next(g for g in ("sep", "dec", "pre", "post") if m.group(g) is not None)
+        pos = m.start(group)
+        if _after_id(text, ids, pos):
+            continue
+        v = money_value(m.group(group))
+        if v is not None:
+            out.append((pos, v))
+    return out
+
+
+def _after_id(text: str, ids: List[int], pos: int) -> bool:
+    """Is the figure at `pos` written right after an ID label (one of `ids`, their end positions)
+    with no money word between: that number, not money."""
+    return any(0 <= pos - end <= _ID_AFTER and not _MONEY_WORDS.search(text[end:pos]) for end in ids)
+
+
+def _opening_spans(text: str) -> List[Tuple[int, int]]:
+    return [m.span() for m in _label_re(R.OPENING_BALANCE_WORDS).finditer(text or "")]
+
+
+def _labelled_figures(text: str, labels: List[str], window: int = 60,
+                      plain: bool = False) -> List[Tuple[int, float]]:
+    """(position, value) of the first money figure within `window` characters after each
+    of `labels`. A label that is part of an opening-balance label ("Opening Balance",
+    "Balance B/F") is not the balance. `plain` also takes a bare number of 3 to 9 digits
+    that is not a year, for a label that already says the figure is an amount — unless an
+    ID or challan label comes right before it (that number is the ID)."""
+    text = text or ""
+    figures = money_figures(text)
+    if plain:
+        seen = {p for p, _ in figures}
+        ids = [m.end() for m in _label_re(R.ID_NUMBER_LABELS + _PLAIN_ID_LABELS).finditer(text)]
+        for m in _PLAIN_RE.finditer(text):
+            if (m.start() not in seen and not _YEAR_RE.fullmatch(m.group())
+                    and not _after_id(text, ids, m.start())):
+                figures.append((m.start(), float(m.group())))
+        figures.sort()
+    opening = _opening_spans(text)
+    out: Dict[int, float] = {}
+    for m in _label_re(labels).finditer(text):
+        if any(a < m.end() and m.start() < b for a, b in opening):
+            continue
+        for pos, v in figures:
+            if pos >= m.end():
+                if pos - m.end() <= window:
+                    out[pos] = v
+                break
+    return sorted(out.items())
+
+
+def labelled_amounts(text: str, labels: List[str], window: int = 60, plain: bool = False) -> List[float]:
+    """The amounts the document itself labels with one of `labels` (rules.BALANCE_LABELS,
+    rules.TAX_PAID_LABELS): the first money figure after each label, in reading order."""
+    return [v for _, v in _labelled_figures(text, labels, window, plain)]
+
+
+# --- dates of birth, the passport's MRZ and its number ------------------------------
+_DOB_LABEL_RE = re.compile(r"(?<![a-z])(?:date\s*of\s*birth|birth\s*date|d\.?\s?o\.?\s?b)(?![a-z])\.?", re.I)
+# The online BRIS certificate's table header: "DATE OF BIRTH | BIRTH REGISTRATION NUMBER | SEX",
+# with the values on the row below.
+_BRIS_HEADER = re.compile(r"[\s:|.\-]*(?:birth\s*)?registration\s*(?:number|no)\b", re.I)
+_ROW_END = re.compile(r"date|issue", re.I)
+
+
+def labelled_dob(text: str) -> Optional[dt.date]:
+    """The date printed beside a "Date of Birth" / "Birth Date" / "DOB" label: the first
+    date within 60 characters after it (digits printed one per box included), read only
+    up to the next label ("Date of Registration", "Issue Date") so that date is never
+    taken for the birth date. When the label is the head of the BRIS table ("DATE OF BIRTH
+    BIRTH REGISTRATION NUMBER SEX"), the date is read from the row below, up to the next
+    "Date" / "Issue" word."""
+    stop = _label_re(R.DOB_STOP_LABELS)
+    for m in _DOB_LABEL_RE.finditer(text or ""):
+        window = text[m.end():m.end() + 60]
+        cut = stop.search(window)
+        found = find_dates(window[:cut.start()] if cut else window)
+        if found:
+            return found[0]
+        hdr = _BRIS_HEADER.match(text, m.end())
+        if hdr:                                     # a table header: the value is on the next row
+            row = text[hdr.end():hdr.end() + 100]
+            end = _ROW_END.search(row)              # never run into "Date of Registration/Issue"
+            found = find_dates(row[:end.start()] if end else row)
+            if found:
+                return found[0]
+    return None
+
+
+_MRZ_JUNK = re.compile(r"[^A-Z0-9<]")
+_MRZ_WORD = re.compile(r"[A-Z0-9<]*(?:<|\d)[A-Z0-9<]*")
+_LINE2_HINT = re.compile(r"[A-Z<]{3}\d{7}[MF<]")
+
+
+def _mrz_runs(text: str) -> List[str]:
+    """Stretches of the text that could be a machine-readable line, with the spaces OCR put
+    inside them taken out: every line of the text that holds a '<', and every run of
+    neighbouring words made of MRZ characters (OCR joins a page's words with spaces and
+    splits a line where it likes)."""
+    t = (text or "").upper().replace("«", "<<").replace("‹", "<")
+    runs: List[str] = []
+    for line in t.splitlines():
+        s = _MRZ_JUNK.sub("", line)
+        if len(s) >= 28 and ("<" in s or _LINE2_HINT.search(s)):
+            runs.append(s)
+    group: List[str] = []
+    for word in t.split() + [""]:
+        w = _MRZ_JUNK.sub("", word)
+        if w and len(w) >= 3 and _MRZ_WORD.fullmatch(w):
+            group.append(w)
+            continue
+        s = "".join(group)
+        if len(s) >= 28 and ("<" in s or _LINE2_HINT.search(s)):
+            runs.append(s)
+        group = []
+    return list(dict.fromkeys(runs))
+
+
+def passport_mrz(text: str) -> Dict[str, Any]:
+    """The passport's machine-readable zone as read off the scan text:
+    {passport_no, passport_no_ok, dob, dob_ok, expiry, expiry_ok, sex, line2_ok, checks,
+    name}, the dates as "YYYY-MM-DD" ("" when unreadable), each *_ok meaning its own check
+    digit agrees, line2_ok every check digit, checks how many agree. {} when the text holds
+    no line 2 with a single check digit that agrees."""
+    from src.scraper.ocr_validator import parse_mrz_line1, parse_mrz_line2
+    best, name = None, ""
+    for run in _mrz_runs(text):
+        two = parse_mrz_line2(run)
+        if two and (best is None or (two["line2_ok"], two["checks"]) > (best["line2_ok"], best["checks"])):
+            best = two
+        if not name:
+            for m in re.finditer(r"P[<KC(]?[A-Z]{3}", run):
+                one = parse_mrz_line1(run[m.start():m.start() + 44])
+                if one and one.get("line1_ok"):
+                    name = one["full_name"]
+                    break
+    if not best:
+        return {}
+    return {"passport_no": best["passport_no"], "passport_no_ok": bool(best["passport_no_ok"]),
+            "dob": best["dob"] or "", "dob_ok": bool(best["dob_ok"]),
+            "expiry": best["expiry"] or "", "expiry_ok": bool(best["expiry_ok"]),
+            "sex": best["sex"], "line2_ok": bool(best["line2_ok"]), "checks": best["checks"], "name": name}
+
+
+def _iso(value: Any) -> Optional[dt.date]:
+    try:
+        return dt.date.fromisoformat(str(value or "").strip()[:10])
+    except ValueError:
+        return None
+
+
+def mrz_dob(mrz: Dict[str, Any], portal_dob: Optional[dt.date] = None) -> Optional[dt.date]:
+    """The MRZ's date of birth when it can be trusted: its check digit agrees AND the line
+    is whole, or at least 2 check digits agree, or it is the portal's own date of birth.
+    One agreeing digit alone is a 1-in-10 chance."""
+    return _trusted(mrz, "dob", portal_dob)
+
+
+def mrz_expiry(mrz: Dict[str, Any], portal_expiry: Optional[dt.date] = None) -> Optional[dt.date]:
+    """The MRZ's expiry date, trusted on the same terms as its date of birth."""
+    return _trusted(mrz, "expiry", portal_expiry)
+
+
+def _trusted(mrz: Dict[str, Any], field: str, portal: Optional[dt.date]) -> Optional[dt.date]:
+    d = _iso(mrz.get(field)) if mrz.get(f"{field}_ok") else None
+    if d and (mrz.get("line2_ok") or (mrz.get("checks") or 0) >= 2 or d == portal):
+        return d
+    return None
+
+
+# OCR's usual letter/digit confusions, folded the same way on both sides (field_check
+# does the same in _ocr_variant).
+_OCR_FOLD = str.maketrans({"a": "4", "o": "0", "i": "1", "l": "1", "s": "5", "b": "8"})
+
+
+def _ocr_fold(s: str) -> str:
+    return re.sub(r"\W", "", str(s or "").lower()).translate(_OCR_FOLD)
+
+
+def passport_number_on(text: str, number: str) -> Tuple[str, str]:
+    """Where the portal's passport number is on a scan: ("exact", number); ("ocr", token)
+    when a 9-character token is within 2 edits of it once OCR's letter/digit confusions
+    are folded (A99900001 read as 499900001); ("", "") when neither."""
+    pno = re.sub(r"\s+", "", (number or "").upper())
+    if not pno:
+        return "", ""
+    if pno in re.sub(r"\s+", "", (text or "").upper()):
+        return "exact", pno
+    want = _ocr_fold(pno)
+    best: Tuple[int, str] = (3, "")
+    for tok in re.findall(r"(?<![A-Za-z0-9])[A-Za-z0-9]{9}(?![A-Za-z0-9])", text or ""):
+        d = edit_distance(_ocr_fold(tok), want)
+        if d < best[0]:
+            best = (d, tok.upper())
+    return ("ocr", best[1]) if best[1] else ("", "")
+
+
 # --- per-document checks -----------------------------------------------------------
 def check_passport(text: str, student: Dict[str, str], sizes, path: Optional[Path] = None) -> List[Tuple[str, str]]:
     out = []
+    mrz = passport_mrz(text)
     expiry = student.get("Passport Expiry", "")
-    exp_date = None
+    portal_exp = None
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", expiry or ""):
-        exp_date = dt.date.fromisoformat(expiry)
-    doc_dates = [d for d in find_dates(text) if d.year >= TODAY.year]
-    if exp_date is None and doc_dates:
-        exp_date = max(doc_dates)
+        portal_exp = dt.date.fromisoformat(expiry)
+    # The validity is read from the passport itself when its MRZ expiry is check-digit
+    # valid (and not a lone lucky digit); the portal's value is what a consultant typed.
+    exp_date = mrz_expiry(mrz, portal_exp)
+    notes = []
+    if exp_date:
+        if portal_exp and portal_exp != exp_date:
+            notes.append((FLAG, f"portal expiry {portal_exp}, the passport's MRZ reads {exp_date} — "
+                                "correct the portal"))
+    elif portal_exp:
+        exp_date = portal_exp
+        notes.append((NOTE, "the expiry date was taken from the portal (the passport's MRZ could not be read)"))
+    else:
+        doc_dates = [d for d in find_dates(text) if d.year >= TODAY.year]
+        exp_date = max(doc_dates) if doc_dates else None
     if exp_date:
         months = months_between(TODAY, exp_date)
         if months < 0:
@@ -324,11 +599,20 @@ def check_passport(text: str, student: Dict[str, str], sizes, path: Optional[Pat
             out.append((PASS, f"valid until {exp_date} ({months} months left)"))
     else:
         out.append((FLAG, "could not read an expiry date from the scan"))
-    pno = (student.get("Passport No") or "").upper()
+    out += notes
+    pno = re.sub(r"\s+", "", (student.get("Passport No") or "").upper())
     if pno:
-        out.append((PASS, f"passport number {pno} found on the scan")
-                   if pno.replace(" ", "") in re.sub(r"\s+", "", text.upper())
-                   else (FLAG, f"portal passport number {pno} not found in the scan text"))
+        how, token = passport_number_on(text, pno)
+        if how == "exact":
+            out.append((PASS, f"passport number {pno} found on the scan"))
+        elif mrz.get("passport_no_ok") and mrz.get("passport_no") and mrz["passport_no"] != pno:
+            out.append((FLAG, f"the passport's MRZ reads number {mrz['passport_no']}, the portal says "
+                              f"{pno} — check which is right"))
+        elif how == "ocr":
+            out.append((PASS, f"passport number {pno} found on the scan, read as {token}"))
+            out.append((NOTE, f"the scan reads {token} for {pno} — probably an OCR misread"))
+        else:
+            out.append((FLAG, f"portal passport number {pno} not found in the scan text"))
     # NOTE: seal-placement check disabled — it cannot yet separate the passport
     # image from the page reliably, so it flagged every scan. Being reworked.
     # out += PC.passport_seal_check(path) if path else []
@@ -369,8 +653,10 @@ def check_photo(text: str, student: Dict[str, str], sizes, path: Optional[Path] 
             gray = rgb.convert("L")
             if ImageStat.Stat(gray).stddev[0] < 30:
                 out.append((FLAG, "image looks flat/low contrast — check sharpness"))
-    except Exception as e:
-        out.append((FLAG, f"could not inspect the image ({e})"))
+    except CODE_FAULTS:
+        raise
+    except Exception as e:                 # locked, truncated or not an image: not a photo problem
+        out.append((ERROR, f"could not open the image ({type(e).__name__}: {_no_path(e, path)})"))
     if path.suffix.lower() not in R.PHOTO_FORMATS:
         out.append((FAIL, f"photo is {path.suffix} — reviewer requires JPG/JPEG"))
     if (student.get("Gender") or "").upper().startswith("F"):
@@ -389,26 +675,54 @@ def check_birth_cert(text: str, student, sizes, path=None, others=None) -> List[
     if not re.search(r"[a-z]", text.lower()):
         out.append((FLAG, "little English text — if the certificate is not in English it must be "
                           "translated on a lawyer pad and notarised"))
-    # The date of birth must agree with the PASSPORT, not with what the portal says.
-    passport_text = (others or {}).get("passport", "")
-    here = set(find_dates(text))
-    there = set(find_dates(passport_text))
-    if not passport_text:
-        out.append((FLAG, "no passport on file to check the date of birth against"))
-    elif not here or not there:
-        out.append((FLAG, "could not read a date of birth from one of the two scans — "
-                          "compare the birth certificate and the passport by eye"))
-    elif here & there:
-        d = sorted(here & there)[0]
-        out.append((PASS, f"date of birth {d} is the same on the birth certificate and the passport"))
-    elif {x.year for x in here} & {x.year for x in there}:
-        y = sorted({x.year for x in here} & {x.year for x in there})[0]
-        out.append((PASS, f"year of birth {y} agrees with the passport; the day and month could "
-                          "not be read (boxed digits often defeat OCR)"))
-    else:
-        out.append((FAIL, f"no date on the birth certificate matches any date on the passport "
-                          f"(certificate: {', '.join(str(x) for x in sorted(here)[:3])})"))
+    out += birth_date_check(text, (others or {}).get("passport", ""), student)
     return out
+
+
+def birth_date_check(cert_text: str, passport_text: str, student) -> List[Tuple[str, str]]:
+    """The date of birth must agree with the PASSPORT, not with what the portal says.
+
+    Each side is read where it is labelled: the certificate's "Date of Birth" field, the
+    passport's MRZ (when its check digits can be trusted) or else its "Date of Birth"
+    field. FAIL only when both are read and differ and the passport's date is sure (a
+    trusted MRZ, or a labelled date that is also the portal's); anything less is a FLAG.
+
+    One PASS does not need the passport's own field to be read: the certificate's labelled
+    date is the portal's, that exact date is printed on the passport scan, and no MRZ (even an
+    untrusted one) gives a different date."""
+    if not passport_text:
+        return [(FLAG, "no passport on file to check the date of birth against")]
+    portal = _iso(student.get("DOB"))
+    cert = labelled_dob(cert_text)
+    raw = passport_mrz(passport_text)
+    mrz = mrz_dob(raw, portal)
+    passport = mrz or labelled_dob(passport_text)
+    if cert and passport and cert == passport:
+        return [(PASS, f"date of birth {cert} is the same on the birth certificate and the passport")]
+    if (cert and not passport and portal and cert == portal
+            and portal in find_dates(passport_text)
+            and _iso(raw.get("dob")) in (None, portal)):
+        return [(PASS, f"date of birth {cert} on the birth certificate is the portal's date of birth, "
+                       "and the passport shows the same date (its date-of-birth field could not be "
+                       "read on its own)")]
+    if not cert or not passport:
+        unread = ("the birth certificate" if not cert else "") + \
+                 (" and " if not cert and not passport else "") + ("the passport" if not passport else "")
+        read = cert or passport
+        side = "birth certificate" if cert else "passport"
+        portal_bit = (f"; the {side}'s {read} is the portal's date of birth" if read and read == portal
+                      else "")
+        return [(FLAG, f"could not read the date of birth on {unread}{portal_bit} — compare the birth "
+                       "certificate and the passport by eye")]
+    if cert.year == passport.year:
+        return [(FLAG, f"the birth certificate gives {cert} and the passport {passport}: the year agrees, "
+                       "the day and month do not (boxed digits often defeat OCR) — compare them by eye")]
+    sure = "MRZ" if mrz else ("date of birth field, which is also the portal's" if passport == portal else "")
+    if sure:
+        return [(FAIL, f"the birth certificate gives date of birth {cert} but the passport ({sure}) "
+                       f"gives {passport}")]
+    return [(FLAG, f"the birth certificate gives date of birth {cert} and the passport {passport} — "
+                   "compare them by eye")]
 
 
 def nid_numbers(text: str) -> List[str]:
@@ -449,10 +763,11 @@ def check_nid(text: str, student, sizes, whose: str, path=None, others=None) -> 
     key = {"father": "Father", "mother": "Mother", "student": "Full Name"}.get(whose, "Full Name")
     name = student.get(key, "")
     passport_text = (others or {}).get("passport", "")
-    if name:
-        first = norm(name).split()[0] if norm(name) else ""
-        on_nid = bool(first and first in norm(text))
-        on_passport = bool(first and first in norm(passport_text))
+    # The whole name, not its first word: a parent's NID that shares only the family name
+    # is not that parent's.
+    if name and name_in(text, name) is not None:
+        on_nid = bool(name_in(text, name))
+        on_passport = bool(name_in(passport_text, name))
         if on_nid and on_passport:
             out.append((PASS, f"{whose}'s name '{name}' appears on both the NID and the passport"))
         elif on_nid and not passport_text:
@@ -472,71 +787,164 @@ def check_nid(text: str, student, sizes, whose: str, path=None, others=None) -> 
     if path is not None:
         try:
             pages = read_pages(path, max_pages=8)
+        except CODE_FAULTS:
+            raise
         except Exception as e:
-            logger.warning("could not read %s page by page: %s", path.name, e)
+            out.append((ERROR, f"could not read the NID page by page ({_no_path(e, path)})"))
     per_page = [set(nid_numbers(t)) for t in pages]
     every = sorted({n for s in per_page for n in s}) or nid_numbers(text)
 
     if not every:
         out.append((FLAG, "no NID/birth-registration number could be read from the scan"))
     else:
-        conflicts, agreed, alone = [], [], []
-        for size in (10, 13, 17):
-            pages_with = [s for s in ({n for n in page if len(n) == size} for page in per_page) if s]
-            if len(pages_with) >= 2:
-                shared = set.intersection(*pages_with)
-                if shared:
-                    agreed.append(sorted(shared)[0])
-                else:
-                    conflicts.append((size, [sorted(s)[0] for s in pages_with[:2]]))
-            elif len(pages_with) == 1:
-                alone.append(sorted(pages_with[0])[0])
-
-        if conflicts:
-            # Two different numbers of the same length is worth a human eye, but not a
-            # verdict: OCR misreads a digit often enough that calling it a forgery would
-            # be overstating the evidence.  The reviewer is given both numbers to compare.
-            size, vals = conflicts[0]
-            out.append((FLAG, f"the {size}-digit ID number reads {vals[0]} on one page and "
-                              f"{vals[1]} on another — check the translation against the "
-                              "original by eye"))
-        elif agreed:
-            out.append((PASS, "ID number " + ", ".join(agreed) +
-                              " reads the same on the original and the translation"))
-        else:
-            kinds = ", ".join(f"{n} ({len(n)}-digit)" for n in every[:3])
-            out.append((NOTE, f"ID number {kinds} read, but not on two pages in the same format, "
-                              "so the original and the translation could not be compared"))
+        out += nid_number_agreement(per_page, every)
     return out
 
 
-def issue_date(text: str) -> Optional[dt.date]:
-    """The date a certificate was issued: taken from the 'Date'/'Ref'/'Memo' line, and
-    never from a family member's date of birth. OCR often inserts stray dots
-    ("302.083.2026"), so the digits near the label are also tried."""
-    head = text[:1200]
-    m = re.search(r"(date|ref|memo|serial)[^\n]{0,90}", head, re.I)
-    if m:
-        got = [d for d in find_dates(m.group(0)) if 0 <= (TODAY - d).days <= 3 * 365]
-        if got:                       # a date on the header line, but never a birth date
-            return max(got)
-        digits = re.sub(r"\D", "", m.group(0))
-        for i in range(len(digits) - 7):          # find DDMMYYYY inside the digit run
-            chunk = digits[i:i + 8]
-            try:
-                d = dt.date(int(chunk[4:]), int(chunk[2:4]), int(chunk[:2]))
-            except ValueError:
+def nid_number_agreement(per_page: List[set], every: List[str]) -> List[Tuple[str, str]]:
+    """Whether the ID number reads the same on the original and the translation.
+
+    Numbers are only compared with numbers of the SAME length (a 10-digit Smart NID and a
+    13-digit old one are two formats of one identity). A number on 2 or more pages agrees.
+    A page none of whose numbers is on any other page is compared with the closest number
+    elsewhere: 1-2 digits apart is an OCR misread (NOTE); 3 or more is worth a human eye
+    (FLAG, naming both numbers) — never a verdict, OCR misreads digits too often."""
+    agreed: List[str] = []
+    misread: List[Tuple[str, str, int]] = []
+    differ: List[Tuple[str, str, int]] = []
+    for size in (10, 13, 17):
+        pages_with = [s for s in ({n for n in page if len(n) == size} for page in per_page) if s]
+        if len(pages_with) < 2:
+            continue
+        for i, nums in enumerate(pages_with):
+            elsewhere = set().union(*(s for j, s in enumerate(pages_with) if j != i))
+            shared = nums & elsewhere
+            if shared:
+                agreed += [n for n in sorted(shared) if n not in agreed]
                 continue
-            if abs((TODAY - d).days) <= 3 * 365:
-                return d
-    recent = [d for d in find_dates(text) if 0 <= (TODAY - d).days <= 3 * 365]
-    return max(recent) if recent else None
+            d, mine, theirs = min((edit_distance(a, b), a, b) for a in sorted(nums) for b in sorted(elsewhere))
+            pair = (mine, theirs, size)
+            if any({mine, theirs} == {a, b} for a, b, _ in misread + differ):
+                continue                   # the same two numbers, seen from the other page
+            (misread if d <= 2 else differ).append(pair)
+    out: List[Tuple[str, str]] = []
+    for mine, theirs, size in differ[:2]:
+        out.append((FLAG, f"the {size}-digit ID number reads {mine} on one page and {theirs} on another "
+                          "— check the translation against the original by eye"))
+    for mine, theirs, size in misread[:2]:
+        out.append((NOTE, f"the {size}-digit ID number reads {mine} on one page and {theirs} on another "
+                          "— probably an OCR misread"))
+    if agreed:
+        out.append((PASS, "ID number " + ", ".join(agreed[:3]) +
+                          " reads the same on the original and the translation"))
+    if not out:
+        kinds = ", ".join(f"{n} ({len(n)}-digit)" for n in every[:3])
+        out.append((NOTE, f"ID number {kinds} read, but not on two pages in the same format, "
+                          "so the original and the translation could not be compared"))
+    return out
+
+
+_DATE_WORD = r"(?:dated?|datc|dale|datex)"          # OCR: "Datc", "Dale", "Issue Datex"
+_NOT_BIRTH = r"(?!\s*o[fl]\s*birth)"                # "Date of Birth", OCR "Date ol Birth"
+# whole words only ("candidate", "update", "therefore" are no label), never "date of birth"
+_ISSUE_LABEL = re.compile(
+    r"\b(?:" + _DATE_WORD + _NOT_BIRTH + r"|ref(?:erence)?|memo|serial)\b\.?\s*(?:no\b\.?)?\s*[:.\-]?"
+    r"[^\n]{0,90}", re.I)
+# The certificate's own number-and-date line, searched in the WHOLE text because a notary or
+# translation page often comes first. Only the 25 characters after the date word are read, never
+# the certificate number (a number like "UC-2201-2026-.." would otherwise give label-digits 22-01-2026).
+_STRONG_ISSUE_LABEL = re.compile(
+    r"(?:\bcerti\w{2,8}\s*no\b[^\n]{0,40}?\b" + _DATE_WORD + _NOT_BIRTH +
+    r"|\bdate\s*of\s*issue|\bissue\s*" + _DATE_WORD + r")\b(?P<rest>\s*[:.;\-]?[^\n]{0,25})", re.I)
+# Dates that belong to another paper: an affidavit the certificate cites, the notary's register,
+# the advocate's attestation, the translator.
+_NOT_ISSUE = re.compile(r"affidavit|notary\s*public\s*(?:no|:)|notari[sz]ed|\badv(?:ocate)?\b|attest|translat",
+                        re.I)
+_NOT_ISSUE_BEFORE = 90      # how far back on the same line that context is looked for
+
+
+def _issue_recent(d: dt.date) -> bool:
+    return 0 <= (TODAY - d).days <= 3 * 365          # never a future date, never a birth date
+
+
+def _issue_date_in(window: str) -> Tuple[Optional[dt.date], str]:
+    cut = _NOT_ISSUE.search(window)
+    if cut:
+        window = window[:cut.start()]               # the line runs on into the notary's part
+    got = [d for d in find_dates(window) if _issue_recent(d)]
+    if got:
+        return max(got), "label"
+    digits = re.sub(r"\D", "", window)
+    for i in range(len(digits) - 7):                # find DDMMYYYY inside the digit run
+        chunk = digits[i:i + 8]
+        try:
+            d = dt.date(int(chunk[4:]), int(chunk[2:4]), int(chunk[:2]))
+        except ValueError:
+            continue
+        if _issue_recent(d):                        # was abs(): 2027-02-23 passed as "-5 months ago"
+            return d, "label-digits"
+    return None, ""
+
+
+def issue_date_labelled(text: str) -> Tuple[Optional[dt.date], str]:
+    """The date a certificate was issued, and where it was read:
+
+      "label"         a date on a 'Date'/'Ref'/'Memo'/'Serial' line near the top, or on the
+                      certificate's own "Certificate No .. Date" / "Date of Issue" / "Issue Date"
+                      line anywhere in the text (a notary or translation page often comes first)
+      "label-digits"  DDMMYYYY found in that line's digits (OCR often inserts stray dots:
+                      "302.083.2026")
+      "fallback"      no such line: the latest date of the last 3 years anywhere on the
+                      page — which may be the notary's date, not the issue date
+      ""              no date at all
+
+    Every label in the first 1200 characters is tried, not only the first. A date written after
+    "affidavit", "Notary Public No", "Adv.", "attested" or "translation" on the same line is never
+    the issue date. Never a family member's date of birth and never a future date: only dates of
+    the last 3 years count."""
+    text = text or ""
+    for rx, where in ((_ISSUE_LABEL, text[:1200]), (_STRONG_ISSUE_LABEL, text)):
+        for m in rx.finditer(where):
+            line_start = where.rfind("\n", 0, m.start()) + 1
+            if _NOT_ISSUE.search(where[max(line_start, m.start() - _NOT_ISSUE_BEFORE):m.start()]):
+                continue                            # the affidavit's / notary's / translator's date
+            d, src = _issue_date_in(m.group("rest") if rx is _STRONG_ISSUE_LABEL else m.group(0))
+            if d:
+                return d, src
+    recent = [d for d in find_dates(text) if _issue_recent(d)]
+    return (max(recent), "fallback") if recent else (None, "")
+
+
+def issue_date(text: str) -> Optional[dt.date]:
+    """The date a certificate was issued (issue_date_labelled without the source)."""
+    return issue_date_labelled(text)[0]
+
+
+_CITED_AFFIDAVIT = re.compile(r"affidavit[^\n]{0,120}", re.I)
+
+
+def cited_affidavit_date(text: str) -> Optional[dt.date]:
+    """The latest date of the last 3 years on a line that cites an affidavit (the certificate is
+    issued after the affidavit it cites, so the certificate is at most that old), else None."""
+    got = [d for m in _CITED_AFFIDAVIT.finditer(text or "") for d in find_dates(m.group(0)) if _issue_recent(d)]
+    return max(got) if got else None
 
 
 def check_family_cert(text: str, student, sizes, path=None) -> List[Tuple[str, str]]:
     out = []
-    recent = issue_date(text)
-    if recent:
+    recent, source = issue_date_labelled(text)
+    # No issue date of its own: an affidavit it cites, dated within the validity, proves it is
+    # recent (owner, 21 Oct 2026). An older cited affidavit proves nothing either way.
+    cited = cited_affidavit_date(text) if source in ("fallback", "") else None
+    if cited and months_between(cited, TODAY) <= R.FAMILY_CERT_MAX_MONTHS:
+        out.append((PASS, f"no issue date line could be read, but it cites an affidavit dated {cited} "
+                          f"({months_between(cited, TODAY)} month(s) ago) — issued after it, so within "
+                          "the 3-month validity"))
+    elif recent and source == "fallback":
+        out.append((FLAG, f"no Date/Ref line could be read; the latest recent date on the certificate is "
+                          f"{recent}, which may be the notary date — check the issue date (3-month "
+                          "validity) by eye"))
+    elif recent:
         age = months_between(recent, TODAY)
         if age <= R.FAMILY_CERT_MAX_MONTHS:
             out.append((PASS, f"issued {recent} ({age} month(s) ago) — within the 3-month validity"))
@@ -548,12 +956,11 @@ def check_family_cert(text: str, student, sizes, path=None) -> List[Tuple[str, s
                else (FLAG, "issuer (Union Parishad / City Corporation) not recognised"))
     out.append((PASS, "notarised through an advocate (wording or seal found)") if notarised(text, path)
                else (FAIL, "no notarisation found — guideline requires an advocate's notarisation"))
-    name = norm(student.get("Full Name", ""))
+    name = student.get("Full Name", "")
     first_chunk = norm(text)[:1200]
-    if name:
-        parts = [p for p in name.split() if len(p) > 2]
+    if name and name_in(first_chunk, name) is not None:
         out.append((PASS, "student's name appears at the top of the certificate")
-                   if any(p in first_chunk for p in parts)
+                   if name_in(first_chunk, name)
                    else (FLAG, "student's name not found near the top — it must be in the first row"))
     ids = len(re.findall(r"\b\d{10,17}\b", text))
     out.append((PASS, f"{ids} NID/birth-registration numbers listed") if ids >= 2
@@ -573,8 +980,10 @@ def check_academic(text: str, student, sizes, path=None, others=None) -> List[Tu
                 out.append((NOTE, "page(s) " + ", ".join(str(n) for n in sideways) +
                                   " are scanned sideways — they were turned upright to be read, "
                                   "but the student should upload them the right way up"))
+        except CODE_FAULTS:
+            raise
         except Exception as e:
-            out.append((FLAG, f"could not check the e-Apostille pages ({e})"))
+            out.append((ERROR, f"could not check the e-Apostille pages ({_no_path(e, path)})"))
     elif has_any(text, R.APOSTILLE_WORDS):
         out.append((PASS, "e-apostille wording found"))
     else:
@@ -589,18 +998,37 @@ def check_academic(text: str, student, sizes, path=None, others=None) -> List[Tu
         name = (student.get(col) or "").strip()
         if not name:
             continue
-        parts = [p for p in norm(name).split() if len(p) > 2]
         out.append((PASS, f"{who}'s name ({name}) appears on the academic papers")
-                   if parts and any(p in norm(text) for p in parts)
+                   if name_in(text, name)
                    else (FLAG, f"{who}'s name '{name}' not found on the academic papers"))
     for label, col in (("HSC", "HSC GPA"), ("SSC", "SSC GPA")):
         gpa = (student.get(col) or "").strip()
         if gpa:
-            g = gpa.rstrip("0").rstrip(".")
             out.append((PASS, f"{label} GPA {gpa} matches the portal")
-                       if (gpa in text or g in text)
+                       if gpa_on(text, gpa)
                        else (FLAG, f"portal {label} GPA {gpa} not found in the certificate text"))
     return out
+
+
+_GPA_LABEL_RE = re.compile(r"(?<![a-z])(?:c?gpa|grade\s*point\s*average)(?![a-z])\W{0,15}?"
+                           r"(\d(?:\.\d{1,2})?)(?![\d]|\.\d)", re.I)
+_GPA_NUMBER_RE = re.compile(r"(?<![\d.])(\d\.\d{1,2})(?![\d]|\.\d)")
+
+
+def gpa_on(text: str, gpa: str) -> bool:
+    """Whether the certificate shows the portal's GPA, compared as a number to 2 decimals:
+    "5.00" is found as "5.00", "5.0" or a labelled "GPA: 5", never inside "55", "15.00" or
+    "5.25". A bare whole number counts only beside a GPA label. When the text labels any GPA,
+    only the labelled values count: a transcript's subject grade points (5.00, 4.00) are
+    decimals too (as field_check does)."""
+    try:
+        want = round(float(gpa), 2)
+    except ValueError:
+        return bool(re.search(rf"(?<![\w.]){re.escape(gpa)}(?![\w]|\.\d)", text or ""))
+    found = [m.group(1) for m in _GPA_LABEL_RE.finditer(text or "")]
+    if not found:
+        found = _GPA_NUMBER_RE.findall(text or "")
+    return any(round(float(v), 2) == want for v in found)
 
 
 def looks_like_solvency(text: str) -> bool:
@@ -624,19 +1052,54 @@ def document_date(text: str) -> Optional[dt.date]:
     return dates[-1] if dates else None
 
 
-def opening_balance(text: str) -> Optional[int]:
-    """The balance a statement starts from.
+_ROW_DATE_AT = re.compile(r"\d{1,2}\s*[./-]\s*(?:\d{1,2}|[a-z]{3,9})\s*[./-]\s*\d{2,4}"
+                          r"|\d{4}[./-]\d{1,2}[./-]\d{1,2}", re.I)
+_ROW_STOP = re.compile(r"balance|closing|branch|total", re.I)
+_ZERO_AFTER = re.compile(r"\s*[:=]?\s*0[.,]00(?!\d)")
+_OTHER_BALANCE_BEFORE = re.compile(r"(?:closing|current|available|ledger|present|total)\s*balance\W{0,5}$"
+                                   r"|total\W{0,5}$", re.I)
+
+
+def opening_balance(text: str) -> Tuple[Optional[int], bool]:
+    """The balance a statement starts from, and whether the statement labels it.
 
     Bangladeshi banks label it differently — Opening Balance, Previous Balance, B/F,
     Brought Forward — and some print no label at all, in which case the balance on the
-    first transaction row is the opening figure."""
-    for label in R.OPENING_BALANCE_WORDS:
-        m = re.search(re.escape(label).replace(r"\ ", r"\s*") + r"\D{0,40}?([\d,]{4,15}(?:\.\d{1,2})?)",
-                      text or "", re.I)
-        if m:
-            v = money_value(m.group(1))
-            if v is not None:
-                return int(v)
+    first transaction row is the opening figure (unlabelled: a guess, never judged).
+
+    The labelled value is read from the label's own row, as these statements lay it out:
+      - a plausible balance (1 lakh or more) printed just before the label, with at most a date
+        between ("Debit Credit Balance 2,740,217.50 Opening Balance", "24,93,857.00 15-09-2026
+        OPENING BALANCE") — not one labelled as another balance or a total;
+      - else the first balance of 1 lakh or more after it, skipping a value date and an "as on"
+        date, up to the next date or label ("OPENING BALANCE 0.00 0.00 2,004,865.00 CR");
+      - else exactly 0.00 and nothing else (a new account).
+    A debit or credit beside the label (under 1 lakh), a year, a date or an account number is
+    never taken for it; a label whose row holds none of these is not read."""
+    text = text or ""
+    ids = [m.end() for m in _id_label_re().finditer(text)]
+    figures = [(p, v) for p, v in plausible_money(text) if not _after_id(text, ids, p)]
+    for m in _label_re(R.OPENING_BALANCE_WORDS).finditer(text):
+        before = [(p, v) for p, v in figures if m.start() - 40 <= p < m.start() and v >= _BALANCE_FLOOR]
+        if before:
+            p, v = before[-1]
+            gap = _ROW_DATE_AT.sub("", re.sub(r"^[\d,.]+", "", text[p:m.start()]), count=1)
+            if re.fullmatch(r"[\s|=\-:CRcr]*", gap) and not _OTHER_BALANCE_BEFORE.search(text[max(0, p - 30):p]):
+                return int(v), True
+        start = m.end()
+        lead = re.match(r"\s*(?:as\s*(?:on|at)|on|dated?)?\W{0,3}", text[start:start + 16])
+        first = _ROW_DATE_AT.match(text, start + lead.end())
+        if first:
+            start = first.end()
+        end = start + 60
+        for stop in (_ROW_DATE_AT.search(text, start, end), _ROW_STOP.search(text, start, end)):
+            if stop:
+                end = min(end, stop.start())
+        row = [v for p, v in figures if start <= p < end and v >= _BALANCE_FLOOR]
+        if row:
+            return int(row[0]), True
+        if _ZERO_AFTER.match(text, m.end()) and not [v for p, v in figures if m.end() <= p < end]:
+            return 0, True
     # no label: take the balance on the first transaction row
     for line in (text or "").splitlines():
         if not re.search(r"\d{1,2}[./-]\w{2,9}[./-]\d{2,4}", line):
@@ -644,8 +1107,256 @@ def opening_balance(text: str) -> Optional[int]:
         figures = [money_value(x) for x in re.findall(r"[\d,]{4,15}(?:\.\d{1,2})?", line)]
         figures = [f for f in figures if f is not None and f >= 100]
         if figures:
-            return int(figures[-1])       # the running balance is the last figure on the row
+            return int(figures[-1]), False  # the running balance is the last figure on the row
+    return None, False
+
+
+def opening_balance_check(statement: str, program: str) -> List[Tuple[str, str]]:
+    """The reviewer's opening-balance rule. Only a LABELLED opening balance is judged, and
+    only ever as FLAG: an unlabelled first-row figure is a guess."""
+    low, high = R.MIN_OPENING_BALANCE.get(program, 0), R.PREFERRED_OPENING_MAX.get(program)
+    value, labelled = opening_balance(statement)
+    if value is None or not labelled:
+        seen = f" (the first transaction row shows {value:,} BDT)" if value is not None else ""
+        return [(NOTE, "no line is labelled as the opening balance" + seen + " — check by eye that the "
+                       f"statement opens at {low:,} BDT or more")]
+    if low and value < low:
+        return [(FLAG, f"the statement opens at {value:,} BDT — below the {low:,} BDT opening balance "
+                       f"expected for {program}")]
+    if high and value > high:
+        return [(FLAG, f"the statement opens at {value:,} BDT — above the preferred maximum of "
+                       f"{high:,} BDT for {program}")]
+    return [(PASS, f"opening balance {value:,} BDT is within the expected range")]
+
+
+_DATE_TEXT = r"\d{1,2}[\s./-]{1,2}\w{1,9}[\s./-]{1,2}\d{2,4}|\d{4}[./-]\d{1,2}[./-]\d{1,2}"
+_PERIOD_RE = re.compile(r"(?:statement\s*period|period|from(?:\s*date)?)\W{0,12}(" + _DATE_TEXT + r")"
+                        r"\s*(?:to|till|until|-|–)\s*(?:date\W{0,4})?(" + _DATE_TEXT + r")", re.I)
+_ROW_DATE_RE = re.compile(r"\s*(" + _DATE_TEXT + r")")
+_MIN_DATED_ROWS = 5
+
+
+def statement_period(pages: List[str]) -> Optional[Tuple[dt.date, dt.date]]:
+    """The first and last day a statement covers: its "Statement Period … to …" / "From …
+    To …" line, or else the earliest and latest of at least 5 dated transaction rows."""
+    for page in pages:
+        m = _PERIOD_RE.search(page or "")
+        if m:
+            a, b = find_dates(m.group(1)), find_dates(m.group(2))
+            if a and b and a[0] <= b[0]:
+                return a[0], b[0]
+    rows = []
+    for page in pages:
+        for line in (page or "").splitlines():
+            m = _ROW_DATE_RE.match(line)
+            found = find_dates(m.group(1)) if m else []
+            if found and TODAY - dt.timedelta(days=5 * 365) <= found[0] <= TODAY + dt.timedelta(days=31):
+                rows.append(found[0])
+    if len(rows) >= _MIN_DATED_ROWS:
+        return min(rows), max(rows)
     return None
+
+
+def statement_period_check(pages: List[str]) -> List[Tuple[str, str]]:
+    period = statement_period(pages)
+    if not period:
+        return [(NOTE, "the statement period could not be read — check it covers the last "
+                       f"{R.BANK_MIN_STATEMENT_MONTHS} months")]
+    start, end = period
+    months = months_between(start, end + dt.timedelta(days=1))     # 1 Apr - 30 Sep is 6 months
+    if months < R.BANK_MIN_STATEMENT_MONTHS:
+        return [(FLAG, f"the statement covers {months} month(s) ({start} to {end}) — the guideline "
+                       f"asks for the last {R.BANK_MIN_STATEMENT_MONTHS} months "
+                       f"({R.BANK_RELAXED_STATEMENT_MONTHS} months is accepted only for excellent "
+                       "accredited universities)")]
+    return [(PASS, f"the statement covers {months} months ({start} to {end})")]
+
+
+# --- the bank balance (B3) ----------------------------------------------------------
+# Money on a bank file is plausible only when written like money AND sized like money: 10,000
+# to 10 crore taka, in a real digit grouping (western 3-3-3 or lakh 2-2-3; OCR may print the
+# separators as dots). A balance is at least 1 lakh: "Balance 0", "SL 124" and column headers are
+# not balances. Certificates print the taka amount with its USD equivalent at their own exchange
+# rate (BDT 115-130 per USD in this corpus); a statement never does.
+_PLAUSIBLE_MONEY = (10_000, 100_000_000)
+_BALANCE_FLOOR = 100_000
+_USD_RATE = (115, 130)
+_USD_WINDOW = 260                       # the USD figure follows the amount and its amount in words
+_CERT_WORDS = re.compile(r"solven|to\s*whom|whom\s*it|financially\s*sound|this\s*is\s*to\s*certify"
+                         r"|balance\s*confirmation|balance\s*certificate", re.I)
+_CERT_LABELS = ["balance", "amount", "total", "sum of", "bdt", "tk"]     # figure within 120 chars
+_CERT_TAKA_LABELS = ["taka"]            # "(Taka Twenty Lac ...)" are words: the figure must follow at once
+_CLOSING_LABELS = ["closing balance", "current balance", "available balance", "ledger balance",
+                   "present balance", "balance as on", "balance as at"]
+_BANK_MONEY_RE = re.compile(
+    _NOT_BEFORE + r"(?:(?P<sep>\d{1,3}(?:,\d{2,3})+(?:[.,]\d{1,2})?|\d{1,3}(?:[.,]\d{2,3}){2,}[.,]\d{2})"
+    + r"|(?P<dec>\d+\.\d{1,2}))" + _NOT_AFTER
+    + r"|(?:(?<![a-z])(?:tk|bdt|taka)\.?|৳)[ \t]*[:=\-]?[ \t]*(?P<pre>\d{1,8})" + _NOT_AFTER
+    + r"|" + _NOT_BEFORE + r"(?P<post>\d{1,8})[ \t]*(?:/-[ \t]*)?(?:tk|bdt|taka)(?![a-z])", re.I)
+_USD_BEFORE = re.compile(r"(?:usd|dollar|\$|u\.s\.)[^a-z0-9]{0,4}$", re.I)
+_USD_MARK = re.compile(r"us[d0o]|dollar|\$", re.I)
+_ANY_NUMBER = re.compile(r"(?<![\d,.])(\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,4})?|\d{3,6}(?:[.,]\d{1,4})?)(?!\d)")
+
+
+def grouped_value(raw: str) -> Optional[float]:
+    """'25,73,067.50', '2,573,067.50', OCR '25.73.067.50' or '30.07,200.00' -> the value; None when
+    the digit groups are neither western (3-3-3) nor lakh (2-2-3). A last group of 1-2 digits is the
+    paisa, whichever mark OCR printed before it."""
+    toks = re.split(r"[.,]", (raw or "").strip())
+    if not all(t.isdigit() for t in toks):
+        return None
+    dec = ""
+    if len(toks) > 1 and len(toks[-1]) <= 2:
+        dec, toks = toks[-1], toks[:-1]
+    if len(toks) > 1:
+        first, rest = toks[0], toks[1:]
+        western = all(len(t) == 3 for t in rest)
+        lakh = all(len(t) == 2 for t in rest[:-1]) and len(rest[-1]) == 3
+        if not 1 <= len(first) <= 3 or not (western or lakh):
+            return None
+    return float("".join(toks) + ("." + dec if dec else ""))
+
+
+def plausible_money(text: str) -> List[Tuple[int, float]]:
+    """(position, value) of every figure on a bank file that can be a taka amount: written like
+    money, a real digit grouping, 10,000 to 10 crore, not marked as USD, and not right after an ID
+    label -- unless it carries thousands separators (an account number never does, and certificate
+    tables print the amount straight after the account number)."""
+    text = text or ""
+    ids = [m.end() for m in _id_label_re().finditer(text)]
+    out: List[Tuple[int, float]] = []
+    for m in _BANK_MONEY_RE.finditer(text):
+        group = next(g for g in ("sep", "dec", "pre", "post") if m.group(g) is not None)
+        pos = m.start(group)
+        if group != "sep" and _after_id(text, ids, pos):
+            continue
+        if _USD_BEFORE.search(text[max(0, m.start() - 14):m.start()]):
+            continue
+        v = grouped_value(m.group(group))
+        if v is not None and _PLAUSIBLE_MONEY[0] <= v <= _PLAUSIBLE_MONEY[1]:
+            out.append((pos, v))
+    return out
+
+
+def _labelled_balances(page: str, labels: List[str], window: int) -> List[Tuple[int, float]]:
+    """The first plausible figure within `window` characters after each label (not an opening-
+    balance label), when it is at least 1 lakh and not the USD equivalent of another figure."""
+    figures = plausible_money(page)
+    values = [v for _, v in figures]
+    opening = _opening_spans(page)
+    out: Dict[int, float] = {}
+    for m in _label_re(labels).finditer(page or ""):
+        if any(a < m.end() and m.start() < b for a, b in opening):
+            continue
+        for pos, v in figures:
+            if pos >= m.end():
+                if pos - m.end() <= window:
+                    out[pos] = v
+                break
+    return [(p, v) for p, v in sorted(out.items())
+            if v >= _BALANCE_FLOOR and not any(80 <= w / v <= 140 for w in values)]
+
+
+def usd_confirms(page: str, pos: int, value: float, marked: bool = False) -> bool:
+    """Is the taka figure at `pos` followed (within _USD_WINDOW characters) by a figure it is
+    _USD_RATE times -- its own USD equivalent, so the taka figure was read whole? `marked`: a
+    USD / dollar / $ mark must also sit within 200 characters before the figure or between."""
+    page = page or ""
+    for m in _ANY_NUMBER.finditer(page[pos:pos + _USD_WINDOW]):
+        if marked and not _USD_MARK.search(page[max(0, pos - 200):pos + m.start()]):
+            continue
+        w = grouped_value(m.group(1))
+        if w and _USD_RATE[0] <= value / w <= _USD_RATE[1]:
+            return True
+    return False
+
+
+def _one_amount(values: List[float]) -> bool:
+    """One amount (repeated or OCR'd twice within 1%), or the largest is the total of the rest."""
+    top = max(values)
+    others = sorted({round(v) for v in values if v < top * 0.99})
+    return not others or abs(sum(others) - top) <= top * 0.01
+
+
+def balance_check(text: str, program: str, pages: Optional[List[str]] = None) -> List[Tuple[str, str]]:
+    """The minimum balance, read in this order:
+      1. the amount the solvency certificate states: on pages with certificate wording ("solvency",
+         "to whom it may concern", "this is to certify", ...), the figure after a balance / amount /
+         total / BDT / Tk label (straight after "Taka"); with no such page, the figure after a
+         balance label on any page that is not a statement;
+      2. a taka figure the file converts to USD (only certificates do);
+      3. the statement's labelled closing / current / available / ledger / present balance.
+    Only these can PASS. Anything else is a FLAG showing the largest plausible amount. A FAIL needs
+    clear evidence: the certificate's own stated amount, below the minimum, one amount (or the total
+    of the others), confirmed by its USD equivalent or printed twice, and no plausible figure at or
+    above the minimum anywhere in the file; every other low reading is a FLAG."""
+    need = R.MIN_BANK_TAKA[program]
+    pages = [p for p in (pages or []) if p] or [text or ""]
+    every = [v for p in pages for _, v in plausible_money(p)]
+    top = int(max(every)) if every else None
+    cert = [j for j, p in enumerate(pages) if _CERT_WORDS.search(p)]
+    pure = [j for j in cert if not looks_like_statement(pages[j])]
+    if cert:
+        stated = [(j, p, v) for j in (pure or cert)
+                  for p, v in sorted(set(_labelled_balances(pages[j], _CERT_LABELS, 120))
+                                     | set(_labelled_balances(pages[j], _CERT_TAKA_LABELS, 25)))]
+    else:
+        stated = [(j, p, v) for j, pg in enumerate(pages) if not looks_like_statement(pg)
+                  for p, v in _labelled_balances(pg, R.BALANCE_LABELS, 60)]
+    from_cert = bool(stated)
+    if not stated:
+        stated = [(j, p, v) for j, pg in enumerate(pages)
+                  if not looks_like_statement(pg) or _CERT_WORDS.search(pg)
+                  for p, v in plausible_money(pg) if v >= _BALANCE_FLOOR and usd_confirms(pg, p, v, marked=True)]
+        if not stated and text and pages != [text]:
+            pages = pages + [text]          # the whole-file read may hold a figure a page read garbled
+            stated = [(len(pages) - 1, p, v) for p, v in plausible_money(text)
+                      if v >= _BALANCE_FLOOR and usd_confirms(text, p, v, marked=True)]
+    if stated:
+        j, pos, s = max(stated, key=lambda x: x[2])
+        s = int(s)
+        if s >= need:
+            return [(PASS, f"balance {s:,} BDT meets the {need:,} BDT minimum")]
+        if top is not None and top >= need:
+            return [(FLAG, f"the balance reads {s:,} BDT — below the {need:,} BDT minimum for {program} — but "
+                           f"{top:,} BDT also appears in the file; check which is the balance")]
+        values = [v for _, _, v in stated]
+        confirmed = usd_confirms(pages[j], pos, s) or [round(v) for v in values].count(s) >= 2
+        if from_cert and j in pure and _one_amount(values) and confirmed:
+            return [(FAIL, f"the balance is {s:,} BDT — below the {need:,} BDT minimum for {program}")]
+        return [(FLAG, f"the balance reads {s:,} BDT — below the {need:,} BDT minimum for {program} — but it "
+                       "could not be confirmed on the solvency certificate; check by eye")]
+    close = [(p, v) for pg in pages for p, v in _labelled_balances(pg, _CLOSING_LABELS, 60)]
+    if close:
+        c = int(max(v for _, v in close))
+        if c >= need:
+            return [(PASS, f"balance {c:,} BDT meets the {need:,} BDT minimum")]
+        more = f" — but {top:,} BDT also appears in the file" if top is not None and top >= need else ""
+        return [(FLAG, f"the statement's closing balance reads {c:,} BDT — below the {need:,} BDT minimum for "
+                       f"{program}{more}; no solvency amount could be read, check by eye")]
+    if top is not None:
+        return [(FLAG, f"no figure is labelled as the balance; the largest amount is {top:,} BDT — check the "
+                       f"balance against the {need:,} BDT minimum for {program} by eye")]
+    return [(FLAG, "no balance amount could be read")]
+
+
+def sponsor_holder(student: Dict[str, str], text: str = "") -> Tuple[str, str]:
+    """(sponsor kind, whose name the bank account should be in), from the portal's Sponsor.
+    Both parents: whichever parent the document names, the father when it names neither.
+    Self: the applicant. Anyone else: "" (the caller decides)."""
+    kind = sponsor_kind(student.get("Sponsor") or "")
+    father, mother = student.get("Father") or "", student.get("Mother") or ""
+    if kind == "FATHER":
+        return kind, father
+    if kind == "MOTHER":
+        return kind, mother
+    if kind == "PARENTS":
+        if mother and not name_in(text, father) and name_in(text, mother):
+            return kind, mother
+        return kind, father or mother
+    if kind == "SELF":
+        return kind, student.get("Full Name") or ""
+    return kind, ""
 
 
 STATEMENT_DATE_LABELS = (
@@ -682,18 +1393,21 @@ def statement_date(pages: List[str]) -> Optional[dt.date]:
 
 
 def check_bank(text: str, student, sizes, program: str, path=None, others=None) -> List[Tuple[str, str]]:
-    out = []
-    need = R.MIN_BANK_TAKA[program]
-    amounts = find_money_taka(text)
-    if amounts:
-        top = amounts[0]
-        if top >= need:
-            out.append((PASS, f"highest amount {top:,} BDT meets the {need:,} BDT minimum"))
-        else:
-            out.append((FAIL, f"highest amount found is {top:,} BDT — below the {need:,} BDT minimum "
-                              f"for {program}"))
-    else:
-        out.append((FLAG, "no balance amount could be read"))
+    # The file always has the solvency certificate on page 1 and the statement from
+    # page 2 onwards (or the other way round), so the balance and the two dates are read
+    # from their own pages rather than guessed out of one merged block of text.
+    pages: List[str] = []
+    page_error = None
+    if path is not None:
+        try:
+            pages = read_pages(path, max_pages=10)
+        except CODE_FAULTS:
+            raise
+        except Exception as e:
+            page_error = (ERROR, f"could not read the bank file page by page ({_no_path(e, path)})")
+    out = balance_check(text, program, pages)
+    if page_error:
+        out.append(page_error)
     # The USD total belongs on the solvency certificate; a statement never carries one.
     if looks_like_solvency(text):
         out.append((PASS, "solvency amount stated in USD") if has_any(text, R.USD_WORDS)
@@ -719,18 +1433,9 @@ def check_bank(text: str, student, sizes, program: str, path=None, others=None) 
                               "6 months or more (embassies query new accounts)"))
     ctx = others if isinstance(others, dict) else {}
     sponsor = (student.get("Sponsor") or "").upper()
-    who = {"FATHER": student.get("Father", ""), "MOTHER": student.get("Mother", "")}.get(sponsor, "")
+    _, who = sponsor_holder(student, text)
     holder = who or student.get("Full Name", "")
 
-    # The file always has the solvency certificate on page 1 and the statement from
-    # page 2 onwards, so the two dates can be read from their own pages rather than
-    # guessed out of one merged block of text.
-    pages: List[str] = []
-    if path is not None:
-        try:
-            pages = read_pages(path, max_pages=10)
-        except Exception as e:
-            logger.warning("could not read %s page by page: %s", path.name, e)
     if len(pages) >= 2:
         sol = document_date(pages[0])
         stm = statement_date(pages[1:])
@@ -752,12 +1457,17 @@ def check_bank(text: str, student, sizes, program: str, path=None, others=None) 
     elif pages:
         out.append((FLAG, "the bank file has only one page, so it cannot hold both a solvency "
                           "certificate and a statement"))
+    # The statement's own rule (the opening balance) is read from the statement pages; a file
+    # read as one block of text is all there is to go on. The months a statement covers are
+    # not checked: the owner took that rule out on 21 Oct 2026 (statement_period_check stays
+    # for when it comes back).
+    statement = pages[1:] if len(pages) >= 2 else [text]
+    out += opening_balance_check("\n".join(statement), program)
 
     if holder:
         ctx["_account_holder"] = holder
-        parts = [p for p in norm(holder).split() if len(p) > 2]
         out.append((PASS, f"account appears to be in the name of {holder}")
-                   if any(p in norm(text) for p in parts)
+                   if name_in(text, holder)
                    else (FLAG, f"expected account holder '{holder}' (sponsor: {sponsor or 'unknown'}) "
                                "not found in the document"))
     return out
@@ -769,11 +1479,64 @@ def current_fiscal_year() -> str:
     return f"{y}-{y + 1}"
 
 
+_FY_RE = re.compile(r"(?<!\d)(20\d{2})\s*[-–/]\s*(20\d{2}|\d{2})(?![\d]|[-–/.]\d)"
+                    r"|(?<!\d)(20\d{2})\s*(?:a\.?\s?d\b\.?\s*)?(?:t[o0]|till|until)\s*"
+                    r"(?:\d{1,2}\w{0,2}\s+\w+,?\s+)?(20\d{2})(?!\d)",
+                    re.I)                       # "1st July 2025 AD to 30th June 2026", OCR "t0"
+_FY_NEAR = 40
+# "Fiscal Year 2026 2027": OCR dropped the dash. Two bare years count only beside a label.
+_FY_BARE = re.compile(r"(?<![\d/.-])(20\d{2})\s+(20\d{2})(?![\d]|[-–/.]\d)")
+_FY_BEFORE = 15     # "for 2026-2027 financial year": the year just before its label
+
+
+def fiscal_years(text: str) -> List[Tuple[int, int, str]]:
+    """(start, end, "YYYY-YYYY") of every fiscal year written on the page: "2026-2027",
+    "2026-27", "2026/27", "1st July 2026 to 30th June 2027". Two years that are not
+    consecutive are no fiscal year."""
+    out = []
+    for m in _FY_RE.finditer(text or ""):
+        a, b = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4))
+        first = int(a)
+        second = int(b) if len(b) == 4 else first // 100 * 100 + int(b)
+        if second == first + 1:
+            out.append((m.start(), m.end(), f"{first}-{second}"))
+    return out
+
+
+def fiscal_year_check(text: str) -> List[Tuple[str, str]]:
+    """A trade licence must be renewed for the current fiscal year (July-June). The year
+    beside a Fiscal Year / Renewal / Validity label decides; with none labelled, the
+    current year written anywhere is enough; any other year alone is only a FLAG (it may
+    be a footer, a previous renewal or the form's print year). A year counts as labelled within
+    _FY_NEAR characters after its label or _FY_BEFORE characters before it ("for 2026-2027
+    financial year"); two bare years ("Fiscal Year 2026 2027") count only when labelled."""
+    want = current_fiscal_year()
+    years = fiscal_years(text)
+    labels = [(m.start(), m.end()) for m in _label_re(R.FISCAL_LABELS).finditer(text or "")]
+
+    def beside(start: int, end: int) -> bool:
+        return any(0 <= start - le <= _FY_NEAR or 0 <= ls - end <= _FY_BEFORE for ls, le in labels)
+
+    years = sorted(years + [(m.start(), m.end(), f"{m.group(1)}-{m.group(2)}")
+                            for m in _FY_BARE.finditer(text or "")
+                            if int(m.group(2)) == int(m.group(1)) + 1 and beside(m.start(), m.end())])
+    labelled = [fy for start, end, fy in years if beside(start, end)]
+    if labelled:
+        return [(PASS, f"licence fiscal year {want} is the current {want}") if want in labelled
+                else (FAIL, f"licence fiscal year {labelled[0]} is not the current fiscal year ({want})")]
+    if any(fy == want for _, _, fy in years):
+        return [(PASS, f"the current fiscal year {want} is on the licence")]
+    if years:
+        return [(FLAG, f"the licence shows {years[0][2]}, but not beside a Fiscal Year / Renewal / Validity "
+                       f"label — check it is renewed for {want}")]
+    return [(FLAG, "no fiscal year found on the trade licence")]
+
+
 def taxpayer_name(text: str) -> str:
     """The person a TIN certificate is issued to.
 
     Bangladeshi TIN certificates carry no "Taxpayer's Name" field.  The name appears in a
-    sentence: "This is to Certify that MST. KEYA ANJUM is a Registered Taxpayer of
+    sentence: "This is to Certify that MST. SAMPLE MOTHER is a Registered Taxpayer of
     National Board of Revenue ...".  Some also print it beside a label, so both are tried.
     """
     patterns = (
@@ -813,15 +1576,14 @@ def check_financial(text: str, student, sizes, path=None, others=None) -> List[T
     t = norm(text)
     ctx = others if isinstance(others, dict) else {}
     sponsor = (student.get("Sponsor") or "").upper()
-    holder = {"FATHER": student.get("Father", ""), "MOTHER": student.get("Mother", "")}.get(sponsor, "")
-    if sponsor and sponsor not in ("FATHER", "MOTHER"):
+    kind, holder = sponsor_holder(student, text)
+    if kind == "OTHER":            # both parents, or the applicant themself, are fine
         out.append((FLAG, f"portal sponsor is '{sponsor}' — only the applicant's parents may sponsor"))
     # It must be in the name of whoever holds the bank account.
     holder = ctx.get("_account_holder") or holder
     if holder and not is_tin(text):
-        parts = [p for p in norm(holder).split() if len(p) > 2]
         out.append((PASS, f"issued in the bank account holder's name ({holder})")
-                   if any(p in t for p in parts)
+                   if name_in(text, holder)
                    else (FLAG, f"bank account holder '{holder}' not found — the Trade Licence/TIN "
                                "should be in the same name as the bank account"))
     kinds = [k for k, w in (("trade licence", "trade licen"), ("TIN certificate", "taxpayer's identification"),
@@ -831,19 +1593,7 @@ def check_financial(text: str, student, sizes, path=None, others=None) -> List[T
     out.append((PASS, "contains: " + ", ".join(sorted(set(kinds)))) if kinds
                else (FLAG, "could not tell which financial document this is"))
     if "trade licen" in t:
-        years = re.findall(r"20\d{2}\s*[-–]\s*20\d{2}", text)
-        if not years:   # "1st July 2026 to 30th June 2027"
-            m2 = re.search(r"(20\d{2})\s*(?:to|till|until|[-–])\s*(?:\d{1,2}\w{0,2}\s+\w+\s+)?(20\d{2})", text, re.I)
-            if m2 and int(m2.group(2)) == int(m2.group(1)) + 1:
-                years = [f"{m2.group(1)}-{m2.group(2)}"]
-        fy = years[0] if years else None
-        if fy:
-            want = current_fiscal_year()
-            norm_fy = re.sub(r"\s|–", lambda m: "" if m.group() != "–" else "-", fy)
-            out.append((PASS, f"licence fiscal year {fy} is the current {want}") if norm_fy == want
-                       else (FAIL, f"licence fiscal year {fy} is not the current fiscal year ({want})"))
-        else:
-            out.append((FLAG, "no fiscal year found on the trade licence"))
+        out += fiscal_year_check(text)
         m = re.search(r"business start(?:ing)? date\D{0,20}([\d./-]{6,12}|\d{1,2}\s+\w+\s+\d{4})", text, re.I)
         if m:
             d = find_dates(m.group(1))
@@ -872,9 +1622,7 @@ def check_financial(text: str, student, sizes, path=None, others=None) -> List[T
 
     if holder and not ctx.get("_financial_name_done"):
         ctx["_financial_name_done"] = True
-        parts = [w for w in norm(holder).split() if len(w) > 2]
-        here = norm(text)
-        if parts and any(w in here for w in parts):
+        if name_in(text, holder):
             out.append((PASS, f"the bank account holder ({holder}) is named on this document"))
         else:
             named = tin_name or prop_name
@@ -884,8 +1632,7 @@ def check_financial(text: str, student, sizes, path=None, others=None) -> List[T
 
     if tin_name and prop_name and not ctx.get("_tin_vs_trade_done"):
         ctx["_tin_vs_trade_done"] = True
-        a = {w for w in norm(tin_name).split() if len(w) > 2}
-        b = {w for w in norm(prop_name).split() if len(w) > 2}
+        a, b = set(name_tokens(tin_name)), set(name_tokens(prop_name))
         out.append((PASS, f"TIN and trade licence are both in the name of {tin_name}") if a & b
                    else (FLAG, f"the TIN names '{tin_name}' but the trade licence names "
                                f"'{prop_name}' — they should be the same person"))
@@ -895,14 +1642,21 @@ def check_financial(text: str, student, sizes, path=None, others=None) -> List[T
 def check_income_tax(text: str, student, sizes, program: str, path=None) -> List[Tuple[str, str]]:
     out = []
     amounts = find_money_taka(text)
-    paid = [a for a in amounts if a >= R.MIN_TAX_PAID_TAKA]
     if program == "MASTER":
         wealth = [a for a in amounts if a >= R.MIN_NET_WEALTH_TAKA]
         out.append((PASS, f"net wealth figure {wealth[0]:,} BDT meets the 50 lakh guideline") if wealth
                    else (FLAG, "no net wealth of 50 lakh BDT or more found (Master's guideline)"))
-    small = [a for a in find_money_taka(text) if a < 1_000_000]
-    out.append((PASS, f"tax paid figure found ({small[0]:,} BDT)") if small
-               else (FLAG, "no tax paid amount found — at least 10,000 BDT is expected"))
+    # The amount the paper says was paid, of any size: "Tax paid 8,500" is below the
+    # guideline, not "no amount found".
+    paid = labelled_amounts(text, R.TAX_PAID_LABELS, plain=True)
+    need = R.MIN_TAX_PAID_TAKA
+    if not paid:
+        out.append((FLAG, f"no amount labelled as tax paid could be read — at least {need:,} BDT is "
+                          "expected"))
+    elif max(paid) >= need:
+        out.append((PASS, f"tax paid {int(max(paid)):,} BDT (at least {need:,} BDT is expected)"))
+    else:
+        out.append((FLAG, f"tax paid {int(max(paid)):,} BDT — below the {need:,} BDT expected"))
     out.append((PASS, "notarised (wording or seal found)") if notarised(text, path)
                else (FLAG, "income tax papers should be notarised through an advocate"))
     return out
@@ -927,12 +1681,6 @@ CHECKS = {
 
 
 # --- cross-document consistency (the reviewer's first rule) --------------------------
-def name_tokens(name: str) -> List[str]:
-    """Meaningful parts of a name: drops titles like MD / MST and initials."""
-    skip = {"md", "mst", "most", "mohammad", "mohammed", "sk", "mr", "mrs", "late"}
-    return [t for t in norm(name).split() if len(t) > 2 and t not in skip]
-
-
 def readable(text: str) -> bool:
     """Whether OCR produced usable words. Bangladeshi passport data pages and heavy
     stamps often come out as noise, and a name must not be judged 'missing' on those."""
@@ -941,16 +1689,6 @@ def readable(text: str) -> bool:
         return False
     vowelly = sum(1 for w in words if re.search(r"[aeiou]", w, re.I))
     return vowelly / len(words) > 0.6
-
-
-def name_in(text: str, name: str) -> Optional[bool]:
-    """True/False if we can judge, None when the name is unknown."""
-    toks = name_tokens(name)
-    if not toks:
-        return None
-    t = norm(text)
-    hits = sum(1 for tok in toks if tok in t)
-    return hits >= max(1, len(toks) - 1)
 
 
 def cross_checks(texts: Dict[str, str], student: Dict[str, str]) -> List[Dict[str, Any]]:
@@ -982,16 +1720,16 @@ def cross_checks(texts: Dict[str, str], student: Dict[str, str]) -> List[Dict[st
         note = f" (too blurred to read: {', '.join(unreadable)})" if unreadable else ""
         if len(missing) >= 2:       # one document alone is usually an OCR failure
             mismatches.append(f"{who} '{name}' not matched on: {', '.join(missing)}")
-            rows.append({"doc": "CROSS-CHECK name", "file": "", "verdict": FLAG,
+            rows.append({"doc": "CROSS-CHECK name", "file": "", "key": CROSS_CHECK, "verdict": FLAG,
                          "detail": f"FLAG: {who}'s name '{name}' could not be matched on "
                                    f"{len(missing)} documents: {', '.join(missing)} — check whether the "
                                    f"spelling really differs{note}"})
         elif missing:
-            rows.append({"doc": "CROSS-CHECK name", "file": "", "verdict": PASS,
+            rows.append({"doc": "CROSS-CHECK name", "file": "", "key": CROSS_CHECK, "verdict": PASS,
                          "detail": f"PASS: {who}'s name '{name}' consistent (not readable on "
                                    f"{missing[0]} alone){note}"})
         else:
-            rows.append({"doc": "CROSS-CHECK name", "file": "", "verdict": PASS,
+            rows.append({"doc": "CROSS-CHECK name", "file": "", "key": CROSS_CHECK, "verdict": PASS,
                          "detail": f"PASS: {who}'s name '{name}' consistent across the identity documents{note}"})
 
     dob = student.get("DOB", "")
@@ -1001,7 +1739,8 @@ def cross_checks(texts: Dict[str, str], student: Dict[str, str]) -> List[Dict[st
                if k in texts and readable(texts[k]) and d not in find_dates(texts[k])]
         wrong = [k for k in bad if any(abs((x - d).days) < 4000 and x != d
                                        for x in find_dates(texts.get(k, "")))]
-        rows.append({"doc": "CROSS-CHECK date of birth", "file": "", "verdict": FLAG if len(bad) >= 2 else PASS,
+        rows.append({"doc": "CROSS-CHECK date of birth", "file": "", "key": CROSS_CHECK,
+                     "verdict": FLAG if len(bad) >= 2 else PASS,
                      "detail": (f"FLAG: portal date of birth {d} could not be matched on: {', '.join(bad)}"
                                 if len(bad) >= 2 else
                                 f"PASS: date of birth {d} consistent" +
@@ -1009,22 +1748,31 @@ def cross_checks(texts: Dict[str, str], student: Dict[str, str]) -> List[Dict[st
 
     pno = (student.get("Passport No") or "").upper()
     if pno:
-        seen = [R.TITLES.get(k, k) for k, t in texts.items() if pno in re.sub(r"\s+", "", t.upper())]
-        rows.append({"doc": "CROSS-CHECK passport number", "file": "", "verdict": PASS if seen else FLAG,
-                     "detail": (f"PASS: passport number {pno} appears on: {', '.join(seen)}" if seen
+        seen, misread = [], []
+        for k, t in texts.items():
+            how, token = passport_number_on(t, pno)
+            if how:
+                seen.append(R.TITLES.get(k, k))
+                if how == "ocr":
+                    misread.append(f"{R.TITLES.get(k, k)}: {token}")
+        note = f" (read with an OCR misread on {'; '.join(misread)})" if misread else ""
+        rows.append({"doc": "CROSS-CHECK passport number", "file": "", "key": CROSS_CHECK,
+                     "verdict": PASS if seen else FLAG,
+                     "detail": (f"PASS: passport number {pno} appears on: {', '.join(seen)}{note}" if seen
                                 else f"FLAG: passport number {pno} not found on any document")})
 
     if mismatches:
         aff = texts.get("affidavit", "")
         if not aff:
-            rows.append({"doc": "CROSS-CHECK affidavit", "file": "", "verdict": FLAG,
+            rows.append({"doc": "CROSS-CHECK affidavit", "file": "", "key": CROSS_CHECK, "verdict": FLAG,
                          "detail": "FLAG: a name could not be matched across several documents and no "
                                    "affidavit is in the file — if the spellings really differ, an "
                                    "affidavit in the APPLICANT'S name is required (" +
                                    "; ".join(mismatches)[:200] + ")"})
         else:
             ok = name_in(aff, student.get("Full Name", ""))
-            rows.append({"doc": "CROSS-CHECK affidavit", "file": "", "verdict": PASS if ok else FAIL,
+            rows.append({"doc": "CROSS-CHECK affidavit", "file": "", "key": CROSS_CHECK,
+                         "verdict": PASS if ok else FAIL,
                          "detail": ("PASS: affidavit is in the applicant's name and covers the name difference"
                                     if ok else
                                     "FAIL: affidavit does not appear to be in the applicant's name — an "
@@ -1035,14 +1783,71 @@ def cross_checks(texts: Dict[str, str], student: Dict[str, str]) -> List[Dict[st
 # --- per-student run ----------------------------------------------------------------
 def classify(filename: str) -> Optional[str]:
     """Longest matching pattern wins, so "PASSPORT SIZE PHOTO.jpg" is a photo, not a
-    passport, and "FATHER NID.pdf" is not mistaken for a student NID."""
-    n = norm(filename)
+    passport, and "FATHER NID.pdf" is not mistaken for a student NID.
+
+    The name is read as it is and with "_" as a space, so the portal's own key form
+    ("family_cert_1234.pdf") and the ZIP's title form ("FAMILY CERT.pdf") both match."""
+    names = {norm(filename), norm(filename.replace("_", " "))}
     best, best_len = None, 0
     for key, pats in R.FILE_PATTERNS.items():
         for p in pats:
-            if p in n and len(p) > best_len:
+            if len(p) > best_len and any(p in n for n in names):
                 best, best_len = key, len(p)
     return best
+
+
+def _row(title: str, file: str, key: str, findings: List[Tuple[str, str]]) -> Dict[str, Any]:
+    """A document row: its verdict from the findings (common.row_verdict), and `has_error`
+    whenever any finding is ERROR, even under a FAIL, so the row is checked again."""
+    row = {"doc": title, "file": file, "key": key, "verdict": row_verdict(findings),
+           "detail": " | ".join(f"{v}: {d}" for v, d in findings)}
+    if has_error(findings):
+        row["has_error"] = True
+    return row
+
+
+def _error_row(title: str, path: Path, key: str, msg: str) -> Dict[str, Any]:
+    """The file could not be checked at all (locked, unrenderable, OCR broke): ERROR, never
+    a verdict on the document, and retried on the next pass."""
+    return {"doc": title, "file": path.name, "key": key, "verdict": ERROR, "has_error": True,
+            "detail": f"ERROR: could not check this file ({_no_path(msg, path)}) — it is retried on the next pass"}
+
+
+def _stand_ins(program: str, files: Dict[str, List[Path]]) -> Dict[str, str]:
+    """alternative key -> the required key it stands in for, when that one is absent: a
+    deceased parent's death certificate in place of their NID (rules.ALTERNATIVES)."""
+    out: Dict[str, str] = {}
+    for need, alts in R.ALTERNATIVES.items():
+        if need in R.REQUIRED[program] and need not in files:
+            for alt in alts:
+                if alt in files:
+                    out.setdefault(alt, need)
+    return out
+
+
+def _check_file(path: Path, key: str, title: str, student: Dict[str, str], program: str,
+                texts: Dict[str, str], first: Tuple[str, str]) -> Dict[str, Any]:
+    """Read one file and run its rules and page checks. A file that cannot be read or
+    checked is an ERROR row; a fault in this code (CODE_FAULTS) stops the run."""
+    try:
+        text, sizes = read_document(path)
+        if (text or "").lstrip().startswith("[unreadable:"):
+            return _error_row(title, path, key, text.strip().strip("[]"))
+        texts[key] = texts.get(key, "") + "\n" + text
+        checker = CHECKS.get(key)
+        results = checker(text, student, sizes, texts, program, path) if checker else [first]
+        if key != "photo":          # the photo has its own image checks
+            info = PC.inspect(path)
+            results += PC.colour_check(info, key)
+            results += PC.qr_check(info, required=key in R.QR_DOCS, text=text)
+            results += PC.bangla_check(text)
+    except CODE_FAULTS:
+        raise
+    except CheckError as e:
+        return _error_row(title, path, key, str(e) or type(e).__name__)
+    except Exception as e:
+        return _error_row(title, path, key, f"{type(e).__name__}: {_no_path(e, path)}")
+    return _row(title, path.name, key, results)
 
 
 def verify_student(folder: Path, student: Dict[str, str], program: str) -> List[Dict[str, Any]]:
@@ -1055,51 +1860,39 @@ def verify_student(folder: Path, student: Dict[str, str], program: str) -> List[
 
     rows: List[Dict[str, Any]] = []
     texts: Dict[str, str] = {}
+    stands_in = _stand_ins(program, files)
     for key in R.REQUIRED[program] + R.OPTIONAL:
         title = R.TITLES.get(key, key)
         if key not in files:
-            if key in R.REQUIRED[program]:
-                rows.append({"doc": title, "file": "", "verdict": MISSING,
+            if key in R.REQUIRED[program] and key not in stands_in.values():
+                rows.append({"doc": title, "file": "", "key": key, "verdict": MISSING,
                              "detail": "required by the guideline but not uploaded"})
             continue
         for path in files[key]:
-            try:
-                text, sizes = read_document(path)
-            except Exception as e:
-                rows.append({"doc": title, "file": path.name, "verdict": FLAG,
-                             "detail": f"could not read the file ({e})"})
+            if key in R.PRESENCE_ONLY:
+                # never read: no text for the cross-checks, no page checks
+                rows.append(_row(title, path.name, key, [(PASS, "present — recorded as present only "
+                                                                "(not checked)")]))
                 continue
-            texts[key] = texts.get(key, "") + "\n" + text
-            checker = CHECKS.get(key)
-            results = checker(text, student, sizes, texts, program, path) if checker else \
-                [(PASS, "present (no automatic rule for this document)")]
-            if key != "photo":          # the photo has its own image checks
-                info = PC.inspect(path)
-                results += PC.colour_check(info, key)
-                results += PC.qr_check(info, required=key in R.QR_DOCS, text=text)
-                results += PC.bangla_check(text)
-            worst = FAIL if any(v == FAIL for v, _ in results) else \
-                (FLAG if any(v == FLAG for v, _ in results) else PASS)
-            rows.append({"doc": title, "file": path.name, "verdict": worst,
-                         "detail": " | ".join(f"{v}: {d}" for v, d in results)})
+            first = (PASS, "present (no automatic rule for this document)")
+            if key in stands_in:
+                need = stands_in[key]
+                first = (PASS, f"present — accepted in place of the {need.split('_')[0]}'s NID "
+                               f"({R.TITLES.get(need, need)} not needed)")
+            rows.append(_check_file(path, key, title, student, program, texts, first))
     rows += cross_checks(texts, student)
     return rows
 
 
-def student_verdict(rows: List[Dict[str, Any]]) -> str:
-    if any(r["verdict"] == MISSING for r in rows):
-        return "INCOMPLETE"
-    if any(r["verdict"] == FAIL for r in rows):
-        return "FAIL"
-    if any(r["verdict"] == FLAG for r in rows):
-        return "REVIEW"
-    return "PASS"
-
-
 # --- finding students and writing the report ---------------------------------------
-def student_folders() -> Dict[str, Tuple[Path, str]]:
-    """passport -> (folder, folder name) for every downloaded student."""
-    out: Dict[str, Tuple[Path, str]] = {}
+def student_folders(portal: Optional[Mapping[str, Mapping]] = None) -> Dict[str, Tuple[Path, str]]:
+    """passport -> (folder, folder name) for every downloaded student.
+
+    One passport can have two folders, when a student moved program and was downloaded
+    again under the new one. With `portal` (passport -> portal row) the folder in the
+    student's current program wins; otherwise, or when neither is, the folder downloaded
+    last (its .download_complete marker, else the folder itself) wins."""
+    found: Dict[str, List[Path]] = {}
     for root in DOCS_ROOTS:
         if not root.exists():
             continue
@@ -1113,14 +1906,42 @@ def student_folders() -> Dict[str, Tuple[Path, str]]:
             for d in targets:
                 m = re.match(r"(.*?)\s*\(([^)]+)\)$", d.name)
                 if m:
-                    out.setdefault(m.group(2).upper(), (d, d.name))
+                    found.setdefault(m.group(2).upper(), []).append(d)
+    out: Dict[str, Tuple[Path, str]] = {}
+    for pas, dirs in found.items():
+        d = dirs[0] if len(dirs) == 1 else _pick_folder(dirs, (portal or {}).get(pas))
+        out[pas] = (d, d.name)
     return out
 
 
-def portal_students() -> Dict[str, Dict[str, str]]:
-    from src.sheets import progress_builder as pb
+def _downloaded_at(d: Path) -> float:
+    for p in (d / ".download_complete", d):
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            continue
+    return 0.0
+
+
+def _pick_folder(dirs: List[Path], student: Optional[Mapping]) -> Path:
+    if student:
+        from src.sheets import progress_builder as pb
+        from src.sheets.verified_docs import _safe_path_part
+        want = _safe_path_part(pb.PROGRAMS[program_of(dict(student))]["name"])
+        mine = [d for d in dirs if d.parent.name == want]
+        if mine:
+            dirs = mine
+    return max(dirs, key=_downloaded_at)
+
+
+def portal_students(rows: Optional[Iterable[dict]] = None) -> Dict[str, Dict[str, str]]:
+    """passport -> portal row. `rows` (an export already fetched, e.g. a saved snapshot)
+    is used as it is; without it the portal export is fetched."""
+    if rows is None:
+        from src.sheets import progress_builder as pb
+        rows = pb.fetch_all_students()
     out = {}
-    for s in pb.fetch_all_students():
+    for s in rows:
         if s.get("Passport No"):
             out[s["Passport No"].upper()] = s
     return out
@@ -1135,7 +1956,7 @@ def write_report(all_rows: List[Dict[str, Any]], path: Path) -> Path:
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill
     colours = {"PASS": "C6EFCE", "FLAG": "FFEB9C", "FAIL": "FFC7CE", "MISSING": "F2F2F2",
-               "REVIEW": "FFEB9C", "INCOMPLETE": "F2F2F2"}
+               "REVIEW": "FFEB9C", "INCOMPLETE": "F2F2F2", "ERROR": "D9D2E9"}
     path.parent.mkdir(parents=True, exist_ok=True)
     wb = Workbook()
     ws = wb.active
@@ -1153,27 +1974,30 @@ def write_report(all_rows: List[Dict[str, Any]], path: Path) -> Path:
         ws.column_dimensions[col].width = w
 
     ws2 = wb.create_sheet("Summary")
-    ws2.append(["Student", "Passport", "Program", "Verdict", "Missing", "Fail", "Flag", "Pass"])
+    ws2.append(["Student", "Passport", "Program", "Verdict", "Missing", "Fail", "Flag", "Pass", "Error"])
     for c in ws2[1]:
         c.font = Font(bold=True)
     seen = {}
     for r in all_rows:
         k = r["passport"]
         s = seen.setdefault(k, {"student": r["student"], "program": r["program"],
-                                "verdict": r["student_verdict"], "MISSING": 0, "FAIL": 0, "FLAG": 0, "PASS": 0})
+                                "verdict": r["student_verdict"], "MISSING": 0, "FAIL": 0, "FLAG": 0, "PASS": 0,
+                                "ERROR": 0})
         s[r["verdict"]] = s.get(r["verdict"], 0) + 1
     for k, s in seen.items():
-        ws2.append([s["student"], k, s["program"], s["verdict"], s["MISSING"], s["FAIL"], s["FLAG"], s["PASS"]])
+        ws2.append([s["student"], k, s["program"], s["verdict"], s["MISSING"], s["FAIL"], s["FLAG"], s["PASS"],
+                    s["ERROR"]])
         ws2.cell(row=ws2.max_row, column=4).fill = PatternFill("solid", fgColor=colours.get(s["verdict"], "FFFFFF"))
     ws2.freeze_panes = "A2"
-    for col, w in zip("ABCDEFGH", (28, 13, 12, 14, 10, 8, 8, 8)):
+    for col, w in zip("ABCDEFGHI", (28, 13, 12, 14, 10, 8, 8, 8, 8)):
         ws2.column_dimensions[col].width = w
     wb.save(path)
     return path
 
 
 def run(passports: List[str], report_name: str = "") -> Tuple[Path, Dict[str, str]]:
-    folders, portal = student_folders(), portal_students()
+    portal = portal_students()
+    folders = student_folders(portal)
     all_rows, verdicts = [], {}
     stamp = dt.datetime.now().strftime("%Y-%m-%d_%H%M")
     out = REPORT_DIR / (report_name or f"document_check_{stamp}.xlsx")
@@ -1211,7 +2035,8 @@ def main() -> None:
     ap.add_argument("--report", default="", help="report file name")
     args = ap.parse_args()
 
-    folders, portal = student_folders(), portal_students()
+    portal = portal_students()
+    folders = student_folders(portal)
     if args.passport:
         picks = [args.passport.strip().upper()]
     elif args.student:

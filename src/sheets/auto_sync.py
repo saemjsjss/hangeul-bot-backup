@@ -8,13 +8,16 @@ Each run:
      never touched.
   2. Documents — downloads students who became document-verified since the last run into
      <DOCS_ROOT>\\<PROGRAM>\\<NAME (PASSPORT)>\\ and shrinks any file over 2 MB (original
-     backed up).  DOCS_ROOT defaults to the VERIFIED STUDENT DOCUMENTS folder beside the
-     BOT folder; see .env.example.
+     backed up).  A student whose documents changed on the portal is fetched again: a changed
+     document replaces the old copy, which is kept in the student's _replaced folder
+     (verified_docs.run_local).  DOCS_ROOT defaults to the VERIFIED STUDENT DOCUMENTS folder
+     beside the BOT folder; see .env.example.
   3. Review — sends a short Telegram summary of what changed (nothing is sent when
      nothing changed).
   4. Verification — every student whose documents or portal record changed is checked
      against the program guidelines (document check) and against the progress sheet
-     (field check); both Excel reports are refreshed. See src/verify/auto_verify.py.
+     (field check). Its message goes out first, then both Excel reports are written (a report
+     open in Excel never holds the message back). See src/verify/auto_verify.py.
 
 Portal access is read-only (GET) throughout.
 
@@ -272,9 +275,11 @@ def sync_sheets(state: Dict) -> List[str]:
 
 
 # --- 2) verified documents -------------------------------------------------------------
-def sync_docs(cloud: Optional[Dict] = None) -> List[str]:
+def sync_docs(cloud: Optional[Dict] = None, state: Optional[Dict] = None) -> List[str]:
     """Download the newly verified students' documents -> the summary lines. `cloud` (when
-    publishing to Supabase is on) keeps the verified list that was read, for the end of the run."""
+    publishing to Supabase is on) keeps the verified list that was read, for the end of the run;
+    a list that looks wrong (verified_docs.layout_alert) is kept as not read, so Supabase holds
+    back its student_documents. `state` (sheet_state.json) remembers which alerts went out today."""
     started = time.time()
     loop = asyncio.new_event_loop()
     try:
@@ -282,41 +287,102 @@ def sync_docs(cloud: Optional[Dict] = None) -> List[str]:
     finally:
         loop.close()
     if cloud is not None:
-        cloud["documents"], cloud["documents_at"] = result.get("students"), started
-    return doc_lines(result)
+        if result.get("layout_alert"):
+            cloud["documents"], cloud["documents_at"] = None, started
+            cloud["docs_error"] = RuntimeError(result["layout_alert"])
+        else:
+            cloud["documents"], cloud["documents_at"] = result.get("students"), started
+    # result["drive_lookup_error"] (Google Drive could not be asked; run_local logged it and used the
+    # list saved earlier) is no news for Telegram
+    return doc_lines(result, state)
 
 
-def doc_lines(result: Dict[str, list]) -> List[str]:
-    """The summary lines for verified_docs.run_local's result: first downloads ("newly verified")
-    apart from students whose portal files changed and were fetched again, of whom only those who
-    got new files are listed (a re-download that saved nothing is no news)."""
+def _once_a_day(state: Optional[Dict], key: str, line: str) -> List[str]:
+    """[line] the first time it comes up on a day, [] while the same line was already given today:
+    an alert that stands until someone acts on it (the verified list unreadable, the document check
+    stopped) is not repeated every 15 minutes. A new day, or a different line, gives it again.
+    Kept in state["daily_alerts"][key] = {"day", "line"}; no state: always [line]."""
+    if state is None:
+        return [line]
+    today = time.strftime("%Y-%m-%d")
+    alerts = state.setdefault("daily_alerts", {})
+    seen = alerts.get(key)
+    if isinstance(seen, dict) and seen.get("day") == today and seen.get("line") == line:
+        return []
+    alerts[key] = {"day": today, "line": line}
+    return [line]
+
+
+def _doc_row(r) -> Tuple[str, str, int, list, int]:
+    """One of run_local's tuples, (program, name, added, shrunk, replaced): the older 4-item form
+    (before replaced documents were kept) counts as nothing replaced."""
+    prog, name, added, shrunk = r[:4]
+    return prog, name, added or 0, list(shrunk or []), (r[4] or 0) if len(r) > 4 else 0
+
+
+def doc_lines(result: Dict[str, list], state: Optional[Dict] = None) -> List[str]:
+    """The summary lines for verified_docs.run_local's result: first downloads ("newly verified");
+    students whose portal documents changed and were fetched again (every one, also when every file
+    came back the same); students the catch-up sweep compared, only when a document was replaced;
+    and, at most once a day (_once_a_day with `state`), the sweep's circuit breaker and a verified
+    list that looks wrong."""
     lines: List[str] = []
 
-    def entry(prog, name, n_files, shrunk, new_word=""):
-        files = f"{n_files} {new_word}file(s)" if n_files else "no new files (already on this PC)"
-        return (f"   • {name} — {prog}, {files}"
-                + (f", {len(shrunk)} compressed to under 2 MB" if shrunk else ""))
+    def entry(r, new_word="", same=""):
+        prog, name, added, shrunk, replaced = _doc_row(r)
+        parts = []
+        if replaced:
+            parts.append(f"{replaced} document(s) replaced (old copies kept in {vd.REPLACED_DIR})")
+        if added:
+            parts.append(f"{added} {new_word}file(s)")
+        if not parts:
+            parts.append(same)
+        if shrunk:
+            parts.append(f"{len(shrunk)} compressed to under 2 MB")
+        return f"   • {name} — {prog}, " + ", ".join(parts)
 
+    alert = result.get("layout_alert")
+    if alert:
+        lines += _once_a_day(state, "docs_layout", f"⚠️ The verified-students list looks wrong: {alert} "
+                                                   "— downloads paused, nothing reset")
     if result.get("saved"):
         lines.append(f"📁 {len(result['saved'])} newly verified student(s) — documents saved:")
-        for prog, name, n_files, shrunk in result["saved"][:MAX_NAMES * 2]:
-            lines.append(entry(prog, name, n_files, shrunk))
-    changed = [r for r in result.get("redownloaded") or [] if r[2]]
+        for r in result["saved"][:MAX_NAMES * 2]:
+            lines.append(entry(r, same="no new files (already on this PC)"))
+    changed = list(result.get("redownloaded") or [])
     if changed:
-        lines.append(f"📁 {len(changed)} student(s) changed their documents on the portal — new files saved:")
-        for prog, name, n_files, shrunk in changed[:MAX_NAMES * 2]:
-            lines.append(entry(prog, name, n_files, shrunk, "new "))
+        lines.append(f"📁 {len(changed)} student(s) changed their documents on the portal:")
+        for r in changed[:MAX_NAMES * 2]:
+            lines.append(entry(r, "new ", "re-downloaded: every file is the same as before (no document replaced)"))
+    caught = [r for r in result.get("refreshed") or [] if _doc_row(r)[4]]
+    if caught:
+        lines.append(f"📁 {len(caught)} student(s) had documents replaced on the portal earlier that were "
+                     "missed — now saved:")
+        for r in caught[:MAX_NAMES * 2]:
+            lines.append(entry(r, "new "))
+    held = list(result.get("held") or [])
+    if held:
+        block = [f"⚠️ The portal ZIP differs for {sum(h[2] for h in held)} file(s) of {len(held)} student(s) "
+                 "the catch-up check compared — check before replacing (nothing was replaced):"]
+        block += [f"   • {name} — {prog}, {differ} of {files} file(s) differ"
+                  for prog, name, differ, files in held[:MAX_NAMES * 2]]
+        block.append("   To replace them once checked: python -m src.sheets.verified_docs --confirm-replace "
+                     "<passport number>")
+        for shown in _once_a_day(state, "docs_held", "\n".join(block)):
+            lines += shown.split("\n")
     for name, err in result.get("failed") or []:
         lines.append(f"⚠️ Could not download documents for {name}: {err[:120]} (will retry next run)")
     return lines
 
 
 # --- 3) verification of what was downloaded ----------------------------------------------
-def verify_docs(cloud: Optional[Dict] = None) -> List[str]:
-    """Check the documents of every student whose folder or portal record changed, and
-    refresh DOCUMENT CHECK.xlsx / FIELD CHECK.xlsx. Slow (OCR), so each pass takes a few
-    students and the rest wait for the next pass. `cloud` (when publishing to Supabase is on)
-    keeps the check's result, and whether results.json could be read before it."""
+def verify_docs(cloud: Optional[Dict] = None) -> Tuple[List[str], Dict]:
+    """Check the documents of every student whose folder or portal record changed -> (the check's
+    message lines, auto_verify.run's result). Slow (OCR), so each pass takes a few students and
+    the rest wait for the next pass. The DOCUMENT CHECK.xlsx / FIELD CHECK.xlsx reports are not
+    written here: run_once sends the message first, then av.finish_reports(result) writes them.
+    `cloud` (when publishing to Supabase is on) keeps the check's result, and whether results.json
+    could be read before it."""
     from src.verify import auto_verify as av
     if cloud is not None:
         from src.cloud.sheet_hooks import store_readable
@@ -324,7 +390,7 @@ def verify_docs(cloud: Optional[Dict] = None) -> List[str]:
     result = av.run(budget=av.DEFAULT_BUDGET)
     if cloud is not None:
         cloud["verify"] = result
-    return av.summary_lines(result)
+    return av.summary_lines(result), result
 
 
 # --- 4) Telegram review ----------------------------------------------------------------
@@ -409,6 +475,78 @@ def _failure_cleared(state: Dict, key: str, label: str) -> List[str]:
         if n >= REPORT_AFTER_FAILURES else []
 
 
+# The document check's lines that stand until someone acts (results.json unreadable, the check
+# paused): given at most once a day (_once_a_day), under these keys.
+STANDING_CHECK_LINES = (("⚠️ Document check stopped", "verify_stopped"),
+                        ("⚠️ Document check paused", "verify_paused"),
+                        ("⚠️ results.json", "verify_restored"))
+
+
+def _report_notes(state: Optional[Dict], notes: List[str]) -> List[str]:
+    """av.finish_reports' notes, each at most once a day per report: a report left open in Excel
+    all day is said once, not on every pass that rewrites it (the note's own time is left out of
+    the comparison)."""
+    out = []
+    for note in notes:
+        m = re.match(r"📄 (.+?)\.xlsx", note)
+        stable = re.sub(r"\(updated \d{2}-\d{2}\)", "(updated)", note)
+        if _once_a_day(state, "report_note:" + (m.group(1) if m else "reports"), stable):
+            out.append(note)
+    return out
+
+
+def _verify_step(state: Dict, cloud: Optional[Dict], send: bool) -> List[str]:
+    """The document check (verify_docs) and its messages, in this order: the check's own lines
+    under CHECK_TITLE, a rules roll-out's summary under av.ROLLOUT_TITLE (marked sent in
+    results.json only once Telegram accepted it, av.mark_rollout_announced; otherwise the next
+    pass hands it out again), and only then the two reports (av.finish_reports, which never
+    raises), whose note (a report open in Excel was saved under another name) follows under
+    CHECK_TITLE, at most once a day per report. So a report left open in Excel never holds a
+    message back. Each message Telegram accepted goes into cloud["sent"]. A check that could not
+    run is counted like the other steps (_failure_line: told from the 3rd run in a row on).
+    -> every line given."""
+    from src.verify import auto_verify as av
+
+    accepted = {}
+
+    def give(msg_lines: List[str], title: str) -> List[str]:
+        if not msg_lines:
+            return []
+        print(chr(10).join(msg_lines))
+        accepted[title] = None
+        if send and notify(msg_lines, title=title):
+            accepted[title] = time.time()
+            if cloud is not None:
+                cloud["sent"].append((title, list(msg_lines), accepted[title]))
+        return list(msg_lines)
+
+    try:
+        vlines, result = verify_docs(cloud)
+    except Exception as e:
+        if cloud is not None:
+            cloud["verify_error"] = e
+        return give(_failure_line(state, "verify", "Document check", e), CHECK_TITLE)
+    shown: List[str] = []
+    for line in vlines:
+        key = next((k for prefix, k in STANDING_CHECK_LINES if line.startswith(prefix)), None)
+        shown += _once_a_day(state, key, line) if key else [line]
+    shown += _failure_cleared(state, "verify", "Document check")
+    out = give(shown, CHECK_TITLE)
+    rollout = list((result or {}).get("rollout_lines") or [])
+    if rollout:
+        out += give(rollout, av.ROLLOUT_TITLE)
+        at = accepted.get(av.ROLLOUT_TITLE)
+        if at is not None:              # sent: marked so; refused (or not sending): handed out again next pass
+            av.mark_rollout_announced(result.get("rollout_complete"),
+                                      time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(at)))
+    try:
+        notes = list(av.finish_reports(result) or [])
+    except Exception as e:
+        logger.warning("The document check reports could not be written: %s", e)
+        notes = []
+    return out + give(_report_notes(state, notes), CHECK_TITLE)
+
+
 def run_once(send: bool = True, verify: bool = True) -> List[str]:
     DATA_DIR.mkdir(exist_ok=True)
     if _lock_held(LOCK_PATH):
@@ -438,7 +576,7 @@ def run_once(send: bool = True, verify: bool = True) -> List[str]:
         finally:
             STATE_PATH.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
         try:
-            lines += _with_retries(lambda: sync_docs(cloud), "Document download")
+            lines += _with_retries(lambda: sync_docs(cloud, state), "Document download")
             lines += _failure_cleared(state, "docs", "Document download")
         except Exception as e:
             lines += _failure_line(state, "docs", "Document download", e)
@@ -458,18 +596,11 @@ def run_once(send: bool = True, verify: bool = True) -> List[str]:
         # and reports separately. A problem here must never fail the sync.
         if verify:
             try:
-                vlines = verify_docs(cloud)
+                lines += _verify_step(state, cloud, send)
             except Exception as e:
-                logger.warning("Document check could not run: %s", e)
-                vlines = []
-                if cloud is not None:
-                    cloud["verify_error"] = e
-            if vlines:
-                print(chr(10).join(vlines))
-                if send:
-                    if notify(vlines, title=CHECK_TITLE) and cloud is not None:
-                        cloud["sent"].append((CHECK_TITLE, list(vlines), time.time()))
-                lines += vlines
+                logger.warning("Document check messages could not be given: %s", e)
+            finally:
+                STATE_PATH.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
         # Last of all, when the sheets, the documents and Telegram are done: hand what was read
         # to the Supabase publisher (its own process; this run never waits for it).
         if cloud is not None:

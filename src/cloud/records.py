@@ -1183,13 +1183,21 @@ def doc_verdicts(passport: str, entry: Mapping[str, Any], ids: Any = None) -> Li
     return unique_keys(out)
 
 
+# What a document-check record says about the check itself, kept in doc_check's data when the
+# record has it (records written before the rules were versioned have neither, and their hash
+# stays as it was). Not "evaluated_at": it moves at every daily re-evaluation, even one that
+# changed nothing, and would send every student's doc_check again each day.
+DOC_CHECK_FACTS = ("rules_version", "max_pages")
+
+
 def doc_checks(documents: Mapping[str, Any], fields: Optional[Mapping[str, Any]] = None,
                ids: Optional[Mapping[str, Any]] = None) -> List[Dict[str, Any]]:
     """kind doc_check (added: the student-level result, which no document row carries), key = the
-    passport, scope all: results.json documents[P] (student, program, verdict, when checked) with
-    its rows' verdict counts and the field check's result counts. `ids`: {passport: (uid, HNG id)}
-    of the students known (src.cloud.student_index). Publish it with read_at = when the store was
-    read (each record's own read_at is the time it was checked)."""
+    passport, scope all: results.json documents[P] (student, program, verdict, when checked, and
+    the rules version and page limit it was checked with, when the record has them:
+    DOC_CHECK_FACTS) with its rows' verdict counts and the field check's result counts. `ids`:
+    {passport: (uid, HNG id)} of the students known (src.cloud.student_index). Publish it with
+    read_at = when the store was read (each record's own read_at is the time it was checked)."""
     out = []
     for passport, entry in (documents or {}).items():
         if not isinstance(entry, Mapping):
@@ -1203,9 +1211,11 @@ def doc_checks(documents: Mapping[str, Any], fields: Optional[Mapping[str, Any]]
         for row in ((fields or {}).get(passport) or {}).get("rows") or []:
             v = str(row.get("result") or "")
             fcounts[v] = fcounts.get(v, 0) + 1
-        data, uid, hng = _with_ids({"student": entry.get("student", ""), "program": entry.get("program", ""),
-                                    "verdict": entry.get("verdict", ""), "checked": entry.get("checked", ""),
-                                    "document_rows": counts, "field_rows": fcounts}, (ids or {}).get(pas))
+        data = {"student": entry.get("student", ""), "program": entry.get("program", ""),
+                "verdict": entry.get("verdict", ""), "checked": entry.get("checked", ""),
+                "document_rows": counts, "field_rows": fcounts}
+        data.update({k: entry[k] for k in DOC_CHECK_FACTS if entry.get(k) not in (None, "")})
+        data, uid, hng = _with_ids(data, (ids or {}).get(pas))
         text = _paragraph(
             _sentence("Document check result" + (f" of {entry.get('student')}" if entry.get("student") else "")
                       + _ids(pas, entry.get("program") or "", hng, _uid_text(uid))
@@ -1221,7 +1231,8 @@ def doc_checks(documents: Mapping[str, Any], fields: Optional[Mapping[str, Any]]
 
 def field_checks(passport: str, entry: Mapping[str, Any], ids: Any = None) -> List[Dict[str, Any]]:
     """kind field_check, key passport|field, scope = the passport: results.json fields[passport]'s
-    rows (FIELD CHECK: the portal value, MATCH / DIFFERS / UNREADABLE / NO DOCUMENT / BLANK, why).
+    rows (FIELD CHECK: the portal value, MATCH / DIFFERS / NOT CONFIRMED / UNREADABLE / NO DOCUMENT
+    / BLANK, why).
     `ids`: the student's (portal uid, HNG id) when known."""
     pas = _passport(passport) or str(passport)
     out = []
@@ -1432,11 +1443,25 @@ def _newest_check_day(section: Mapping[str, Any]) -> str:
     return max((d for d in days if d), default="")
 
 
+def _counts(rows: Iterable[Mapping[str, Any]], field: str, always: Sequence[str],
+            when_any: Sequence[str]) -> Dict[str, int]:
+    """How many rows have each value of `field`: every value in `always` (0 included), then each
+    in `when_any` only when a row has it (a value the store did not know before keeps the
+    report's text as it was where no row has it)."""
+    rows = [r for r in rows or [] if isinstance(r, Mapping)]
+    counts = {k: sum(1 for r in rows if r.get(field) == k) for k in always}
+    for k in when_any:
+        n = sum(1 for r in rows if r.get(field) == k)
+        if n:
+            counts[k] = n
+    return counts
+
+
 def document_check_report(store: Mapping[str, Any]) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
     """DOCUMENT CHECK.xlsx's content from the store it is built from (results.json, as
     auto_verify.write_document_report does): -> (report "document_check|<day of the newest
-    check>", one section per student: verdict and its Missing/Fail/Flag/Pass counts). (None, [])
-    when the store holds no student."""
+    check>", one section per student: verdict and its Missing/Fail/Flag/Pass counts, and Error
+    when a file could not be checked). (None, []) when the store holds no student."""
     docs = {p: e for p, e in (store.get("documents") or {}).items() if isinstance(e, Mapping)}
     when = _newest_check_day(docs)
     if not docs or not when:
@@ -1444,7 +1469,7 @@ def document_check_report(store: Mapping[str, Any]) -> Tuple[Optional[Dict[str, 
     sections = []
     verdicts: Dict[str, int] = {}
     for pas, e in sorted(docs.items(), key=lambda kv: (str(kv[1].get("program")), str(kv[1].get("student")))):
-        counts = {k: sum(1 for r in e.get("rows") or [] if r.get("verdict") == k) for k in ("MISSING", "FAIL", "FLAG", "PASS")}
+        counts = _counts(e.get("rows"), "verdict", ("MISSING", "FAIL", "FLAG", "PASS"), ("ERROR",))
         if e.get("verdict"):
             verdicts[str(e["verdict"])] = verdicts.get(str(e["verdict"]), 0) + 1
         who = _joined(e.get("student"), f"({_joined(pas, e.get('program'), sep=', ')})")
@@ -1461,8 +1486,9 @@ def document_check_report(store: Mapping[str, Any]) -> Tuple[Optional[Dict[str, 
 
 def field_check_report(store: Mapping[str, Any]) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
     """FIELD CHECK.xlsx's content from results.json (auto_verify.write_field_report): -> (report
-    "field_check|<day of the newest check>", one section per student with its result counts and
-    the fields that differ, and a Corrections section when there are any). (None, []) when empty."""
+    "field_check|<day of the newest check>", one section per student with its result counts (NOT
+    CONFIRMED only when a field has it) and the fields that differ, and a Corrections section
+    when there are any). (None, []) when empty."""
     fields = {p: e for p, e in (store.get("fields") or {}).items() if isinstance(e, Mapping)}
     when = _newest_check_day(fields)
     if not fields or not when:
@@ -1470,8 +1496,8 @@ def field_check_report(store: Mapping[str, Any]) -> Tuple[Optional[Dict[str, Any
     sections = []
     for pas, e in sorted(fields.items(), key=lambda kv: (str(kv[1].get("program")), str(kv[1].get("student")))):
         rows = e.get("rows") or []
-        counts = {k: sum(1 for r in rows if r.get("result") == k)
-                  for k in ("MATCH", "DIFFERS", "UNREADABLE", "NO DOCUMENT", "BLANK")}
+        counts = _counts(rows, "result", ("MATCH", "DIFFERS", "UNREADABLE", "NO DOCUMENT", "BLANK"),
+                         ("NOT CONFIRMED",))
         differ = [_joined(r.get("field") and f"{r.get('field')}:", r.get("portal") and f"portal {r.get('portal')}",
                           r.get("detail") and f"— {r.get('detail')}")
                   for r in rows if r.get("result") == "DIFFERS"]

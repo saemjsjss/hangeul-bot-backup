@@ -6,7 +6,9 @@ What is pinned here:
                   its sections) and each notice Telegram accepted (notification); after the document
                   check, the checked passports' doc_verdict, field_check and doc_page_text (each
                   passport its own complete scope) and, from the whole store, doc_check,
-                  field_correction and the DOCUMENT CHECK / FIELD CHECK reports
+                  field_correction and the DOCUMENT CHECK / FIELD CHECK reports; a check that
+                  stopped on an unreadable results.json sends none of the store's kinds
+                  (re-evaluation and its republishing: tests/test_cloud_verify_refresh.py)
   missing report  the daily report and a section per incomplete student, the text as sent; a report
                   that could not be built: its notice and the reason; /missing's list per program
   /stage          student_progress of the pages read (never complete: one intake is not everyone)
@@ -51,7 +53,7 @@ from src.sheets import verified_docs as vd  # noqa: E402
 from src.verify import auto_verify as av  # noqa: E402
 from src.verify import doc_verifier as dv  # noqa: E402
 
-PASSPORT = "A01234567"
+PASSPORT = "A99900001"
 NAME = "TEST STUDENT ONE"
 SCAN = "passport_425_1790000000.jpg"
 
@@ -187,8 +189,15 @@ def sync(monkeypatch, tmp_path):
                                       "sizes": [[800, 600]]},
         f"PAGES:{SCAN}:1234:1790000000:20": {"pages": ["PEOPLE'S REPUBLIC OF BANGLADESH PASSPORT TEST STUDENT ONE"],
                                              "sideways": []}}), encoding="utf-8")
-    monkeypatch.setattr(dv, "student_folders", lambda: {PASSPORT: (folder, folder.name)})
+    # The folders as doc_verifier finds them with the portal rows given (sheet_hooks passes this
+    # run's export: never the portal itself, never a lookup without the rows).
+    monkeypatch.setattr(dv, "portal_students", lambda rows=None: {
+        str(r.get("Passport No") or "").upper(): r for r in rows or [] if r.get("Passport No")})
+    monkeypatch.setattr(dv, "student_folders", lambda portal=None: {PASSPORT: (folder, folder.name)} if portal else {})
     monkeypatch.setattr(av, "run", lambda budget=6, only=None, recheck=False: world.result)
+    # auto_sync writes the reports after its messages (av.finish_reports): the stub result has no
+    # reports_due, and no report path of the live data folder is ever touched.
+    monkeypatch.setattr(av, "finish_reports", lambda result: [], raising=False)
     return world
 
 
@@ -369,16 +378,21 @@ def test_a_hook_that_breaks_is_one_line_and_the_sync_goes_on(sync, cloud, monkey
         "Supabase publish failed (portal_sync): the records could not be built (RuntimeError)"]
 
 
-def test_an_unreadable_store_sends_only_the_passports_just_checked(sync, cloud):
-    av.STORE_PATH.write_text("{ not json", encoding="utf-8")            # auto_verify starts from an empty store
-    fresh = {"documents": {PASSPORT: STORE["documents"][PASSPORT]}, "fields": {}, "corrections": []}
-    sync.result = {"checked": CHECKED, "waiting": 0, "skipped": [], "store": fresh}
+def test_an_unreadable_store_stops_the_check_and_holds_back_store_wide_kinds(sync, cloud):
+    av.STORE_PATH.write_text("{ not json", encoding="utf-8")            # no good backup either: the check stops
+    sync.result = {"checked": [], "waiting": 0, "skipped": [], "store": {},
+                   "store_error": "results.json could not be read (no good backup) — nothing was overwritten"}
     with telegram():
         auto_sync.run_once()
+    assert av.STORE_PATH.read_text(encoding="utf-8") == "{ not json"   # left as it was
     doc, kinds = handed(cloud)
-    assert "doc_verdict" in kinds and "doc_check" not in kinds
+    assert "doc_verdict" not in kinds and "doc_check" not in kinds and "field_correction" not in kinds
     assert {b["scope"] for b in kinds["report"]} == {"sync_summary"}      # no DOCUMENT/FIELD CHECK from it
-    assert "results.json: unreadable before the document check (it started from an empty store)" in doc["failed_reads"]
+    assert "results.json: unreadable before the document check (the check stopped; nothing was overwritten)" \
+        in doc["failed_reads"]
+    assert not any("empty store" in f for f in doc["failed_reads"])
+    publish.process_file(cloud.spawned[0])
+    assert list(cloud.fake.runs.values())[0]["status"] == "partial"
 
 
 def test_a_check_that_could_not_run_is_a_failed_read(sync, cloud, monkeypatch):
@@ -398,21 +412,21 @@ def test_passports_supabase_never_accepted_are_sent_a_few_a_run(cloud, monkeypat
     monkeypatch.setattr(sheet_hooks, "CATCH_UP_PASSPORTS", 1)
     monkeypatch.setattr(av, "TEXT_DIR", tmp_path / "text")
     entry = STORE["documents"][PASSPORT]
-    store = {"documents": {"B01234567": dict(entry), "C01234567": dict(entry)}, "fields": {}, "corrections": []}
+    store = {"documents": {"A99900002": dict(entry), "A99900003": dict(entry)}, "fields": {}, "corrections": []}
     result = {"checked": [], "waiting": 0, "store": store}
 
     def scopes(batches):
         return sorted({r["scope"] for b in batches if b["kind"] == "doc_verdict" for r in b["rows"]})
 
     first, _ = sheet_hooks.verify_batches(result, True, folders={})
-    assert scopes(first) == ["B01234567"]
+    assert scopes(first) == ["A99900002"]
     publish.publish_batches("portal_sync", first)
     second, _ = sheet_hooks.verify_batches(result, True, folders={})
-    assert scopes(second) == ["C01234567"]
+    assert scopes(second) == ["A99900003"]
     publish.publish_batches("portal_sync", second)
     third, _ = sheet_hooks.verify_batches(result, True, folders={})
     assert scopes(third) == []                                           # both are in Supabase now
-    assert cloud.fake.keys("doc_verdict", "B01234567") and cloud.fake.keys("doc_verdict", "C01234567")
+    assert cloud.fake.keys("doc_verdict", "A99900002") and cloud.fake.keys("doc_verdict", "A99900003")
 
 
 def test_nothing_is_kept_or_built_while_publishing_is_off(sync, cloud, monkeypatch):
@@ -648,21 +662,21 @@ def issues(portal, monkeypatch, tmp_path):
     portal.pages["students.php"] = page(
         with_details(row(1, 1, NAME, hng="HNG-2026-905"), Passport_No=PASSPORT),
         with_details(row(2, 2, "TEST STUDENT TWO", hng="HNG-2026-906"), Passport_No="PENDING"),
-        with_details(row(3, 3, "TEST STUDENT THREE", hng="HNG-2026-907"), Passport_No="B07654321"))
+        with_details(row(3, 3, "TEST STUDENT THREE", hng="HNG-2026-907"), Passport_No="A99900004"))
     portal.pages["student_edit.php?id=1"] = edit_page(1, NAME, PASSPORT, "2024-01-02")
-    portal.pages["student_edit.php?id=3"] = edit_page(3, "TEST STUDENT THREE", "B07654321", "2023-05-05")
+    portal.pages["student_edit.php?id=3"] = edit_page(3, "TEST STUDENT THREE", "A99900004", "2023-05-05")
     return portal
 
 
 def test_the_refresh_hands_over_the_issue_dates_and_every_profile_it_read(issues, cloud, monkeypatch):
     run_main(passport_issue, monkeypatch, "--refresh")
     assert json.loads(passport_issue.CACHE_PATH.read_text(encoding="utf-8")) == {
-        "by_passport": {PASSPORT: "2024-01-02", "B07654321": "2023-05-05"}}
+        "by_passport": {PASSPORT: "2024-01-02", "A99900004": "2023-05-05"}}
     assert {m for m, _ in issues.asked} == {"GET"}
     doc, kinds = handed(cloud)
     assert doc["job"] == "issue_refresh"
     dates, = kinds["passport_issue"]
-    assert (dates["scope"], dates["complete"], keys(dates)) == ("all", True, [PASSPORT, "B07654321"])
+    assert (dates["scope"], dates["complete"], keys(dates)) == ("all", True, [PASSPORT, "A99900004"])
     profiles, = kinds["student_profile"]
     assert (profiles["scope"], profiles["complete"], keys(profiles)) == (None, True, ["1", "3"])
     one = [r for r in profiles["rows"] if r["key"] == "1"][0]
