@@ -142,9 +142,12 @@ def pages_label(pages: Iterable[int]) -> str:
 
 
 def where(u: DocUnit, mode: str) -> str:
-    """"p6-7" in a bundle; the input file name in a folder."""
+    """"p6-7" in a bundle; the input file name in a folder, with the pages inside it when the unit is one of
+    several documents cut out of that file ("FINANCIAL DOCUMENTS.pdf p4-5", revision 2.3)."""
     if mode == "folder":
-        return u.source_file or (u.path.name if u.path else pages_label(u.pages))
+        name = u.source_file or (u.path.name if u.path else pages_label(u.pages))
+        part = getattr(u, "part", "")
+        return f"{name} {part}" if part and u.source_file else name
     return pages_label(u.pages)
 
 
@@ -253,6 +256,7 @@ def summary_lines(r: RunResult, out: Optional[Path] = None) -> List[Tuple[str, s
             L.append((NOTE, f"NOTE: {n.message}"))
     if r.overall == STOP:
         L.extend(("", s) for s in _page_types_lines(r))
+        L.extend(not_checked_lines(r))
         L.append(("", _report_line(out)))
         return _fit(L)
     present_only = [d for d in r.docs if d.unit.key == "id_card_cv"]
@@ -294,8 +298,23 @@ def summary_lines(r: RunResult, out: Optional[Path] = None) -> List[Tuple[str, s
     if present_only:
         L.append((PRESENT, "Not checked (present): " + "; ".join(
             f"{title_of(d.unit)} ({where(d.unit, r.mode)})" for d in present_only)))
+    L.extend(not_checked_lines(r))
     L.append(("", _report_line(out)))
     return _fit(L)
+
+
+def not_checked_lines(r: RunResult) -> List[Tuple[str, str]]:
+    """Folder mode (revision 2.3): "Not checked (not a PDF or image): <file>; <file>" and "Not checked (could not
+    be opened): <file>", one line per reason, for the files the runner could not read. Never a document line,
+    never a slot, never a verdict."""
+    by: Dict[str, List[str]] = {}
+    for item in (getattr(r, "not_checked", None) or []):
+        try:
+            name, why = item
+        except (TypeError, ValueError):
+            continue
+        by.setdefault(str(why), []).append(str(name))
+    return [("", f"Not checked ({why}): " + "; ".join(names)) for why, names in by.items()]
 
 
 def _report_line(out: Optional[Path]) -> str:

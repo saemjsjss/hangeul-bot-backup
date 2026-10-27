@@ -176,8 +176,9 @@ def _run(m: _Modules, rs: _Run, input_path: Path, program: str, out: Path, *, to
     clock = rs.clock
     with clock("ingest"):
         src = m.ingest.open_input(input_path)
+    not_checked = [tuple(x) for x in (getattr(src, "not_checked", None) or [])]
     rs.partial.update(case_id=src.case_id, mode=src.mode, input=str(input_path), program=program,
-                      today=today.isoformat())
+                      today=today.isoformat(), not_checked=not_checked)
     given = None
     if page_texts is not None:                    # before the engine loads: a foreign file refuses fast (exit 2)
         with clock("engine"):
@@ -310,7 +311,7 @@ def _run(m: _Modules, rs: _Run, input_path: Path, program: str, out: Path, *, to
                       input=str(input_path), program=program, today=today.isoformat(), reading=reading, pages=pages,
                       types=types, split=res, identity=ident, births=list(births.values()), docs=docs, cross=cross,
                       notices=notices, missing_lines=list(missing), overall=overall, headline=headline,
-                      timings=clock.t, safety=safety_info)
+                      timings=clock.t, safety=safety_info, not_checked=not_checked)
         REPORT.write_all(r, out, extra)
     rs.log.append(f"result {overall} | {headline}")
     _write_log(m, rs, r)
@@ -373,9 +374,15 @@ def _cut_and_attach(m: _Modules, eng: Any, src: Any, res: Any, pages: List[PageR
                     docs_dir: Path) -> None:
     """Bundle: cut every unit, attach the paths, prime every cut (one read per page, always), then crop the photo
     (doccheck.crop_photo; the photo unit's path becomes the crop, or None when no photo edge was found).
-    Folder: attach the staged copies (no priming: the bot reads each file as it does on folders)."""
+    Folder: attach the staged copies (no priming: the bot reads each file as it does on folders). A unit that is
+    one of several documents of its file (DocUnit.part, revision 2.3) gets its own cut of the staged copy, so its
+    checks read only its pages. Revision 2.4: that cut is NOT primed either. The bot reads it as it reads every
+    folder file (its own read, the whole-file read_document included); priming it with the run's page texts took
+    that read away from the bot's rules for parts only (owner folder 3: the bank balance the bot's own read prints
+    in full, the run's page read splits, so the part's balance became a FLAG while the uncut file had PASSed)."""
     if src.mode != "bundle":
         m.split.attach_paths(res, staged)
+        _cut_parts(m, eng, res, pages, staged, docs_dir / "parts")
         return
     paths = eng.cut(src.root, m.split.cut_plan(res), docs_dir)
     m.split.attach_paths(res, paths)
@@ -393,6 +400,25 @@ def _cut_and_attach(m: _Modules, eng: Any, src: Any, res: Any, pages: List[PageR
             else docs_dir / f"PASSPORT SIZE PHOTO p{u.pages[0] + 1:02d}.jpg"
         img = eng.page_image_of(pages[u.pages[0]], 300)
         u.path = m.doccheck.crop_photo(eng, img, target)
+
+
+def _cut_parts(m: _Modules, eng: Any, res: Any, pages: List[PageRead], staged: Dict[str, Path],
+               parts_dir: Path) -> None:
+    """Folder mode (revision 2.3): cut every part unit out of its staged file (pages inside the file) and attach the
+    cut. The cut's name is split.unit_file_name(u) (run pages: unique in the run, and dv.classify of it gives the
+    unit's key back). Revision 2.4: the cut is not primed (the bot reads it itself, as every folder file)."""
+    by_file: Dict[str, List[DocUnit]] = {}
+    for u in res.units:
+        if getattr(u, "part", "") and u.pages and u.source_file in staged:
+            by_file.setdefault(u.source_file, []).append(u)
+    for fname, us in by_file.items():
+        plan = [(m.split.unit_file_name(u), int(pages[u.pages[0]].file_page), int(pages[u.pages[-1]].file_page))
+                for u in us]
+        paths = list(eng.cut(staged[fname], plan, parts_dir))
+        if len(paths) != len(us):
+            raise ValueError(f"{len(paths)} cut files for {len(us)} parts of one file")
+        for u, p in zip(us, paths):
+            u.path = Path(p)
 
 
 def _financial(m: _Modules, rs: _Run, units: List[DocUnit], pages: List[PageRead], tin_raw: Dict[str, Any],

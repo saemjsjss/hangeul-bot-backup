@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from . import names, strict
+from . import birth, names, strict
 from .model import FLAG, NOTE, BirthFacts, DocUnit, Finding, Identity, NameRef, PageRead
 
 SOURCE = "runner:identity"
@@ -277,9 +277,29 @@ def _tail_on_another_page(person: str, longer: str, unit: str, page: int,
     return False
 
 
+def _qr_parent_names(births: Optional[Dict[Tuple[int, ...], BirthFacts]], unit: str, pages_of_unit: Sequence[int],
+                     person: str) -> List[str]:
+    """Revision 2.3: the parent's name a decoded birth-certificate QR payload carries (machine read, letters only),
+    for the certificate whose pages hold the reference's page; [] when the payload carries none (the genuine bdris
+    link carries an opaque key)."""
+    out: List[str] = []
+    for key, facts in (births or {}).items():
+        if pages_of_unit and not set(pages_of_unit) & set(key):
+            continue
+        if getattr(facts, "qr_status", "") != "decoded":
+            continue
+        name = birth.qr_names(facts).get(person, "")
+        if name:
+            out.append(name)
+    return out
+
+
 def _parent_refs(ident: Identity, reads: List["names.Read"], pages: List[PageRead],
-                 confirm: Callable[[int, str], str]) -> None:
-    """Step 3: the parents' canonical names (A3), every other unit's reads as vocabulary (critique 4)."""
+                 confirm: Callable[[int, str], str],
+                 births: Optional[Dict[Tuple[int, ...], BirthFacts]] = None) -> None:
+    """Step 3: the parents' canonical names (A3), every other unit's reads as vocabulary (critique 4). Revision
+    2.3: a parent's name the birth certificate's QR payload carries confirms the printed reference (and its tail)
+    when the letters agree (any order, dots aside)."""
     ident.notes = [n for n in ident.notes if n.rule not in _PARENT_RULES]
     for person in ("father", "mother"):
         d = names.canonical_detail(person, reads, None, reads)
@@ -292,11 +312,15 @@ def _parent_refs(ident: Identity, reads: List["names.Read"], pages: List[PageRea
                 # and names.evaluate FLAGs it on the birth certificate (never a silent PASS).
                 longer = f"{written} {d.get('tail_written') or ' '.join(tail)}"
                 if (_tail_on_another_page(person, longer, d["unit"], pg, reads)
+                        or any(strict.compare(q, longer, any_order=True, dots=False) == "EQUAL"
+                               for q in _qr_parent_names(births, d["unit"], (pg,), person))
                         or confirm(pg, longer) == "confirmed"):
                     written, tail = longer, ()
             ref = NameRef(parts=tuple(strict.words(written)), written=written, source=d["how"],
                           unit=d["unit"], pages=(pg,) if pg >= 0 else (), tail=tail)
-            ref.confirmed = _confirmed_elsewhere(written, d["unit"], pg, reads, confirm)
+            ref.confirmed = (any(strict.compare(q, written, any_order=True, dots=False) == "EQUAL"
+                                 for q in _qr_parent_names(births, d["unit"], (pg,) if pg >= 0 else (), person))
+                             or _confirmed_elsewhere(written, d["unit"], pg, reads, confirm))
             if d["how"] == "passport field":
                 ident.notes.append(_note(NOTE, "identity.parents_from_passport",
                                          f"the {person}'s name is taken from the passport's {person.capitalize()}'s "
@@ -459,7 +483,7 @@ def build_identity(units: List[DocUnit], pages: List[PageRead], births: Dict[Tup
     ident.student = student
 
     # 3. the parents (A3), every unit as vocabulary (critique 4)
-    _parent_refs(ident, reads, pages, confirm)
+    _parent_refs(ident, reads, pages, confirm, births)
 
     # 4. date of birth: the trusted MRZ first; untrusted fallbacks
     d = dv.mrz_dob(best) if best else None
@@ -524,7 +548,7 @@ def finish_identity(ident: Identity, units: List[DocUnit], pages: List[PageRead]
     name is still unknown, that NID's name becomes the reference. A position-only role never does."""
     confirm = confirm or names._unclear
     reads, _ = names.collect_reads(units, pages, births, money=True)
-    _parent_refs(ident, reads, pages, confirm)
+    _parent_refs(ident, reads, pages, confirm, births)
     for person, key in (("father", "father_nid"), ("mother", "mother_nid")):
         nref = NameRef()
         for u in units:

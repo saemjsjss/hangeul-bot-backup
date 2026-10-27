@@ -170,7 +170,28 @@ def _rewrite(rows: Iterable[Tuple[str, str]], table: Optional[Dict[str, str]]) -
 def bot_findings(rows: List[Tuple[str, str]], fn: str, unit: DocUnit, pages: List[PageRead]) -> List[Finding]:
     """(verdict, message) rows of bot function `fn` -> Findings on the unit's pages (1-based input pages)."""
     pg = unit_pages(unit, pages)
-    return [Finding(v, f"bot.{fn}", m, f"bot:{fn}", pg) for v, m in rows]
+    return [Finding(v, f"bot.{fn}", part_page_refs(m, unit, pages), f"bot:{fn}", pg) for v, m in rows]
+
+
+_PAGE_REF = re.compile(r"\b(pages?)\s+(\d+)(?:\s*([-–])\s*(\d+))?\b")
+
+
+def part_page_refs(message: str, unit: DocUnit, pages: Optional[Sequence[PageRead]]) -> str:
+    """Folder mode, revision 2.3: a unit cut out of a file that holds several documents (DocUnit.part) is read by
+    the bot as its own file, so a bot message's "page N" is the N-th page of the cut; it becomes the page inside the
+    input file, as every other folder message names it. Any other unit: the message unchanged."""
+    if not getattr(unit, "part", "") or not pages or not message:
+        return message
+
+    def one(k: str) -> str:
+        n = int(k)
+        return str(input_page(unit.pages[n - 1], pages)) if 0 < n <= len(unit.pages) else k
+
+    def rep(m: "re.Match") -> str:
+        word, a, dash, b = m.groups()
+        return f"{word} {one(a)}" + (f"{dash}{one(b)}" if b else "")
+
+    return _PAGE_REF.sub(rep, message)
 
 
 # --- passport ------------------------------------------------------------------------------------------------
@@ -519,6 +540,61 @@ def board_qr(unit: DocUnit, pages: List[PageRead]) -> Tuple[List[Finding], List[
 
 
 # --- page checks ---------------------------------------------------------------------------------------------
+FIN_KIND_UNSURE = r"^could not tell which financial document this is$"
+FIN_KIND_TEXT = {"trade_license": "trade licence", "tin_certificate": "TIN certificate",
+                 "employment_certificate": "employment certificate"}
+_BUSINESS_START = r"business start(?:ing)? date\D{0,20}([\d./-]{6,12}|\d{1,2}\s+\w+\s+\d{4})"   # == check_financial
+
+
+def licence_rows(text: str, path: Optional[Path], dv: Any) -> List[Tuple[str, str]]:
+    """The rows dv.check_financial gives a trade licence once its words say "trade licen" (doc_verifier 1595-1607,
+    unchanged): the fiscal year (fiscal_year_check), the business start date and the notarisation."""
+    out = list(dv.fiscal_year_check(text))
+    m = re.search(_BUSINESS_START, text or "", re.I)
+    if m:
+        d = dv.find_dates(m.group(1))
+        if d:
+            yrs = (dv.TODAY - d[0]).days / 365.25
+            out.append((PASS, f"business started {d[0]} ({yrs:.1f} years ago)") if yrs >= 2
+                       else (FLAG, f"business started {d[0]} — under 2 years; older businesses are "
+                                   "viewed more positively"))
+    out.append((PASS, "trade licence is notarised (wording or seal found)") if dv.notarised(text, path)
+               else (FAIL, "trade licence is not notarised — notarisation is required for it"))
+    return out
+
+
+def typed_as(u: DocUnit, pages: Optional[List[PageRead]], fine: str) -> bool:
+    """A page of the unit is typed `fine` by its own text (pagetype.page_features), not by a file name or a default."""
+    if not pages or not fine:
+        return False
+    PT = _runner_mod("pagetype")
+    return any(PT.page_features(pages[i].text, pages[i].image_only).best == fine
+               for i in u.pages if 0 <= i < len(pages))
+
+
+def financial_kind_rows(rows: List[Tuple[str, str]], u: DocUnit, text: str, path: Optional[Path],
+                        dv: Any, pages: Optional[List[PageRead]] = None) -> List[Tuple[str, str]]:
+    """Revision 2.4: dv.check_financial tells a trade licence, a TIN certificate or an employment certificate by a
+    few title words ("trade licen", "taxpayer's identification", "tin certificate", "employment"). A title it does
+    not know ("TRADE AND BUSINESS LICENSE", owner folder 9) or an OCR slip ("Certificale", owner folder 3) gives FLAG
+    "could not tell which financial document this is", and a licence's own rows (fiscal year, notarisation) never
+    run. When a page of the unit is typed as the unit's fine type by its own text (typed_as), that row becomes PASS
+    "contains: <kind> (by the page typing ...)" and a trade licence gets the bot's licence rows on its text
+    (licence_rows). A fine type from the file name or a default only: the row stays."""
+    kind = FIN_KIND_TEXT.get(u.fine or "")
+    if not kind or not any(re.search(FIN_KIND_UNSURE, m) for _, m in rows) or not typed_as(u, pages, u.fine):
+        return rows
+    out: List[Tuple[str, str]] = []
+    for v, m in rows:
+        if re.search(FIN_KIND_UNSURE, m):
+            out.append((PASS, f"contains: {kind} (by the page typing; the bot's title words were not read on it)"))
+            if u.fine == "trade_license":
+                out += licence_rows(text, path, dv)
+        else:
+            out.append((v, m))
+    return out
+
+
 def holds_tin_pages(unit: DocUnit) -> bool:
     return unit.fine == "tin_certificate" or any(len(s) > 2 and s[2] == "tin_certificate" for s in unit.sub)
 
@@ -539,6 +615,9 @@ def page_rows(unit: DocUnit, text: str, eng: Any, skip_qr: bool,
                 for v, m in PC.qr_check(info, required=unit.key in R.QR_DOCS, text=defused)]
     if unit.key != "birth_cert":
         out += [Finding(v, "page.bangla", m, "bot:page_checks.bangla_check", pg) for v, m in PC.bangla_check(text)]
+    if getattr(unit, "part", ""):                    # rev 2.3: a cut part's page numbers -> the file's pages
+        out = [Finding(f.verdict, f.rule, part_page_refs(f.message, unit, pages), f.source, f.pages, f.evidence)
+               for f in out]
     return out
 
 
@@ -749,6 +828,9 @@ def check_documents(units: List[DocUnit], pages: List[PageRead], rec: DerivedRec
                 where = facts.english_pages[0] if facts.english_pages else (u.pages[0] if u.pages else -1)
                 machine.append(MachineRead(unit=u.uid, person="student", name=facts.qr_name, source="birth QR",
                                            page=where))
+            qp = getattr(birth, "qr_parent_reads", None)          # rev 2.3: the parents' names in the payload
+            if callable(qp):
+                machine.extend(qp(facts, u))
             skip_qr = True
         elif key == "family_cert":
             fs += bot_findings(dv.check_family_cert(text, view, sizes, path), "check_family_cert", u, pages)
@@ -767,6 +849,7 @@ def check_documents(units: List[DocUnit], pages: List[PageRead], rec: DerivedRec
             fs += passport_no_rows(text, ident, u, pages)
         elif key == "trade_license":
             rows = _drop(dv.check_financial(text, view, sizes, path, texts), DROP["trade_license"])
+            rows = financial_kind_rows(rows, u, text, path, dv, pages)        # rev 2.4
             _assert_no_holder_rows(rows)
             fs += bot_findings(rows, "check_financial", u, pages)
             skip_qr = holds_tin_pages(u)

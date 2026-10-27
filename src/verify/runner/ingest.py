@@ -159,6 +159,18 @@ def folder_files(folder: Path) -> List[Path]:
     return sorted(files, key=lambda p: (p.name.casefold(), p.name))
 
 
+NOT_INPUT = "not a PDF or image"            # Source.not_checked reasons (revision 2.3)
+NOT_OPENED = "could not be opened"
+
+
+def other_files(folder: Path) -> List[Path]:
+    """The folder's other visible files (an .odg drawing, a .docx ...): not recursive, hidden / system and ~$ files
+    skipped, sorted by name. The runner lists them as not checked; it never reads them."""
+    files = [p for p in Path(folder).iterdir()
+             if p.is_file() and p.suffix.lower() not in INPUT_SUFFIXES and not _hidden(p)]
+    return sorted(files, key=lambda p: (p.name.casefold(), p.name))
+
+
 def folder_case_id(files: Sequence[SourceFile]) -> str:
     joined = "\n".join(f"{f.name}|{f.size}|{int(f.mtime)}" for f in files)
     return "F-" + hashlib.sha1(joined.encode("utf-8")).hexdigest()[:16]
@@ -180,9 +192,21 @@ def open_input(path: Path) -> Source:
         found = folder_files(p)
         if not found:
             raise InputError("the folder holds no .pdf, .jpg, .jpeg or .png file")
-        files = [_source_file(f, classify_name(f.name), file_label(k, len(found)))
-                 for k, f in enumerate(found, 1)]
-        return Source(mode="folder", root=p, files=files, case_id=folder_case_id(files))
+        # revision 2.3: a file the runner cannot read is listed as not checked, never a document or a slot, and
+        # never stops the run: another file type, or a PDF / image that will not open
+        not_checked: List[Tuple[str, str]] = [(f.name, NOT_INPUT) for f in other_files(p)]
+        files: List[SourceFile] = []
+        first_error: Optional[InputError] = None
+        for k, f in enumerate(found, 1):
+            try:
+                files.append(_source_file(f, classify_name(f.name), file_label(k, len(found))))
+            except InputError as e:
+                not_checked.append((f.name, NOT_OPENED))
+                first_error = first_error or e
+        if not files:                              # nothing to check at all: the first file's error (exit 2)
+            raise first_error or InputError("the folder holds no .pdf, .jpg, .jpeg or .png file")
+        not_checked.sort(key=lambda x: (x[0].casefold(), x[0]))
+        return Source(mode="folder", root=p, files=files, case_id=folder_case_id(files), not_checked=not_checked)
     raise InputError("the input does not exist or is not a file or folder")
 
 

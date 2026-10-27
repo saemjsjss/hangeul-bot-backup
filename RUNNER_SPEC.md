@@ -1,6 +1,6 @@
 # RUNNER_SPEC — test runner for the owner's desktop document checker (prototype)
 
-Status: design, revision 2.1, 27 Oct 2026. Branch `prototype/page-types`, worktree `C:\Hangeul\JARVIS\prototype\page-types`.
+Status: design, revision 2.4, 28 Oct 2026. Branch `prototype/page-types`, worktree `C:\Hangeul\JARVIS\prototype\page-types`.
 Not committed. This file holds no personal data. Every example name, number or date in it is a placeholder.
 
 The runner is a prototype, not the app. It takes either one bundle PDF or one folder of bot-named files,
@@ -128,6 +128,92 @@ these decisions differ, revision 2 wins everywhere in this file.
   as a write) and `_winapi.CreateProcess` (multiprocessing) is refused in the runner and recorded in the worker. A
   create-new open under the bot raises CreateRefused (tempfile no longer spins). An input folder that holds a
   junction or a link is refused before any snapshot or listing reads through it.
+
+### Revision 2.3 (28 Oct, after the owner's first two real folders) — changelog
+
+The owner's folders (KLP) combine documents in one file and showed four runner bugs. Versions: `RUNNER_VERSION =
+"0.2.3"`, `RUNNER_RULES_VERSION = "2026-10-28.r2.3"`, same run schema (new fields have defaults).
+
+- **Folder: a file that holds several documents is cut into them (section 5.4, folder rule 7).** A "FINANCIAL
+  DOCUMENTS" file (solvency, statements, trade licence, TIN) became ONE bank unit: false "TRADE LICENSE / EMPLOYMENT
+  CERTIFICATE MISSING" and "TIN CERTIFICATE MISSING", the trade licence and TIN never checked, no financial chain.
+  Now `split.file_documents` runs the bundle split's own rules on each folder file's pages alone (the alignment to
+  the fixed order, the academic levels with their e-Apostille pages, the financial parts); a file that makes two
+  documents or more gives one unit per document (`DocUnit.part` = the pages inside the file, "p4-6"), cut out of the
+  staged copy (revision 2.4: not primed), judged by its own checks; the report names "<file> p4-6" and bot
+  messages name the file's pages. Inside one file the NID block is not split into persons and a page with little
+  text is no photo. No ORDER/NOT JUDGED in folder mode. A one-document file is unchanged (its "name vs content" FLAG
+  included); a cut file none of whose parts is the named document gets that FLAG on every part.
+- **Academic split (both modes).** A page with no academic sign right after an e-Apostille (a certificate scanned
+  upside down) goes with that apostille to the level that follows (owner folder 3: the SSC apostille no longer
+  joined the HSC). Between HSC and SSC, the examination a page names wins ("Dakhil Examination" is SSC even when the
+  school's name holds "Alim").
+- **Names: an outvoted reference (section 7).** The birth certificate's one OCR read (a bilingual JPG) misread one
+  letter of the mother's name; its own zoomed re-read repeated the misread, so the passport, the student NID, the
+  mother NID and the family certificate, which agree with each other, all FAILed. A name FAIL needs BOTH spellings
+  confirmed; the reference's own re-read re-reads the same print, so when two or more other documents agree with
+  each other on one spelling the reference does not have, no other document prints the reference and no
+  independent read confirms it (a QR / MRZ machine read, another page of its document, another document or account
+  holder), the finding is ONE FLAG `names.<person>_reference` "check by eye" on the reference document; the agreeing
+  documents get a NOTE, a third spelling is at most FLAG, and the dot rule runs over the agreeing documents. One
+  other document against a reference confirmed by its own re-read is still FAIL.
+- **Birth certificate QR (section 5.12).** A decoded payload that carries the parents' names (`text_fields`
+  father / mother; URL parameters or "Father's Name:" text) gives `MachineRead`s; equal letters confirm the reference
+  (identity) and its tail; a difference is FLAG `birth.qr_father` / `birth.qr_mother` (never FAIL here). The genuine
+  bdris link carries an opaque key: nothing changes for it.
+- **GPU pre-read (section 5.13).** One page too large for the 3 GB cap (`torch.OutOfMemoryError`) ended the whole
+  pre-read (owner folder 9: every page then read on the CPU). Now the page is read again after
+  `torch.cuda.empty_cache()` with its long side cut to 2000, then 1600 pixels (`"downscaled"` in its record); if it
+  still does not fit it is left out (the file's `"skipped"` list) and the runner reads it on the CPU; the other
+  pages go on. The cap is never raised. `run_case.py` uses a page-texts file that belongs to the input on any worker
+  exit and its READING note says how many pages the card, the text layer and the CPU read.
+- **A file the runner cannot read (section 5.1).** A folder's other files (an `.odg` drawing next to the PDF of the
+  same name) and a PDF or image that will not open are listed as "Not checked (not a PDF or image): <file>" /
+  "Not checked (could not be opened): <file>" (`Source.not_checked`, `RunResult.not_checked`): never a document, a
+  slot or a crash. A folder with nothing that opens is still exit 2.
+- **Checks.** `tests/test_fixes23.py` (made-up data: the folder cut, the outvoted reference, the QR parents, the card
+  memory retries, run_case's note, the not-checked files); the unit suite, pii_scan, venv_check, birth_fixtures,
+  sim_split (numbers identical), sim_money (identical), sim_names (re-read off: the same 46 FAILs and FAIL precision;
+  41 references outvoted, their per-document FLAGs become one FLAG + NOTEs) and CHECK_0001 (summary identical) pass.
+
+### Revision 2.4 (28 Oct, the by-eye check of the owner's two folders after revision 2.3) — changelog
+
+Every line of the re-run was compared with the page images by eye. Versions: `RUNNER_VERSION = "0.2.4"`,
+`RUNNER_RULES_VERSION = "2026-10-28.r2.4"`, same run schema.
+
+- **Folder parts are not primed (section 5.4 folder rule 7, 5.6).** Priming a part's cut with the run's page texts
+  took the bot's own read away from the bot's rules for parts only (a bank balance the bot's own read prints in full
+  came out split in the run's page read: the part's balance became a FLAG where the uncut file had PASSed). A part's
+  cut is read by the bot as every folder file is.
+- **The present-only ID card / CV gets no `split.name_vs_content` FLAG** (a CV's personal table prints the NID and
+  passport numbers and "read like NID"; the hidden FLAG was counted in the headline).
+- **Passport name label (section 5.5).** A passport prints the name in CAPITALS: a first word of the personal-data
+  page's name read in Title case or small letters, within 2 letters of "name", before CAPITALISED words is the
+  field's label misread ("Name:" read as another word), not a name word (`names.passport_label_lead`). The printed
+  name then matches the MRZ and is the dot reference again (it was a false FLAG `identity.printed_name`).
+- **Inside one folder file (section 5.4 folder rule 7).** Empty pages (typed "photo" for their emptiness) join the
+  document before them, never a bank document (its page count is a rule) and never as a file's first page; floats
+  and unrecognised pages between two documents of the same kind join that document when every page of them reads at
+  most partly like any document (best cue ≤ `HINT_MIN`): a long return of income whose schedule pages read weakly is
+  one INCOME TAX, not INCOME TAX + UNRECOGNISED + AFFIDAVIT + INCOME TAX (a false affidavit is used by the name rule).
+  A float that reads clearly stays its own document.
+- **Family table, wrapped name cells (section 5.9.1).** A name cell that wraps prints its second line after the
+  row's other first-line cells. When the row's date cell is cut at the year ("01-06-"), the first CAPITALISED name run
+  after it that a digit cell follows at once (the year, the number's end) is the name's second line
+  (`names.wrapped_cell_tail`). The row reader also stops at a label token ("<Place>:") and at a Title-case word before
+  a CAPITALISED name (the row before's address cell). The targeted re-read of a variant that is the reference minus
+  its last word(s) takes in the line below as well (`WRAP_LINES`): a one-line crop had "confirmed" the dropped word,
+  a false FAIL. Such a re-read is "unclear", never "confirmed", when the variant's words are followed by words within
+  a third of their letters of the dropped word(s) (`names.dropped_words_follow`: the surname is there, one letter
+  misread).
+- **Not compared, with an outvoted reference (section 7).** The UNREAD FLAG ("a single read too unlike the name") is
+  not raised on a document whose other read shows the spelling the other documents agree on.
+- **Financial kind (section 5.6 adapter table).** `dv.check_financial` tells the kind by a few title words; a title it
+  does not know ("TRADE AND BUSINESS LICENSE") or an OCR slip gives FLAG "could not tell which financial document
+  this is" and a licence's own rows never run. When a page of the unit is typed as the unit's fine type by its own
+  text, that row becomes PASS "contains: <kind> (by the page typing ...)" and a trade licence gets the bot's licence
+  rows unchanged (`fiscal_year_check`, the business start date, the notarisation) — `doccheck.financial_kind_rows`.
+- **Checks.** `tests/test_fixes24.py` (made-up data); `test_fixes23.TestCutParts` now asserts no priming.
 
 ---------------------------------------------------------------------------------------------------------
 
@@ -334,9 +420,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-RUNNER_VERSION = "0.2.1"
+RUNNER_VERSION = "0.2.4"
 BASE_RULES_VERSION = "2026-10-21.3"      # the bot rules in the worktree's src/verify (commit 07b1f22)
-RUNNER_RULES_VERSION = "2026-10-27.r2.1"   # + the owner's 21-27 Oct decisions (A1-A8), applied in the runner only
+RUNNER_RULES_VERSION = "2026-10-28.r2.4"   # + the owner's 21-27 Oct decisions (A1-A8), applied in the runner only
 RUN_SCHEMA = "runner-run/2"
 PAGE_TEXTS_SCHEMA = "runner-page-texts/1"   # gpuread.py writes it, engine.load_page_texts reads it (5.2.1)
 
@@ -385,6 +471,10 @@ class Source:
     root: Path                       # the bundle file or the folder
     files: List[SourceFile]
     case_id: str                     # "B-<sha1 of bundle bytes>[:16]" | "F-<sha1 of name|size|mtime list>[:16]"
+    # folder mode, revision 2.3: files the runner cannot check, (file name, why): "not a PDF or image" (an .odg,
+    # a .docx ...) or "could not be opened" (a broken or password-protected PDF or image). Listed in the report
+    # as "Not checked (...)"; never a document, never a slot.
+    not_checked: List[Tuple[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -431,6 +521,9 @@ class DocUnit:
     path: Optional[Path] = None      # file the bot checkers read: cut sub-PDF, staged copy or photo crop
     source_file: str = ""            # folder mode: the input file name
     notes: List[Finding] = field(default_factory=list)              # split-level findings about this unit
+    # folder mode, revision 2.3: "p4-6" when the unit is one of several documents cut out of its file (the
+    # pages inside that file); "" when the unit is the whole file (or in a bundle)
+    part: str = ""
 
 
 @dataclass
@@ -584,6 +677,8 @@ class RunResult:
     headline: str
     timings: Dict[str, float]
     safety: Dict[str, Any]
+    # folder mode, revision 2.3: Source.not_checked, (file name, why), one "Not checked (...)" summary line each
+    not_checked: List[Tuple[str, str]] = field(default_factory=list)
 ```
 
 ### 4.2 `strict.py`
@@ -955,6 +1050,9 @@ def open_input(path: Path) -> Source
     # A .pdf file -> mode "bundle" (one SourceFile).
     # A directory -> mode "folder": its .pdf/.jpg/.jpeg/.png files, not recursive, sorted by name.
     #   Hidden and ~$ files are skipped.
+    #   Revision 2.3: every other visible file (an .odg, a .docx ...) -> Source.not_checked (name, "not a PDF or
+    #   image"); a .pdf / image that will not open -> (name, "could not be opened"), the run goes on without it.
+    #   Nothing that opens at all -> InputError naming the first file by its position (exit 2).
     # Anything else -> InputError.
     # case_id: bundle "B-" + sha1(bytes)[:16]; folder "F-" + sha1("\n".join(f"{name}|{size}|{int(mtime)}"))[:16].
 def classify_name(filename: str) -> Optional[str]
@@ -1106,8 +1204,15 @@ def documents(feats, al, cfg) -> List[Doc]                      # verbatim + the
 def segment(types: List[PageType], program: str, cfg: SplitCfg = SplitCfg(), costs: Costs = Costs()) -> Segmentation
 def segment_folder(src: Source, pages: List[PageRead], types: List[PageType]) -> Segmentation
     # One Doc per input file. label = the section/float of key_by_name, or of the file's majority
-    # fine type when the name is unknown. A file holding several fine types (TRADE LICENSE.pdf with
-    # TIN pages, one ACADEMIC file with two levels) keeps one Doc with sub = parts by fine type / level.
+    # fine type when the name is unknown. Revision 2.3: a file whose pages make two documents or more by the
+    # bundle rules (file_documents) gives one Doc per document (Doc.part); a one-document file keeps one Doc,
+    # with sub = parts by fine type / level.
+def file_documents(types, a: int, b: int, key: str = "", fname: str = "") -> Optional[List[Doc]]
+    # Revision 2.3: align() + documents() on the file's pages a..b alone; the NID block is one Doc (no person
+    # split inside a file); a "photo" run is unrecognised unless the name says photo; adjacent unrecognised runs
+    # merge. Documents counted: academic = its known levels (>= 2 to cut), financial = its fine types, others 1,
+    # unrecognised 0. >= 2 -> the Docs (part=True, file_start=a, file_key=key, misplaced=False, key = the name's
+    # key on the part it names only); else None.
 def provisional_units(seg: Segmentation, pages: List[PageRead]) -> List[DocUnit]
     # DocUnits without roles: NID-block units keyed "nid_unassigned". Used by birth and identity only.
     # Unit pages equal the final units' pages for every non-NID unit (birth lookups use tuple(pages)).
@@ -1121,7 +1226,7 @@ def attach_paths(res: SplitResult, paths: Union[List[Path], Dict[str, Path]]) ->
 
 **Revision-2 changes to `documents()` and `finish()`** (both modes unless noted):
 
-1. **Academic: one unit per level** (critique 16). In a bundle each level (degree, diploma, HSC, SSC) is its own unit (key `academic`, `level` set, title "ACADEMIC HSC" ...), so the bot's academic chain runs per level file. An e-Apostille page joins the level its text names (`PageType.level`), else the level that follows it. In folder mode a file stays one unit; when it holds several levels its title lists them ("ACADEMIC (HSC, SSC)") and `sub` holds the levels.
+1. **Academic: one unit per level** (critique 16). In a bundle each level (degree, diploma, HSC, SSC) is its own unit (key `academic`, `level` set, title "ACADEMIC HSC" ...), so the bot's academic chain runs per level file. An e-Apostille page joins the level its text names (`PageType.level`), else the level that follows it. Revision 2.3: a page with no academic sign (no level, no certificate / transcript kind: a certificate scanned upside down) right after an e-Apostille goes with that apostille. In folder mode (revision 2.3) a file with two known levels or more is cut into one unit per level, as in a bundle (rule 7); a file with one known level stays one unit (title "ACADEMIC HSC", or "ACADEMIC" when no level is read).
 2. **Financial: one unit per part** (A6 g, kept). Keys all `trade_license`, fine type `trade_license`, `employment_certificate` or `tin_certificate`, titles "TRADE LICENSE", "EMPLOYMENT CERTIFICATE", "TIN CERTIFICATE": one report line each.
 3. **Trailing page after income tax** (A6 f). Unrecognised page(s) at the end of the bundle, right after the income-tax document, join the income-tax unit: no ORDER notice, a unit NOTE `split.attached_trailing` "page N (not recognised) kept with INCOME TAX as its last page".
 4. **Death certificate anchored to the NID block** (critique 7). `death_cert` is no longer a FLOAT: it belongs to the NID section. Outside the NID block it is misplaced (an ORDER notice, below).
@@ -1134,6 +1239,7 @@ def attach_paths(res: SplitResult, paths: Union[List[Path], Dict[str, Path]]) ->
    - No cap on the number of notices.
 6. **Missing slots** (critique 5). `owner_doc` is filled by a trade licence or an employment certificate; `tin` by a TIN certificate (Q3); `bank` by any bank unit (a bank unit with no solvency page gives `SOLVENCY_MISSING_TEXT` through `bank.py`, unless another bank file of a folder holds the certificate). A death certificate whose person is unresolved does not fill a slot: when a parent's slot is otherwise empty, `res.maybe[slot] = uid` and the slot is left out of `missing` (critique 17). When both parents' slots are open and there are fewer such death certificates than open slots, `missing` also gets `parent_id`: "FATHER OR MOTHER NID (OR DEATH CERTIFICATE) MISSING — a death certificate stands for one parent only".
 7. **Folder mode:** roles from the file name (role_how "file-name"); a generic DEATH CERTIFICATE gets its role by strict name against refs (assign_persons scoring with the position weight set to 0); no ORDER/STOP; a unit whose majority fine type does not map to its file-name key gets a unit note FLAG `split.name_vs_content`.
+   **Revision 2.3, a file that holds several documents** (the owner's "FINANCIAL DOCUMENTS", "ACADEMIC DOCUMENTS ATTESTED"): `file_documents` cuts it with the bundle rules inside the file (bank solvency then statement; trade licence / employment certificate; TIN; income tax; academic newest first, certificate then transcript, e-Apostille pages attached; affidavit and the other floats; unrecognised pages kept as an `unrecognised` unit with its FLAG, or attached at an edge as in a bundle). Each part is a unit (academic per level, financial per part) with `DocUnit.part` = its pages inside the file ("p4-6", 1-based) and `source_file` = the file; `pipeline._cut_parts` cuts it out of the staged copy (`engine.cut`, file-local pages, `docs\parts\<unit_file_name>`) and attaches the cut, NOT primed (revision 2.4: the bot reads it itself, as every folder file); bot messages that cite "page N" of the cut name the file's page (`doccheck.part_page_refs`). The part the file's name names keeps the name's key (and its role); the others get their keys from their pages. No ORDER notice and no NOT JUDGED in folder mode: a part out of the file's order is judged where it is. When no part is the document the name says, every part gets FLAG `split.name_vs_content` ("the file name says X but its pages read like A, B"). Missing slots count the parts: no "X MISSING" when X is inside another file. A file of one document (a two-page NID, a bank file of solvency and statements, a passport with a blank back) is not cut.
 8. **Both modes:** Doc → DocUnit mapping (below); unit notes for role_how "position" / "name-partial" (FLAG `split.role_position` / `split.role_partial`), "extra" NID (key `nid_unassigned`, FLAG `split.nid_unassigned`) and unrecognised pages (FLAG `split.unrecognised`).
 
 **Doc to DocUnit mapping:**
@@ -1294,7 +1400,7 @@ REWRITE: Dict[str, Dict[str, str]]
 | family_cert | `dv.check_family_cert(text, view, sizes, path)` | none | — (`names.family_first_row` from `names.py`) |
 | academic (one unit per level) | `dv.check_academic(text, view, sizes, path, texts)` | Apostille FAIL kept (R15). Bundle mode (critique 8): the row "page 1 is not an e-Apostille — the first apostille is on page N" becomes an ORDER finding `academic.apostille_order` "the e-Apostille for <LEVEL> is on page N — put it first in that level's pages" (pages = that apostille page); "no e-Apostille with a scannable QR" and "an e-Apostille page is there but its QR could not be read" stay FAIL. When `board_qr` read codes: DROP `^no QR code and nothing showing it is the online registration copy`, `^a QR code is on the page but could not be read`, `^no QR code on this document`. | `academic.board_qr` (A6 c, below). |
 | bank | `dv.check_bank(text, view, sizes, program, path, texts)` | DROP `^account opened ` (A7: account age removed). DROP `^solvency certificate and statement both dated`, `^the solvency certificate is dated `, `^solvency certificate dated `, `^statement generated `, `^neither date could be read` (replaced by `bank.dates`). DROP `^solvency amount stated in USD`, `^no USD equivalent found`, `^carries a seal and signature`, `^no seal or signature of any kind found` (replaced by `bank.usd` / `bank.seal` on the solvency page, critique 15). | — (`bank.py`) |
-| trade_license (all fine types) | `dv.check_financial(text, view, sizes, path, texts)` | DROP `^TIN and trade licence are both in the name of`, `^the TIN names '` (loose any-token test). The holder rows cannot fire with the empty record (asserted). | — (`tin.py`, `financial.py`) |
+| trade_license (all fine types) | `dv.check_financial(text, view, sizes, path, texts)` | DROP `^TIN and trade licence are both in the name of`, `^the TIN names '` (loose any-token test). The holder rows cannot fire with the empty record (asserted). Revision 2.4 (`financial_kind_rows`): "could not tell which financial document this is" becomes PASS "contains: <kind> (by the page typing; ...)" when a page of the unit is typed as the unit's fine type by its own text; a trade licence then gets the bot's licence rows on its text (`fiscal_year_check`, business start date, notarisation, as `check_financial` words them). | — (`tin.py`, `financial.py`) |
 | income_tax | `dv.check_income_tax(text, view, sizes, program, path)` | MASTER: rows unchanged. Any other program (A6 h, critique 18): every FLAG or FAIL row of the bot AND of `page_rows` becomes NOTE with " (information only: the income-tax guideline is for Master's)" appended; plus `doc.present_info` PRESENT "present — information only for <PROGRAM>". | — (`financial.income_tax_findings`; its FLAG stays a FLAG) |
 | language_cert | none | — | IELTS, TOEFL and TOPIK: `language.check_language_file(rows_text, identity.passport_for_language(ident), program, today, covered_fn)`, where `covered_fn = lambda cert_name: names.covered(aff, ident.student.written or ident.student.parts, cert_name)` (critique 14). Text = `language.rows_text(eng.read_boxes(page_image))` per page, joined with "\f". Fallback: the 200 dpi text. Each `(verdict, check, why)` becomes `Finding(rule="language."+check)`. Any other certificate kind: `doc.present_only` PRESENT "present — only IELTS, TOEFL and TOPIK are checked" (critique 20). |
 | affidavit | none | — | `doc.present` PASS "affidavit present — used by the name rule". |
@@ -1550,11 +1656,14 @@ FINANCIAL CHAIN: <worst> — <reason> ...                       (taxpayer = hold
 BUNDLE: <FLAG> — <reason>                                     (bundle-level findings, e.g. colour)
 NEW CHECKS (owner to confirm): <rule> on <TITLE> (p<a>-<b>)   (only when a NEW_CHECK_RULES finding fired)
 Not checked (present): ID CARD / CV (p<a>-<b>)
+Not checked (not a PDF or image): <file>; <file>              (folder mode, revision 2.3: Source.not_checked)
+Not checked (could not be opened): <file>
 Report: <out>\report.xlsx | JSON: <out>\run.json
 ```
 
 - Reasons are FAIL first, then ERROR, then FLAG, each at most 160 characters. PASS and NOTE are not listed.
-- In folder mode, `(p<a>-<b>)` becomes `(<file name>)`.
+- In folder mode, `(p<a>-<b>)` becomes `(<file name>)`; for a unit cut out of a file that holds several documents
+  (revision 2.3) `(<file name> p<a>-<b>)`, the pages inside that file.
 
 #### 5.11.2 report.xlsx (sheets in this order; critique 20)
 
@@ -1639,6 +1748,7 @@ def read_dob(text: str, image: Optional["np.ndarray"], eng: Optional["Engine"]) 
 - Not decoded (a QR is seen but unreadable) or no QR found → FLAG "the QR could not be decoded — check the QR by eye".
 - Host not `bdris.gov.bd` / `everify.bdris.gov.bd`, or not `https://` → FAIL "the QR does not point to the government bdris site" (a machine read is confirmed).
 - The payload carries a name → `strict.compare(qr_name, printed_name, dots=False)`: EQUAL → PASS; a difference → `strict.judge(kind, covered=False, confirmed=printed_confirmed)` → FAIL "the name in the QR is not the printed name — the certificate may be altered" / FLAG. No printed name read → FLAG. The QR name is also passed to `names.py` as a `MachineRead` (it then confirms or contradicts the printed spelling against the passport).
+- Revision 2.3: the payload carries a parent's name (`text_fields["father"]` / `["mother"]`: URL parameters father, fatherName, father_name, fathers_name and the mother's alike; text "Father's Name: ..." / "Mother's Name: ...") → `birth.qr_parent_reads` gives `MachineRead(person="father"/"mother", source="birth QR")`; `birth.qr_father` / `birth.qr_mother`: the letters equal the certificate's printed reference (any order, dots aside) → PASS, and `identity` takes the QR as the confirmation of the reference (and of its tail); a difference → FLAG "check by eye" (the printed side is one OCR read: never FAIL here; `names.py` then treats the reference as not independently confirmed). The genuine bdris link carries an opaque key: no parent name, nothing changes.
 - The payload or the CODE128 barcode carries a BRN → equal to the printed BRN: PASS; different → FAIL when `brn_confirmed`, else FLAG.
 - The payload carries a DOB → equal to the certificate's DOB: PASS; different → FAIL when `dob_trusted`, else FLAG.
 - The opaque bdris key alone (the genuine format: 64 base64 characters = 48 bytes, no spaces) → PASS "QR is a genuine-looking bdris verification link" + NOTE "the name behind the bdris QR can only be checked online — not done (no network)". A malformed key → FLAG.
@@ -1673,6 +1783,14 @@ def read_all(src: Source, dv, checkpoint: Callable[[], None], done: Dict[str, An
     # dv._ocr_image wrapped (read_gpu_pages.on_card): checkpoint() before every OCR page (never for a text-layer
     # page), pages already in `done` reused (resume), save() after every page. Image files: dv.read_document(path)
     # under the same wrapper. Returns the runner-page-texts/1 dict.
+    # Revision 2.3 (card memory; signature + free: Optional[Callable[[], None]] = None): a page whose read raises
+    # CUDA out-of-memory (is_oom: torch.OutOfMemoryError or a RuntimeError saying "out of memory") is read again
+    # after free() (gc + torch.cuda.empty_cache, from run_session) with its long side cut to OOM_LONG_SIDES =
+    # (2000, 1600) pixels (cv2 INTER_AREA; the page record gets "downscaled": <px>); an image file is read again as
+    # an RGB array the same way. A page that still runs out of memory is left out of "pages" and listed in the file
+    # entry's "skipped" [{"page", "reason"}]; read_pages gets "" for it and goes on with the other pages;
+    # "complete" is false and the runner reads that page on the CPU. Any other error still ends the run (saved
+    # first). CAP_GB is never raised.
 def convert_legacy(legacy: Path, source: Path, out: Path) -> None
     # test1\tools\read_gpu_pages.py output {"meta", "pages": {"1": {...}}} -> runner-page-texts/1 (sha256 of the
     # source PDF added; n_pages must agree). No card.
@@ -1698,7 +1816,7 @@ def main(argv: Sequence[str]) -> int
 ```
 
 1. Checks `--out` with `safety.check_out_dir` (nothing written on refusal: exit 2).
-2. Unless `--cpu`: runs `[BOT_PY, "-I", "-B", GPUREAD, input, out\page_texts.json, "--wait-s", "120"]` up to `MAX_RUNS` times: 0 → done; 3 → run again (resumes); 5 → fall back: note "GPU slot not available within 120 s — <n> page(s) read on the CPU light engine"; 4, 1 or anything else → fall back with the note "GPU pre-read failed (exit <code>) — ...".
+2. Unless `--cpu`: runs `[BOT_PY, "-I", "-B", GPUREAD, input, out\page_texts.json, "--wait-s", "120"]` up to `MAX_RUNS` times: 0 → done; 3 → run again (resumes); 5 → fall back: note "GPU slot not available within 120 s — <n> page(s) read on the CPU light engine"; 4, 1 or anything else → fall back with the note "GPU pre-read failed (exit <code>) — ...". Revision 2.3: a page-texts file that belongs to the input (every entry's name, sha256 and page count) is given to the runner after ANY worker exit (the runner reads only the missing pages on the CPU); the note counts the pages each engine read ("<g> page(s) read on the card (+<l> text layer), <n> page(s) read on the CPU light engine"); exit 0 with pages left out for card memory says "GPU pre-read left <k> page(s) out (too large for the card's memory cap)".
 3. Runs the runner: `[RUNNER_PY, "-I", "-B", "-m", "src.verify.runner", input, "--program", P, "--out", out, ("--page-texts", json) when it exists (complete or partial), "--reading-note", note, ("--today", D)]` and returns its exit code.
 4. Starts and waits only for its own children; never kills another process; on Ctrl-C it ends only its own child. Writes `out\run_case.log` (timings and exit codes, no text).
 
@@ -1750,6 +1868,11 @@ def main(argv: Sequence[str]) -> int
 | R39 | NEW: TIN printed from a non-government address (A6 j) | `tin.web_address` | FLAG only ("new, keep?", Q14) |
 | R40 | NEW: tax circle/zone on the return differs from the TIN's (A6 j) | `financial.income_tax_findings` → `income_tax.tax_office` | FLAG only ("new, keep?", Q14) |
 | R41 | Colour scan in a bundle (critique 19) | `doccheck.page_rows` bundle colour | one bundle FLAG (Q15) |
+| R42 | Folder: a file that holds several documents is cut into them, each judged; no false MISSING (rev 2.3) | `split.file_documents`, `split._units` (`DocUnit.part`), `pipeline._cut_parts`, `doccheck.part_page_refs`, `report.where` | per document; `split.name_vs_content` FLAG when no part is the named document |
+| R43 | A name FAIL needs BOTH spellings confirmed: a reference outvoted by agreeing documents (rev 2.3) | `names._outvoted`, `names.ref_independently_confirmed` | one FLAG `names.<person>_reference` on the reference document; NOTE on the agreeing documents; a third spelling at most FLAG |
+| R44 | The bilingual birth-certificate QR must decode and match: the parents' names when the payload carries them (rev 2.3) | `birth.parse_payload`, `birth.qr_parent_reads`, `birth._qr_parent_rows`, `identity._parent_refs` | PASS (and the reference confirmed) / FLAG |
+| R45 | A folder file the runner cannot read is listed, never a document or a slot (rev 2.3) | `ingest.open_input` (`Source.not_checked`), `report.not_checked_lines` | "Not checked (not a PDF or image)" / "Not checked (could not be opened)" line |
+| R46 | One page too large for the card's 3 GB cap does not end the GPU pre-read (rev 2.3) | `gpuread.read_with_retries`, `run_case.plan` | READING note counts each engine |
 
 ---------------------------------------------------------------------------------------------------------
 
@@ -1777,7 +1900,22 @@ dots, is compared with `any_order=True` and without dots.
 - for a reference, another document printing it letter for letter.
 
 A difference is FAIL only when BOTH spellings are confirmed and no read of the variant's document shows the
-reference spelling. When the re-read shows the reference instead, the difference stays FLAG ("a closer read
+reference spelling.
+
+**Revision 2.3: an outvoted reference.** The reference is ONE document's read; its own zoomed re-read re-reads the
+same print and can repeat a misread (owner folder 3: one letter of the mother's name, T read as L, on a bilingual
+JPG). `names._outvoted`: when two or more OTHER documents agree with each other on one spelling the reference does
+not have (letters equal; a card's MRZ line in any order), no other document prints the reference, no other
+confirmed spelling stands against them, and no read independent of the reference's own print confirms it
+(`names.ref_independently_confirmed`: a machine read of the person — a birth-certificate or board QR, the passport
+MRZ for the student —, another page of the reference's document, another document, or an account holder / taxpayer
+read of `extra_reads`), the finding is ONE FLAG `names.<person>_reference` on the reference document ("<R> on the
+birth certificate, but <V> on n other documents that agree with each other ... check by eye: if it prints <R>,
+those documents differ from it"); the agreeing documents get a NOTE (kind AGREES, not listed on the NAMES line);
+a third spelling is at most FLAG; the dot rule runs over the agreeing documents with no dot reference. One other
+document against a reference confirmed by its own re-read is still FAIL; a reference another document prints is
+never outvoted. Revision 2.4: with an outvoted reference, the "not compared" FLAG (`names.<person>_unread`, a single
+read too unlike the name) is not raised on a document whose other read shows the agreed spelling. When the re-read shows the reference instead, the difference stays FLAG ("a closer read
 shows <R> — probably OCR, check by eye, page N"). A difference OCR could explain (a dot, I/l/1, 0/O, a single
 read) that cannot be confirmed is FLAG "check by eye, page N". A difference is NEVER PASS. Test 1 is the
 reason: whole-page OCR dropped the dot of "MD." on one certificate and the old logic gave a false FAIL.
@@ -2265,3 +2403,16 @@ whitespace does not count, A1), Q11 (GPA consistency: removed, critique 20), Q12
 7. **The GPU is shared with the bot.** The pre-read waits at most 120 s for a slot and stops at a checkpoint when the bot's check starts; the run then falls back to the CPU light engine for the rest and says so. GPU and CPU texts differed by 0.18% of characters on test 1.
 8. **The bot's apostille QR reader** (`PC.page_codes`) is used unchanged; it may miss apostille QRs the way it missed the board QRs (A6 c fixes only the board-QR line).
 9. **The boxed DOB on old prints** is read weakly from the image (6 of 11 exact in the study); it can only be trusted when the "In words" line agrees.
+10. **Revision 2.3, folder files that hold several documents.** Inside one file the NID block is one person (a file
+    holding the father's and the mother's NIDs is one unit, its person by name); a page the alignment cannot place
+    and no 2.4 rule joins to a neighbour (a clear statement page after the income tax, a blank first page) becomes an
+    `unrecognised` unit with its FLAG; a part out of
+    the file's order is judged where it is (no ORDER notice in folder mode). An outvoted reference (section 7) turns
+    a confirmed spelling difference of the birth certificate itself into one FLAG: the owner looks at the
+    certificate once instead of reading several FAILs.
+11. **Revision 2.4.** A wrapped family-table name cell is read whole only when the row's date cell wraps too (cut at
+    the year); otherwise the first line alone is read and the wider re-read crop turns a would-be FAIL into a FLAG.
+    The page typer can still tie two kinds on one page (an income-tax certificate typed TIN in owner folder 9: it
+    joins the TIN part). The bot's own rules keep their limits: its academic level words read a school's name
+    ("... Alim Madrasah") as HSC (a FLAG on an SSC part), and its opening-balance reader may miss a balance printed
+    before its label (a NOTE). A handwritten signature is not read: `bank.seal` needs seal wording or seal colour.

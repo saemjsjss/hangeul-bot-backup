@@ -59,6 +59,9 @@ ENGINE_LABEL = f"bot EasyOCR on CUDA (gpu_guard, cap {CAP_GB:.1f} GB)"
 LEGACY_ENGINE_LABEL = ENGINE_LABEL + "; converted from test1 read_gpu_pages.py output"
 KINDS = ("layer", "ocr", "image")
 EXIT_OK, EXIT_CRASH, EXIT_ARGS, EXIT_STOPPED, EXIT_NO_CUDA, EXIT_NO_SLOT = 0, 1, 2, 3, 4, 5
+# Revision 2.3 (owner folder 9): a page too large for the 3 GB cap is read again smaller (long side in pixels), and
+# left to the runner's CPU engine when even that runs out of card memory. The cap itself is never raised.
+OOM_LONG_SIDES = (2000, 1600)
 _GB = 1024 ** 3
 
 
@@ -206,10 +209,11 @@ def _close(result: Dict[str, Any]) -> None:
 
 
 def counts(result: Dict[str, Any]) -> Dict[str, int]:
-    """Pages by kind, plus the expected total (for the printed summary; no text)."""
-    out = {"total": 0, "read": 0, "layer": 0, "ocr": 0, "image": 0}
+    """Pages by kind, plus the expected total and the pages left to the CPU (for the printed summary; no text)."""
+    out = {"total": 0, "read": 0, "layer": 0, "ocr": 0, "image": 0, "skipped": 0}
     for e in result.get("files") or []:
         out["total"] += int(e.get("n_pages") or 0)
+        out["skipped"] += len(e.get("skipped") or [])
         for p in e.get("pages") or []:
             out["read"] += 1
             out[p.get("kind", "ocr")] = out.get(p.get("kind", "ocr"), 0) + 1
@@ -217,17 +221,93 @@ def counts(result: Dict[str, Any]) -> Dict[str, int]:
 
 
 # --------------------------------------------------------------------------------------------------------
+# Card memory (revision 2.3): one page too large for the cap must not end the whole pre-read
+
+def is_oom(e: BaseException) -> bool:
+    """True for CUDA running out of card memory (torch.OutOfMemoryError / torch.cuda.OutOfMemoryError, both
+    RuntimeErrors, or a RuntimeError saying so). Any other error is not this."""
+    if type(e).__name__ == "OutOfMemoryError":
+        return True
+    return isinstance(e, RuntimeError) and "out of memory" in str(e).lower()
+
+
+def _attempt(fn: Callable[[], Any]) -> Tuple[bool, Any]:
+    """(True, fn()) or (False, None) when fn ran out of card memory; any other error goes on. The exception (and
+    the frames holding the failed tensors) is released before the caller frees the card's cache."""
+    try:
+        return True, fn()
+    except BaseException as e:
+        if not is_oom(e):
+            raise
+    return False, None
+
+
+def downscale(arr: Any, long_side: int) -> Any:
+    """The page image with its long side cut to `long_side` pixels (INTER_AREA), or None when it is not larger
+    than that already (or is no image array)."""
+    shape = getattr(arr, "shape", None)
+    if not shape or len(shape) < 2:
+        return None
+    h, w = int(shape[0]), int(shape[1])
+    if max(h, w) <= long_side:
+        return None
+    s = long_side / float(max(h, w))
+    size = (max(1, int(round(w * s))), max(1, int(round(h * s))))
+    try:
+        import cv2
+        return cv2.resize(arr, size, interpolation=cv2.INTER_AREA)
+    except ImportError:                                    # the bot venv has cv2 (EasyOCR needs it)
+        import numpy as np
+        from PIL import Image
+        return np.asarray(Image.fromarray(arr).resize(size, Image.LANCZOS))
+
+
+def read_with_retries(read: Callable[[Any], Any], arr: Any, free: Callable[[], None],
+                      sides: Sequence[int] = OOM_LONG_SIDES) -> Tuple[bool, Any, Optional[int]]:
+    """read(arr); when the card runs out of memory: free its cache and read the page again with its long side
+    cut to each of `sides` in turn. Returns (ok, result, long side used or None for the full page). (False, None,
+    None) when every try ran out of memory: the page is left to the runner's CPU engine."""
+    ok, out = _attempt(lambda: read(arr))
+    if ok:
+        return True, out, None
+    free()
+    for side in sides:
+        small = downscale(arr, side)
+        if small is None:
+            continue
+        ok, out = _attempt(lambda: read(small))
+        if ok:
+            return True, out, side
+        free()
+    return False, None, None
+
+
+def _no_free() -> None:
+    return None
+
+
+def _skip(entry: Dict[str, Any], page: int, tries: Sequence[int]) -> None:
+    sides = ", ".join(["full size"] + [f"{s} px" for s in tries])
+    entry.setdefault("skipped", []).append({"page": int(page),
+                                            "reason": f"CUDA out of memory ({sides}); left to the CPU engine"})
+
+
+# --------------------------------------------------------------------------------------------------------
 # The core loop (testable with a fake dv)
 
 def read_all(src, dv, checkpoint: Callable[[], None], done: Dict[str, Any],
-             save: Callable[[Dict[str, Any]], None]) -> Dict[str, Any]:
+             save: Callable[[Dict[str, Any]], None], free: Optional[Callable[[], None]] = None) -> Dict[str, Any]:
     """Read every page of `src` (a model.Source) and return the runner-page-texts/1 dict.
 
     Per PDF: dv.read_pages(path, max(20, n), sideways) with dv._ocr_image wrapped: checkpoint() before every
     OCR page (never for a text-layer page), pages already in `done` reused (resume; their sideways flag is
     replayed), save() after every page. Per image file: checkpoint(), then dv.read_document(path) once.
-    On any exception (SlotInterrupted, SlotExpired, a crash) the partial dict (complete: false) is saved
+    A page that runs out of card memory (revision 2.3) is read again with its long side cut to 2000, then 1600
+    pixels after `free()` (torch.cuda.empty_cache); when it still does not fit, it is left out of the file
+    (listed under the file's "skipped") and the runner reads it on the CPU; the other pages go on.
+    On any other exception (SlotInterrupted, SlotExpired, a crash) the partial dict (complete: false) is saved
     before the exception goes on. `done` is an earlier partial file of the same input, or {}."""
+    free = free or _no_free
     done = done if isinstance(done, dict) else {}
     result: Dict[str, Any] = {"schema": SCHEMA, "complete": False, "engine": ENGINE_LABEL,
                               "mode": src.mode, "case_id": src.case_id, "files": [],
@@ -246,9 +326,9 @@ def read_all(src, dv, checkpoint: Callable[[], None], done: Dict[str, Any],
             if len(prev) >= sf.n_pages:
                 continue                                  # every page read in an earlier slot
             if sf.is_image:
-                _read_image(sf, entry, dv, checkpoint, save, result)
+                _read_image(sf, entry, dv, checkpoint, save, result, free)
             else:
-                _read_pdf(sf, entry, prev, dv, checkpoint, save, result)
+                _read_pdf(sf, entry, prev, dv, checkpoint, save, result, free)
     except BaseException:
         _close(result)
         save(result)
@@ -258,16 +338,37 @@ def read_all(src, dv, checkpoint: Callable[[], None], done: Dict[str, Any],
     return result
 
 
-def _read_image(sf, entry, dv, checkpoint, save, result) -> None:
+def _image_array(path: Path) -> Any:
+    """An image file as an RGB array (what EasyOCR's own loader gives for a path)."""
+    import numpy as np
+    from PIL import Image
+    with Image.open(path) as im:
+        return np.asarray(im.convert("RGB"))
+
+
+def _read_image(sf, entry, dv, checkpoint, save, result, free=_no_free) -> None:
     checkpoint()                                          # an image file is one OCR page
     t = time.perf_counter()
-    text = dv.read_document(Path(sf.path))[0]             # the runner's engine reads images the same way
-    entry["pages"] = [_rec(1, text, "image", False, time.perf_counter() - t)]
+    # the runner's engine reads images the same way (dv.read_document: EasyOCR on the file, no rotation retries)
+    ok, text = _attempt(lambda: dv.read_document(Path(sf.path))[0])
+    side = None
+    if not ok:                                            # once more at full size with the cache freed, then smaller
+        free()
+        ok, text, side = read_with_retries(lambda a: " ".join(dv._ocr_reader().readtext(a, detail=0)),
+                                           _image_array(Path(sf.path)), free, OOM_LONG_SIDES)
+    if not ok:
+        entry["pages"] = []
+        _skip(entry, 1, OOM_LONG_SIDES)
+    else:
+        rec = _rec(1, text, "image", False, time.perf_counter() - t)
+        if side:
+            rec["downscaled"] = side
+        entry["pages"] = [rec]
     _close(result)
     save(result)
 
 
-def _read_pdf(sf, entry, prev, dv, checkpoint, save, result) -> None:
+def _read_pdf(sf, entry, prev, dv, checkpoint, save, result, free=_no_free) -> None:
     layers = layer_texts(Path(sf.path))
     n = len(layers)
     if n != sf.n_pages:
@@ -287,6 +388,7 @@ def _read_pdf(sf, entry, prev, dv, checkpoint, save, result) -> None:
         return
     ocr_order = iter([p for p, t in enumerate(layers, 1) if len(t) < LAYER_MIN])
     real = dv._ocr_image
+    skipped: set = set()
 
     def on_card(arr, turned=None):
         p = next(ocr_order, None)
@@ -298,13 +400,28 @@ def _read_pdf(sf, entry, prev, dv, checkpoint, save, result) -> None:
                 turned.append(True)
             return rec["text"]
         checkpoint()                                      # between pages: the bot's check started / slot used up
-        here: List[bool] = []
         t0 = time.perf_counter()
-        text = real(arr, here)                            # the bot's _ocr_image: upright read + rotation retries
+        flags: List[List[bool]] = []
+
+        def read(a):
+            here: List[bool] = []
+            flags.append(here)
+            return real(a, here)                          # the bot's _ocr_image: upright read + rotation retries
+
+        ok, text, side = read_with_retries(read, arr, free, OOM_LONG_SIDES)
         seconds = time.perf_counter() - t0
+        if not ok:                                        # too large for the cap even when smaller: the CPU reads it
+            skipped.add(p)
+            _skip(entry, p, OOM_LONG_SIDES)
+            publish()
+            save(result)
+            return ""
+        here = flags[-1] if flags else []
         if turned is not None:
             turned.extend(here)
         pages[p] = _rec(p, text, "ocr", bool(here), seconds)
+        if side:
+            pages[p]["downscaled"] = side
         publish()
         save(result)
         return text
@@ -319,6 +436,8 @@ def _read_pdf(sf, entry, prev, dv, checkpoint, save, result) -> None:
         raise RuntimeError(f"read_pages returned {len(texts)} page(s) of {n}")
     for p, t in enumerate(texts, 1):
         rec = pages.get(p)
+        if rec is None and p in skipped:
+            continue                                      # left out: the runner reads it on the CPU
         if rec is None:
             raise RuntimeError(f"page {p} was not read")
         rec["text"] = t                                   # read_pages' own result is the page text
@@ -463,7 +582,15 @@ def run_session(src, out: Path, gg, dv, *, wait_s: float = WAIT_S, slot_s: float
                     return EXIT_NO_CUDA
                 state["peak"] = lambda: (round(torch.cuda.max_memory_allocated() / _GB, 3),
                                          round(torch.cuda.max_memory_reserved() / _GB, 3))
-                result = read_all(src, dv, slot.checkpoint, done, save)
+
+                def free() -> None:                                       # after an out-of-memory page
+                    import gc
+                    gc.collect()
+                    empty = getattr(torch.cuda, "empty_cache", None)
+                    if callable(empty):
+                        empty()
+
+                result = read_all(src, dv, slot.checkpoint, done, save, free)
                 srec["ended"] = "complete"
                 srec["slot_seconds"] = round(time.time() - t_slot, 2)
                 save(result)
@@ -507,6 +634,8 @@ def _print_slots(slots: Sequence[Dict[str, Any]]) -> None:
 
 def _print_result(result: Dict[str, Any], how: str) -> None:
     c = counts(result)
+    if c["skipped"]:
+        how += f" except {c['skipped']} page(s) too large for the card's memory cap (left to the CPU engine)"
     print(f"gpuread: {how}; files {len(result.get('files') or [])}; pages {c['read']}/{c['total']} "
           f"(layer {c['layer']}, ocr {c['ocr']}, image {c['image']}); GPU OCR {result.get('seconds_total')} s")
 

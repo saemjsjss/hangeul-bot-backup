@@ -176,11 +176,25 @@ def mrz_name(text: str) -> List[str]:
     return list(strict.words(" ".join(t for t in m.group(1).split("<") if t)))
 
 
+# revision 2.3: the examination a school certificate or transcript names ("Dakhil Examination 2020") says its level
+# better than any other word on it: a Dakhil (SSC) transcript printing its school's name "... Alim Madrasah" read as
+# HSC, and a folder file's levels are now cut apart by level. Only HSC / SSC: a degree page that names an HSC exam
+# stays a degree.
+_EXAM_LEVELS = [("HSC", r"higher\s+secondary(?:\s+certificate)?\s+exam|\balim\s+exam|\bh\.?\s?s\.?\s?c\.?\s+exam"),
+                ("SSC", r"secondary\s+school(?:\s+certificate)?\s+exam|\bdakhil\s+exam|\bs\.?\s?s\.?\s?c\.?\s+exam")]
+
+
 def level_of(text: str) -> Optional[Tuple[str, int]]:
-    """The academic level the text names first in _LEVELS order: (name, rank) or None."""
+    """The academic level the text names first in _LEVELS order: (name, rank) or None. Revision 2.3: between HSC and
+    SSC, the level of the first examination the text names wins ("Dakhil Examination" -> SSC)."""
     tl = re.sub(r"\s+", " ", (text or "").lower())
     for name, rank, rx in _LEVELS:
         if re.search(rx, tl):
+            if name in ("HSC", "SSC"):
+                hits = [(m.start(), lv) for lv, ex in _EXAM_LEVELS for m in [re.search(ex, tl)] if m]
+                if hits:
+                    lv = min(hits)[1]
+                    return lv, LEVEL_RANK[lv]
             return name, rank
     return None
 

@@ -390,11 +390,12 @@ class TestFolder(unittest.TestCase):
         res, seg, pages = self.folder(files)
         self.assertEqual(res.notices, [])
         self.assertFalse(res.stop)
-        by_file = {u.source_file: u for u in res.units}
-        self.assertEqual(len(res.units), len(files))
-        acad = by_file["ACADEMIC CERTIFICATE.pdf"]
-        self.assertEqual((acad.key, acad.title, acad.level), ("academic", "ACADEMIC (HSC, SSC)", ""))
-        self.assertEqual([lv for _, _, lv in acad.sub], ["HSC", "SSC"])
+        by_file = {u.source_file: u for u in res.units if not u.part}
+        # revision 2.3: a file that holds several documents is cut into them (two levels; trade licence + TIN)
+        self.assertEqual(len(res.units), len(files) + 2)
+        acads = [u for u in res.units if u.source_file == "ACADEMIC CERTIFICATE.pdf"]
+        self.assertEqual([(u.key, u.title, u.level, u.part) for u in acads],
+                         [("academic", "ACADEMIC HSC", "HSC", "p1-2"), ("academic", "ACADEMIC SSC", "SSC", "p3-4")])
         dc = by_file["DEATH CERTIFICATE.pdf"]
         self.assertEqual((dc.key, dc.role, dc.role_how), ("father_death_cert", "father", "name"))
         mo = by_file["MOTHER NID.pdf"]
@@ -402,10 +403,11 @@ class TestFolder(unittest.TestCase):
         bank = by_file["BANK STATEMENT.pdf"]
         self.assertEqual([(f.verdict, f.rule) for f in bank.notes], [(FLAG, "split.name_vs_content")])
         self.assertTrue(all(not u.notes for u in res.units if u is not bank))
-        tl = by_file["TRADE LICENSE.pdf"]
-        self.assertEqual((tl.key, tl.fine, tl.title), ("trade_license", "trade_license", "TRADE LICENSE (+ TIN CERTIFICATE)"))
-        self.assertEqual([t for _, _, t in tl.sub], ["trade_license", "tin_certificate"])
-        self.assertEqual(res.missing, [])                     # the TIN pages inside TRADE LICENSE.pdf fill "tin"
+        tls = [u for u in res.units if u.source_file == "TRADE LICENSE.pdf"]
+        self.assertEqual([(u.key, u.fine, u.title, u.part) for u in tls],
+                         [("trade_license", "trade_license", "TRADE LICENSE", "p1"),
+                          ("trade_license", "tin_certificate", "TIN CERTIFICATE", "p2")])
+        self.assertEqual(res.missing, [])                     # the TIN page inside TRADE LICENSE.pdf fills "tin"
         staged = {name: Path(r"C:\Hangeul\DOCCHECK\lab\private-runner\runs\X\docs") / name for name, _, _ in files}
         SP.attach_paths(res, staged)
         self.assertEqual(by_file["PASSPORT.pdf"].path, staged["PASSPORT.pdf"])

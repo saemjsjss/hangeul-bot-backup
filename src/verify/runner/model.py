@@ -7,9 +7,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-RUNNER_VERSION = "0.2.1"
+RUNNER_VERSION = "0.2.4"
 BASE_RULES_VERSION = "2026-10-21.3"      # the bot rules in the worktree's src/verify (commit 07b1f22)
-RUNNER_RULES_VERSION = "2026-10-27.r2.1"   # + the owner's 21-27 Oct decisions (A1-A8), applied in the runner only
+RUNNER_RULES_VERSION = "2026-10-28.r2.4"   # + the owner's 21-27 Oct decisions (A1-A8), applied in the runner only
 RUN_SCHEMA = "runner-run/2"
 PAGE_TEXTS_SCHEMA = "runner-page-texts/1"   # gpuread.py writes it, engine.load_page_texts reads it (5.2.1)
 
@@ -96,6 +96,10 @@ class Source:
     root: Path                       # the bundle file or the folder
     files: List[SourceFile]
     case_id: str                     # "B-<sha1 of bundle bytes>[:16]" | "F-<sha1 of name|size|mtime list>[:16]"
+    # folder mode, revision 2.3: files the runner cannot check, (file name, why): "not a PDF or image" (an .odg,
+    # a .docx ...) or "could not be opened" (a broken or password-protected PDF or image). Listed in the report
+    # as "Not checked (...)"; never a document, never a slot.
+    not_checked: List[Tuple[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -142,6 +146,9 @@ class DocUnit:
     path: Optional[Path] = None      # file the bot checkers read: cut sub-PDF, staged copy or photo crop
     source_file: str = ""            # folder mode: the input file name
     notes: List[Finding] = field(default_factory=list)              # split-level findings about this unit
+    # folder mode, revision 2.3: "p4-6" when the unit is one of several documents cut out of its file (the
+    # pages inside that file); "" when the unit is the whole file (or in a bundle)
+    part: str = ""
 
 
 @dataclass
@@ -299,3 +306,5 @@ class RunResult:
     headline: str
     timings: Dict[str, float]
     safety: Dict[str, Any]
+    # folder mode, revision 2.3: Source.not_checked, (file name, why), one "Not checked (...)" summary line each
+    not_checked: List[Tuple[str, str]] = field(default_factory=list)

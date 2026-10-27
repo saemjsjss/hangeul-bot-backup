@@ -66,6 +66,7 @@ SOLVENCY_MISSING_TEXT = "BANK SOLVENCY CERTIFICATE MISSING"   # printed by verdi
 OPTIONAL_SLOTS = ["student_nid", "language_cert", "affidavit", "eca", "personal_statement", "recommendation",
                   "id_card_cv"]                         # never reported missing; income tax is optional outside MASTER
 HINT_MIN = 5.0          # cue score for "page N reads partly like the missing document"
+PRESENT_ONLY_KEYS = frozenset({"id_card_cv"})   # never read (owner, 21 Oct): no split.name_vs_content either (rev 2.4)
 
 
 def slots_for(program: str) -> List[str]:
@@ -324,6 +325,10 @@ class Doc:
     attached: List[int] = field(default_factory=list)   # trailing pages kept with income tax (A6 f)
     key: str = ""                # folder mode: the file-name key (ingest.classify_name), "" when unknown
     file: str = ""               # folder mode: the input file name
+    # folder mode, revision 2.3: one of several documents of a file that holds several (cut out of it)
+    part: bool = False
+    file_start: int = 0          # part: the run index of the file's first page
+    file_key: str = ""           # part: the key the file's NAME gives (key is set only on the part it names)
 
 
 @dataclass
@@ -444,6 +449,11 @@ def split_academic(feats, a: int, b: int) -> List[Tuple[int, int, str]]:
     for i in range(a, b + 1):
         f = feats[i]
         if f.kind == "apostille":
+            pending.append(i)
+            continue
+        if pending and not f.level and f.page_kind not in ("certificate", "transcript"):
+            # rev 2.3: a page with no academic sign right after an e-Apostille (a certificate scanned upside down,
+            # a blank back) goes where that apostille goes: with the level that follows it
             pending.append(i)
             continue
         new = not sets
@@ -733,10 +743,141 @@ def _file_fine(name: str) -> Optional[str]:
     return None
 
 
+_NID_BLOCK = ("nid", "death_cert")
+
+
+def _shifted(d: Doc, a: int) -> Doc:
+    """A Doc of a file's own page list (0-based in the file) moved to run indexes (the file starts at run page a)."""
+    return replace(d, start=d.start + a, end=d.end + a, sub=[(s + a, e + a, x) for s, e, x in d.sub],
+                   attached=[i + a for i in d.attached])
+
+
+def _known_levels(d: Doc) -> List[str]:
+    out: List[str] = []
+    for _, _, lv in d.sub:
+        if lv and lv != "?" and lv not in out:
+            out.append(lv)
+    return out
+
+
+def _fin_types(d: Doc) -> List[str]:
+    out: List[str] = []
+    for _, _, t in d.sub:
+        if t in FINANCIAL_TITLE and t not in out:
+            out.append(t)
+    return out
+
+
+def _n_documents(d: Doc) -> int:
+    """How many documents the bundle rules make of one Doc of a file: academic levels (two known levels or more),
+    financial parts (two fine types or more), one otherwise; unrecognised pages are no document."""
+    if d.label == "unrecognised":
+        return 0
+    if d.label == "academic":
+        return max(1, len(_known_levels(d)))
+    if d.label == "financial":
+        return max(1, len(_fin_types(d)))
+    return 1
+
+
+_BLANK_NOT_TO = ("bank", "unrecognised")      # rev 2.4: a blank page never joins these inside a file
+
+
+def _extend(d: Doc, end: int) -> None:
+    """Doc `d` runs on to page `end` (its last part too)."""
+    d.end = end
+    if d.sub:
+        s, _, t = d.sub[-1]
+        d.sub[-1] = (s, end, t)
+
+
+def _weak_page(t: PageType) -> bool:
+    """A page that reads at most partly like any document (best cue <= HINT_MIN, or 'other' / empty)."""
+    return t.best in ("other", "photo") or float(t.score) <= HINT_MIN
+
+
+def _absorb_sandwiched(out: List[Doc], types: Sequence[PageType]) -> List[Doc]:
+    """Revision 2.4, inside ONE folder file only: documents of a file's pages lying between two documents of the
+    same kind belong to that document when they are only floats or unrecognised pages and every page of them reads
+    at most partly like any document (_weak_page). Owner folder 9: an 8-page return of income whose schedule pages
+    read weakly (2 to 5) became INCOME TAX + UNRECOGNISED + AFFIDAVIT + INCOME TAX; it is one INCOME TAX. A float
+    that reads clearly (an affidavit page above HINT_MIN) stays its own document. Academic and financial documents
+    get their parts again over the joined pages (split_academic / split_financial)."""
+    res = list(out)
+    k = 0
+    while k < len(res):
+        d = res[k]
+        if d.label == "unrecognised" or d.label in FLOATS:
+            k += 1
+            continue
+        m = next((x for x in range(k + 1, len(res)) if res[x].label == d.label), None)
+        between = res[k + 1:m] if m is not None else []
+        if (m is not None and m > k + 1 and
+                all(x.label in FLOATS and all(_weak_page(types[i]) for i in range(x.start, x.end + 1))
+                    for x in between)):
+            j = replace(d, end=res[m].end, attached=list(res[m].attached), sub=[])
+            if d.label == "academic":
+                j.sub = split_academic(types, j.start, j.end)
+            elif d.label == "financial":
+                j.sub = split_financial(types, j.start, j.end)
+            res[k:m + 1] = [j]
+            continue
+        k += 1
+    return res
+
+
+def file_documents(types: Sequence[PageType], a: int, b: int, key: str = "", fname: str = "") -> Optional[List[Doc]]:
+    """Revision 2.3 (the owner's folders combine documents: "FINANCIAL DOCUMENTS", "ACADEMIC DOCUMENTS ATTESTED"):
+    the documents a folder file holds, by the bundle split's own rules run on the file's pages alone (run pages
+    a..b): the alignment to the fixed order (bank solvency then statement; trade licence / employment certificate;
+    TIN; income tax), the academic levels (newest first, certificate then transcript, e-Apostille pages with the
+    level they certify) and the financial parts. Inside one file the NID block is not split into persons (the
+    file is one person's card) and a page with little text is no photo unless the name says so. Returns the parts
+    (Doc.part, run indexes) when they make two documents or more, else None (the file stays one unit, as before).
+    No ORDER notice in folder mode: a part out of the file's order is judged where it is."""
+    if b <= a:
+        return None
+    sub = list(types[a:b + 1])
+    out: List[Doc] = []
+    for d in documents(sub, align(sub)):
+        d = _shifted(d, a)
+        prev = out[-1] if out else None
+        if (d.label in ("photo", "unrecognised") and KEY_LABEL.get(key) != "photo"
+                and all(types[i].best == "photo" for i in range(d.start, d.end + 1))):
+            # rev 2.4: empty pages inside a file (typed "photo" for their emptiness) are the blank back of the page
+            # before them (owner folder 9: the income-tax certificate's back became an UNRECOGNISED PAGES FLAG);
+            # never a bank document's pages (their count is a rule), never the first page (unrecognised, as before)
+            if prev is not None and prev.label not in _BLANK_NOT_TO:
+                _extend(prev, d.end)
+                continue
+        if d.label == "photo" and KEY_LABEL.get(key) != "photo":
+            d = replace(d, label="unrecognised", sub=[], attached=[])
+        if prev is not None and d.label in _NID_BLOCK and prev.label in _NID_BLOCK:
+            prev.end = d.end                          # one file: one person's card (translation and original)
+            if d.label == "nid":
+                prev.label = "nid"
+            continue
+        if prev is not None and d.label == "unrecognised" and prev.label == "unrecognised":
+            prev.end = d.end
+            continue
+        out.append(d)
+    out = _absorb_sandwiched(out, types)
+    if sum(_n_documents(d) for d in out) < 2:
+        return None
+    want = KEY_LABEL.get(key)
+    for d in out:
+        d.part, d.file, d.file_start, d.file_key = True, fname, a, key
+        d.misplaced = False                           # folder mode: no ORDER / NOT JUDGED for a part
+        d.key = key if (key and want == d.label) else ""
+        d.role, d.role_how = "", ""
+    return out
+
+
 def segment_folder(src: Source, pages: List[PageRead], types: List[PageType]) -> Segmentation:
     """One Doc per input file (pages in run order). The label is the section / float of the file's
-    name key (ingest.classify_name), or of its majority page type when the name gives none. A file
-    holding several fine types or levels keeps one Doc with `sub` = its parts."""
+    name key (ingest.classify_name), or of its majority page type when the name gives none. Revision 2.3:
+    a file whose pages make several documents by the bundle rules (file_documents) gives one Doc per
+    document (Doc.part); a file of one document keeps one Doc, with `sub` = its parts."""
     docs: List[Doc] = []
     for sf in src.files:
         idx = [p.index for p in pages if p.file == sf.name]
@@ -744,6 +885,11 @@ def segment_folder(src: Source, pages: List[PageRead], types: List[PageType]) ->
             continue
         a, b = min(idx), max(idx)
         key = sf.key_by_name or ""
+        if idx == list(range(a, b + 1)):
+            parts = file_documents(types, a, b, key, sf.name)
+            if parts:
+                docs.extend(parts)
+                continue
         guess = _majority_label(types, a, b)
         if not key and guess == "photo":       # a file with little text is not the photo unless its name says so
             guess = None
@@ -775,9 +921,13 @@ def _units(seg: Segmentation, docs: Sequence[Doc], with_roles: bool) -> List[Tup
     def add(key, fine, title, a, b, d, level="", sub=None):
         role = d.role if with_roles and d.role in ORDER_ROLES else ""
         how = d.role_how if role else ""
+        part = ""
+        if d.part:                                   # rev 2.3: the pages inside the file ("p4-6")
+            x, y = a - d.file_start + 1, b - d.file_start + 1
+            part = f"p{x}" if x == y else f"p{x}-{y}"
         u = DocUnit(uid="", key=key, fine=fine, title=title, pages=list(range(a, b + 1)), role=role,
                     role_how=how, misplaced=d.misplaced, level=level, sub=list(sub or []),
-                    source_file=d.file)
+                    source_file=d.file, part=part)
         out.append((u, d))
 
     for d in docs:
@@ -790,7 +940,7 @@ def _units(seg: Segmentation, docs: Sequence[Doc], with_roles: bool) -> List[Tup
             add(key, d.label, TITLE[key], d.start, d.end, d)
         elif d.label == "academic":
             subs = d.sub or [(d.start, d.end, "?")]
-            if seg.mode == "bundle":
+            if seg.mode == "bundle" or (d.part and len(_known_levels(d)) >= 2):   # rev 2.3: a file's levels
                 for s, e, lv in subs:
                     lv = "" if lv == "?" else lv
                     add("academic", "academic", f"ACADEMIC {lv.upper()}".strip(), s, e, d, level=lv)
@@ -805,7 +955,7 @@ def _units(seg: Segmentation, docs: Sequence[Doc], with_roles: bool) -> List[Tup
                     sub=[(s, e, "" if lv == "?" else lv) for s, e, lv in subs] if len(subs) > 1 else [])
         elif d.label == "financial":
             subs = d.sub or [(d.start, d.end, "financial?")]
-            if seg.mode == "bundle":
+            if seg.mode == "bundle" or d.part:                                     # rev 2.3: a file's parts
                 for s, e, t in subs:
                     fine = _resolve_fine(feats, s, e, t)
                     add("trade_license", fine, FINANCIAL_TITLE[fine], s, e, d)
@@ -1068,13 +1218,30 @@ def _finish_folder(seg: Segmentation, types: List[PageType], pages: List[PageRea
     units = [u for u, _ in pairs]
     for u, d in pairs:
         _unit_notes(u, d)
-        if d.key:
+        # rev 2.4: the ID card / CV is present-only (owner, 21 Oct): never read, so no content FLAG either (a CV's
+        # personal table prints the NID and passport numbers and read "like NID" in owner folder 3)
+        if d.key and not d.part and d.key not in PRESENT_ONLY_KEYS:
             got = _majority_label(types, d.start, d.end)
             want = KEY_LABEL.get(d.key)
             if got and want and got != want:
                 u.notes.append(_finding(FLAG, "split.name_vs_content",
                                         f"the file name says {NICE[want]} but its pages read like {NICE[got]} — "
                                         f"check by eye", u.pages, name_label=want, content_label=got))
+    # rev 2.3: a file cut into several documents, none of them the one its name says
+    by_file: Dict[str, List[Tuple[DocUnit, Doc]]] = {}
+    for u, d in pairs:
+        if d.part:
+            by_file.setdefault(d.file, []).append((u, d))
+    for fname, ud in by_file.items():
+        want = KEY_LABEL.get(ud[0][1].file_key)
+        labels = [d.label for _, d in ud if d.label != "unrecognised"]
+        if not want or want in labels:
+            continue
+        got = ", ".join(dict.fromkeys(NICE[x] for x in labels))
+        for u, d in ud:
+            u.notes.append(_finding(FLAG, "split.name_vs_content",
+                                    f"the file name says {NICE[want]} but its pages read like {got} — check by eye",
+                                    u.pages, name_label=want, content_label=d.label))
     missing, maybe = _missing(units, program)
     return SplitResult(units=units, notices=[], missing=missing, stop=False, maybe=maybe)
 

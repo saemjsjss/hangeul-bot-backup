@@ -1200,10 +1200,13 @@ def parse_payload(payload: str) -> Dict[str, Any]:
         fields: Dict[str, str] = {}
         for name, value in params.items():                 # a URL that carries the record itself
             v = value.strip()
+            low = re.sub(r"[^a-z]", "", name.lower())
             if _BRN_RE.fullmatch(v):
                 fields["brn"] = v
             elif re.fullmatch(r"\d{4}-\d{2}-\d{2}|\d{2}[/-]\d{2}[/-]\d{4}", v):
                 fields["dob"] = v
+            elif low in _QR_PARENT_KEYS and re.search(r"[A-Za-z]{2}", v):      # revision 2.3: the parents
+                fields[_QR_PARENT_KEYS[low]] = v
             elif name.lower() in ("name", "fullname", "full_name", "nm") and re.search(r"[A-Za-z]{2}", v):
                 fields["name"] = v
         out["text_fields"] = fields
@@ -1216,11 +1219,53 @@ def parse_payload(payload: str) -> Dict[str, Any]:
     m = re.search(r"(\d{2}[/-]\d{2}[/-]\d{4}|\d{4}-\d{2}-\d{2})", s)
     if m:
         fields["dob"] = m.group(1)
-    m = re.search(r"name\s*[:=]\s*([A-Za-z .'-]{3,})", s, re.I)
-    if m:
-        fields["name"] = m.group(1).strip()
+    fields.update(_text_name_fields(s))
     out["text_fields"] = fields
     return out
+
+
+# revision 2.3: a payload that carries the parents' names (the owner: the bilingual QR must decode and MATCH)
+_QR_PARENT_KEYS = {"father": "father", "fathername": "father", "fathersname": "father",
+                   "mother": "mother", "mothername": "mother", "mothersname": "mother"}
+_QR_LABEL = re.compile(r"(?i)\b(?:(father|mother)(?:'?s)?\s*(?:name)?|(?<![a-z])name)\s*[:=]\s*")
+_QR_VALUE_END = re.compile(r"(?i)[\n\r;,|]|\b(?:father|mother|name|date|dob|birth|brn|reg|sex|gender)\b")
+
+
+def _text_name_fields(s: str) -> Dict[str, str]:
+    """A text payload's 'Name:', "Father's Name:" and "Mother's Name:" values ({"name", "father", "mother"}); a
+    value ends at a line break, a separator or the next field word. The first of each kind counts."""
+    out: Dict[str, str] = {}
+    for m in _QR_LABEL.finditer(s or ""):
+        key = (m.group(1) or "name").lower()
+        rest = s[m.end():]
+        end = _QR_VALUE_END.search(rest)
+        value = re.sub(r"[^A-Za-z .'-]", " ", rest[:end.start()] if end else rest)
+        value = " ".join(value.split()).strip(" .'-")
+        if key not in out and len(re.sub(r"[^A-Za-z]", "", value)) >= 3:
+            out[key] = value
+    return out
+
+
+def qr_names(facts: BirthFacts) -> Dict[str, str]:
+    """The names a decoded birth-certificate payload carries: {"student": .., "father": .., "mother": ..} (only
+    those present). The genuine bdris verification link carries none (an opaque key)."""
+    tf = (facts.qr or {}).get("text_fields") or {}
+    out = {"student": str(facts.qr_name or tf.get("name") or "")}
+    for p in ("father", "mother"):
+        out[p] = str(tf.get(p) or "")
+    return {k: v for k, v in out.items() if v and strict.letters(v)}
+
+
+def qr_parent_reads(facts: BirthFacts, unit: DocUnit) -> List[MachineRead]:
+    """The parents' names a birth-certificate QR payload carries, as machine reads (A1: letters, never dots) for
+    names.py: a parent's reference (this certificate's printed read) is confirmed by them when the letters agree
+    (revision 2.3)."""
+    if facts.qr_status != "decoded":
+        return []
+    page = int((facts.qr or {}).get("page", unit.pages[0] if unit.pages else 0))
+    names = qr_names(facts)
+    return [MachineRead(unit=unit.uid, person=p, name=names[p], source="birth QR", page=page)
+            for p in ("father", "mother") if names.get(p)]
 
 
 def decode_birth_qr(image, page: int = 0, dpi: int = IMAGE_DPI, budget_s: float = QR_BUDGET_S,
@@ -2027,6 +2072,7 @@ def check_birth_certificate(facts: BirthFacts, unit: DocUnit, ident: Identity, p
     _notary_rows(facts, add, P)
     if facts.format == "bilingual_qr":
         _qr_rows(facts, unit, add, P, printed_name, printed_confirmed, confirm)
+        _qr_parent_rows(facts, unit, ident, add, P)
     _dob_rows(facts, ident, add, P)
     brn = facts.brn or facts.qr_brn
     if brn and len(brn) == 17 and facts.dob is not None and brn[:4] != f"{facts.dob.year:04d}":
@@ -2177,6 +2223,37 @@ def _qr_rows(facts: BirthFacts, unit: DocUnit, add, P, printed_name: str, printe
         else:
             add(FLAG, "birth.qr_dob", f"the QR's date of birth {facts.qr_dob.isoformat()} differs from the "
                 f"printed {facts.dob.isoformat()} (one reading) — check by eye", pg)
+
+
+def _qr_parent_rows(facts: BirthFacts, unit: DocUnit, ident: Optional[Identity], add, P) -> None:
+    """Revision 2.3: a decoded payload that carries a parent's name must match the certificate's printed read of it
+    (identity's reference, when it was read off this certificate): the same letters (any order, dots aside) ->
+    PASS, and names.py takes the QR as the independent read that confirms the reference; else FLAG "check by
+    eye" (the printed side is a whole-page OCR read, so never FAIL here; names.py then treats the reference as
+    unconfirmed)."""
+    if facts.qr_status != "decoded":
+        return
+    q = facts.qr or {}
+    qp = q.get("page")
+    pg = [P(qp)] if isinstance(qp, int) else []
+    found = qr_names(facts)
+    for person in ("father", "mother"):
+        name = found.get(person)
+        if not name:
+            continue
+        ref = getattr(ident, person, None) if ident is not None else None
+        printed = (ref.written or " ".join(ref.parts)) if (ref is not None and ref.unit == unit.uid
+                                                           and ref.source == "birth certificate") else ""
+        if not strict.letters(printed):
+            add(FLAG, f"birth.qr_{person}", f"the QR carries the {person}'s name, but the printed one could not be "
+                "read — compare them by eye", pg)
+            continue
+        kind = strict.compare(name, printed, any_order=True, dots=False)
+        if kind == "EQUAL":
+            add(PASS, f"birth.qr_{person}", f"the {person}'s name in the QR is the printed name", pg)
+        else:
+            add(FLAG, f"birth.qr_{person}", f"the {person}'s name in the QR differs from the printed read ({kind}) — "
+                f"check by eye{', ' + _pages_text(pg) if pg else ''}", pg, kind=kind, qr_name=name, printed=printed)
 
 
 def _dob_rows(facts: BirthFacts, ident: Identity, add, P) -> None:
