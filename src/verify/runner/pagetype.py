@@ -1,0 +1,260 @@
+"""Per-page features for the order-aware split (RUNNER_SPEC section 5.3, revision 2; Task 2).
+
+A port of the lab's order_split.py lines 99-238 (the page features). The page's cue scores come from the
+prototype recogniser (`prototype_page_types.score_page`, `OTHER_BELOW`, `EMPTY_CHARS`), reached through
+`botimport.load().P` so the bot code is always the worktree's, with the stub config.
+
+Changes from the lab (the only ones):
+  * the name helpers (`_name_after`, `labelled`, `mrz_name`) use `strict.words` instead of the bot's
+    `name_tokens` (which drops initials, two-letter words and honorifics): role scoring is strict (S8);
+  * a page with no text layer whose one embedded image covers the page (`image_only`) and that reads
+    fewer than 150 characters is the photo (score 5.0), so a scanned photo page with OCR specks is found;
+  * bank pages get a kind: "solvency" (SOLVENCY_CUE) or "statement" (STATEMENT_CUE);
+  * the result is a `model.PageType`: `best` is the best fine type, or "other" when its score is under
+    the prototype's OTHER_BELOW bar (as `predict_page` says it); `score` is that best score; `level` is
+    the level's name; `nid_numbers` and `birth_dates` are sorted lists (dates as ISO text);
+  * `kind` is the academic kind (apostille / certificate / transcript) only on pages that show some
+    academic sign (an academic cue, a level, grades, or certificate wording on a page no type claims),
+    the bank kind on bank pages, and "" on every other page. Inside the academic block the split reads a
+    page without a kind as the lab did ("transcript", pagetype.academic_kind).
+
+No personal data: the module holds cue words only.
+"""
+from __future__ import annotations
+
+import re
+from typing import Dict, List, Optional, Sequence, Set, Tuple
+
+from . import botimport, strict
+from .model import PageRead, PageType
+
+# ------------------------------------------------------------------------- the prototype recogniser
+
+
+def _bot():
+    """The bot code (botimport.load()); the root already loaded wins, so the runner's cache root is kept."""
+    return botimport._loaded if botimport._loaded is not None else botimport.load()
+
+
+def proto():
+    """`src.verify.prototype_page_types` from the worktree (score_page, OTHER_BELOW, EMPTY_CHARS ...)."""
+    return _bot().P
+
+
+# prototype fine type -> bot key (prototype_page_types.COARSE, with "other" -> "unrecognised").
+# "nid" and "death_cert" need a role: split.finish turns them into father_nid / mother_death_cert ...
+FINE_TO_KEY: Dict[str, str] = {
+    "passport": "passport", "photo": "photo",
+    "nid": "nid", "nid_translation": "nid",
+    "birth_cert": "birth_cert", "death_cert": "death_cert", "family_cert": "family_cert",
+    "academic_apostille": "academic", "academic_certificate": "academic", "academic_transcript": "academic",
+    "bank_solvency": "bank", "bank_statement": "bank",
+    "trade_license": "trade_license", "tin_certificate": "trade_license",
+    "employment_certificate": "trade_license",
+    "income_tax": "income_tax", "language_cert": "language_cert", "affidavit": "affidavit",
+    "personal_statement": "personal_statement", "recommendation": "recommendation", "eca": "eca",
+    "id_card_cv": "id_card_cv", "other": "unrecognised",
+}
+
+ACADEMIC_FINE = ("academic_apostille", "academic_certificate", "academic_transcript")
+BANK_FINE = ("bank_solvency", "bank_statement")
+ACADEMIC_KINDS = ("apostille", "certificate", "transcript")
+BANK_KINDS = ("solvency", "statement")
+PHOTO_IMAGE_CHARS = 150          # image_only page reading fewer characters than this: the photo (5.3)
+SOLVENCY_CUE = re.compile(r"solvency|to\s+whom\s+it\s+may\s+concern|this\s+is\s+to\s+certify", re.I)
+STATEMENT_CUE = re.compile(r"statement\s+of\s+account|opening\s+balance|closing\s+balance|withdraw|deposit",
+                           re.I)
+
+# ------------------------------------------------------------------------- order_split L95-121 (ported)
+# Translation cue, letterhead / typed-page only. A bare "translation" also sits on the translation
+# centre's stamp that is pressed on the ORIGINAL card copy, and notary / NID-back words fire on every
+# page of a notarised bundle. "Translated" / "true copy" is the letterhead's own wording; a page that
+# says "translat..." AND is mostly clean English words is a typed translation, not a card scan.
+_LETTERHEAD = re.compile(r"translated|true\s*copy")
+_TRANSLAT = re.compile(r"translat")
+ENGLISH_TYPED = 0.45
+_NID_NO = re.compile(r"(?:\bn?id|national\s+id(?:\s+card)?)\s*(?:no|number|n0|#)?\s*[.:;\-]?\s*(\d(?:[ ]?\d){9,16})(?!\d)")
+_MON = {m: i for i, m in enumerate(["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct",
+                                     "nov", "dec"], 1)}
+_DOB_WORD = re.compile(r"birth\W{0,4}(\d{1,2})\s*[\-./ ]?\s*([a-z]{3,9})\s*[\-./, ]?\s*(\d{4})")
+_DOB_NUM = re.compile(r"birth\W{0,4}(\d{1,2})[\-./](\d{1,2})[\-./](\d{4})")
+_GRADE = re.compile(r"(?<![a-z0-9])(?:a\+|a-|a|b|c|d|f)\s*[\s:]\s*\d\.\d{1,2}(?!\d)")
+_CERT_WORDS = re.compile(r"certify that|duly passed|has passed|passed the|this is to certify")
+_LEVELS = [("degree", 4, r"bachelor|master|degree|university"), ("diploma", 3, r"diploma|polytechnic"),
+           ("HSC", 2, r"higher secondary|\bhsc\b|\balim\b"), ("SSC", 1, r"secondary school|\bssc\b|dakhil")]
+LEVEL_RANK: Dict[str, int] = {name: rank for name, rank, _ in _LEVELS}
+_NAME_STOP = {"father", "fathers", "mother", "mothers", "husband", "wife", "spouse", "date", "birth", "dob",
+              "sex", "gender", "address", "present", "permanent", "nid", "id", "no", "number", "place",
+              "nationality", "religion", "occupation", "blood", "signature", "son", "daughter", "of", "and",
+              "the", "card", "holder", "registration", "issue", "relation", "relationship", "name", "names",
+              "mobile", "village", "post", "district", "age", "late", "deceased", "cause", "in", "word", "is",
+              "was", "passport", "bangladesh", "nationality", "personal", "legal", "guardian", "emergency",
+              # boilerplate seen right after a name on the forms (photo box, nationality, OCR of Bangla)
+              "picture", "photo", "photograph", "affixed", "whole", "bangladeshi", "jon", "fet", "seal",
+              "signed", "sign", "copy", "true", "translated", "translation", "notary", "advocate"}
+
+
+def _eng_ratio(t: str) -> float:
+    toks = t.split()
+    if not toks:
+        return 0.0
+    good = sum(1 for w in toks if re.fullmatch(r"[A-Za-z][a-z]{2,}[:.,;]?|[A-Z]{3,}[:.,;]?", w))
+    return good / len(toks)
+
+
+def nid_numbers(tl: str) -> Set[str]:
+    """NID / birth-registration numbers after an ID label (10, 13 or 17 digits; a 17-digit number is
+    kept as its last 13). `tl`: the page text lower-cased with whitespace runs as one space."""
+    boiler = proto().R.BOILERPLATE_NUMBERS
+    out = set()
+    for m in _NID_NO.finditer(tl):
+        d = m.group(1).replace(" ", "")
+        if len(d) in (10, 13, 17) and d not in boiler:
+            out.add(d[-13:] if len(d) == 17 else d)
+    return out
+
+
+def birth_dates(tl: str) -> Set[Tuple[int, int, int]]:
+    """(year, month, day) read right after a birth label ("Birth: 01 Jan 2000", "birth 01/01/2000")."""
+    out = set()
+    for m in _DOB_WORD.finditer(tl):
+        mo = _MON.get(m.group(2)[:3])
+        if mo:
+            out.add((int(m.group(3)), mo, int(m.group(1))))
+    for m in _DOB_NUM.finditer(tl):
+        out.add((int(m.group(3)), int(m.group(2)), int(m.group(1))))
+    return out
+
+
+def _iso(d: Tuple[int, int, int]) -> str:
+    return f"{d[0]:04d}-{d[1]:02d}-{d[2]:02d}"
+
+
+def _name_after(text: str, start: int) -> List[str]:
+    kept = []
+    for tok in text[start:start + 120].split()[:7]:
+        # "_" too: OCR prints an initial's dot as "_" ("A_ SAMPLE"), as names.py reads it (integration, test 1)
+        w = re.sub(r"[’']s$", "", tok.strip(".,:;'\"()[]’_"))
+        if not w or not re.fullmatch(r"[A-Za-z][A-Za-z.'\-]*", w):
+            break
+        if w.lower().replace(".", "") in _NAME_STOP:
+            break
+        if len(w) == 1 and w.islower():                       # Bangla read as a stray letter
+            break
+        kept.append(w)
+        if len(kept) == 5:
+            break
+    return list(strict.words(" ".join(kept)))
+
+
+def labelled(text: str, label: str) -> List[List[str]]:
+    """Name-word lists (strict.words, upper case) written after `label` ("name", "father", "mother").
+    For "name" the label must not be someone else's name field (Father's Name, Mother's Name, Husband's
+    Name)."""
+    out = []
+    low = (text or "").lower()
+    for m in re.finditer(r"\b" + label + r"(?:'?s)?\b\s*(?:name)?\s*[:;.\-]?\s*", low):
+        if label == "name":
+            before = low[max(0, m.start() - 14):m.start()]
+            # Kept as in the lab: "Father's Name" (with the apostrophe) is NOT skipped. On NID translations
+            # OCR often reads the labels and the values as two columns ("Name: Father's Name: <holder>
+            # <father> ..."), and the value after it is then the holder's own; skipping it lost one right
+            # person on the held-out bundles (sim_split, 27 Oct).
+            if re.search(r"(father|mother|husband|spouse|wife|guardian|fathers|mothers)\W*$", before):
+                continue
+        toks = _name_after(text, m.end())
+        if toks:
+            out.append(toks)
+    return out
+
+
+def mrz_name(text: str) -> List[str]:
+    """The name words of a passport MRZ line 1 ("P<BGD<surname><<<given>..."), surname first."""
+    m = re.search(r"p\s?<\s?bgd([a-z<]{6,})", (text or "").lower())
+    if not m:
+        return []
+    return list(strict.words(" ".join(t for t in m.group(1).split("<") if t)))
+
+
+def level_of(text: str) -> Optional[Tuple[str, int]]:
+    """The academic level the text names first in _LEVELS order: (name, rank) or None."""
+    tl = re.sub(r"\s+", " ", (text or "").lower())
+    for name, rank, rx in _LEVELS:
+        if re.search(rx, tl):
+            return name, rank
+    return None
+
+
+# ------------------------------------------------------------------------- page features
+
+
+def page_features(text: str, image_only: bool = False) -> PageType:
+    """order_split.page_features, as a model.PageType (index 0: the caller sets it)."""
+    P = proto()
+    text = text or ""
+    tl = re.sub(r"\s+", " ", text.lower())
+    sc = P.score_page(text, False)
+    n = len(text.strip())
+    sc["photo"] = 5.0 if n < P.EMPTY_CHARS else 0.0          # a bundle page with no text: the photo
+    if image_only and n < PHOTO_IMAGE_CHARS:                    # a scanned photo page with a few specks
+        sc["photo"] = max(sc["photo"], 5.0)
+    ranked = sorted(sc.items(), key=lambda kv: -kv[1])
+    best_fine, best = ranked[0]
+    if best < P.OTHER_BELOW and n < 150:                       # a photo scanned with a few specks
+        sc["photo"] = max(sc["photo"], 3.0)
+    translation = bool(_LETTERHEAD.search(tl)) or (bool(_TRANSLAT.search(tl)) and _eng_ratio(text) > ENGLISH_TYPED)
+    level = level_of(tl)
+    grades = len(_GRADE.findall(tl))
+    cert_words = bool(_CERT_WORDS.search(tl))
+    if sc["academic_apostille"] >= 4 and sc["academic_apostille"] >= sc["academic_certificate"]:
+        akind = "apostille"
+    elif grades >= 4 or sc["academic_transcript"] >= 5:
+        akind = "transcript"
+    elif cert_words:
+        akind = "certificate"
+    else:
+        akind = "certificate" if sc["academic_certificate"] > sc["academic_transcript"] else "transcript"
+    if best_fine in BANK_FINE:
+        kind = "solvency" if SOLVENCY_CUE.search(text) else "statement" if STATEMENT_CUE.search(text) else ""
+    elif (best_fine in ACADEMIC_FINE or level is not None or grades >= 4 or any(sc[k] > 0 for k in ACADEMIC_FINE)
+          or (cert_words and best < P.OTHER_BELOW)):
+        kind = akind
+    else:
+        kind = ""
+    holders = labelled(text, "name")
+    return PageType(index=0, best=best_fine if best >= P.OTHER_BELOW else "other", score=float(best),
+                    scores=sc, translation=translation, level=level[0] if level else None, kind=kind,
+                    nid_numbers=sorted(nid_numbers(tl)), birth_dates=sorted(_iso(d) for d in birth_dates(tl)),
+                    holder=list(holders[0]) if holders else [])
+
+
+def raw_best(pt: PageType) -> str:
+    """The lab's `best_fine`: the top-scoring fine type even under the OTHER_BELOW bar. The alignment and
+    the person split need it (a weak NID cue still decides which label pays the 'weak' cost). When
+    `best` is "other", the photo score had not been raised before ranking (a raise lifts the score to
+    5.0), so the ranking is the scores' order with photo at 0.0; ties go to the earlier type, as in
+    the lab's stable sort."""
+    if pt.best != "other":
+        return pt.best
+    best_k, best_v = "other", None
+    for k, v in pt.scores.items():
+        v = 0.0 if k == "photo" else v
+        if best_v is None or v > best_v:
+            best_k, best_v = k, v
+    return best_k
+
+
+def academic_kind(pt: PageType) -> str:
+    """The academic kind the split uses for a page inside the academic block. A page that shows no
+    academic sign has kind "" (or a bank kind); the lab's rule then gives it "transcript"."""
+    return pt.kind if pt.kind in ACADEMIC_KINDS else "transcript"
+
+
+def type_pages(pages: Sequence[PageRead]) -> List[PageType]:
+    """One PageType per run page (index = PageRead.index)."""
+    out = []
+    for p in pages:
+        pt = page_features(p.text, p.image_only)
+        pt.index = p.index
+        out.append(pt)
+    return out
