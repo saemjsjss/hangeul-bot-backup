@@ -37,11 +37,14 @@ ONNX_LAB = Path(r"C:\Hangeul\DOCCHECK\lab\onnx")
 MODELS = ONNX_LAB / "models"
 GLUE_DATA = ONNX_LAB / "pkg" / "glue_data.json"
 PROVIDERS = ["CPUExecutionProvider"]
+DET_ARENA = False             # rev 2.7: the detector's session has ORT's CPU memory arena off (make_reader)
+REC_ARENA = False             # rev 2.7 (step 1b): the recogniser's too
 HEAVY = ("torch", "torchvision", "easyocr", "scipy", "skimage")
 LAYER_MIN_CHARS = 40          # dv.read_pages: a page with fewer layer characters is OCR'd
 PAGE_DPI = 200                # dv.read_pages render
 IMAGE_ONLY_COVER = 0.5        # PageRead.image_only: one embedded image covering >= 50% of the page
-IMAGE_MEMO = 12               # page_image_of keeps the last 12 renders
+IMAGE_MEMO = 12               # page_image_of keeps at most the last 12 renders ...
+IMAGE_MEMO_MB = 200           # ... rev 2.7: and at most this many MB of them (the newest render is always kept)
 RUNNER_PAGE_KEY = "RUNNER-PAGE"   # case-cache key of a page read alone (partial page texts)
 TURN_KEY = "RUNNER-TURN"          # case-cache key of a page read turned (rev 2.5, pagetype.turn_junk_pages)
 LINE_DPI = 100                    # render for text_line_ratio (rev 2.5)
@@ -50,24 +53,59 @@ _CASE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 
 
 # --------------------------------------------------------------------------------- the reader
-def make_reader(threads: int = 0):
-    """LightReader on two ORT sessions with the CPU execution provider only (threads 0 = ORT default)."""
+def session_options(threads: int = 0, arena: bool = True):
+    """ONNX Runtime session options of the light reader: quiet log, `threads` intra-op threads (0 = ORT default),
+    the CPU memory arena on or off."""
     import onnxruntime as ort
-    import glue_numpy
     so = ort.SessionOptions()
     so.log_severity_level = 3
     if threads:
         so.intra_op_num_threads = threads
-    det = ort.InferenceSession(str(MODELS / "craft_mlt_25k.onnx"), so, providers=PROVIDERS)
-    rec = ort.InferenceSession(str(MODELS / "english_g2.onnx"), so, providers=PROVIDERS)
+    so.enable_cpu_mem_arena = bool(arena)
+    return so
+
+
+def make_reader(threads: int = 0):
+    """LightReader on two ORT sessions with the CPU execution provider only (threads 0 = ORT default).
+
+    Rev 2.7 (RUNNER_SPEC limit 15): the DETECTOR's session runs with ONNX Runtime's CPU memory arena OFF
+    (DET_ARENA). One CRAFT pass on a large page needs about 1-2.4 GB of activations for a moment; with the arena
+    on, ORT kept that memory for the rest of the process and grew it again on the next page (two 2560-pixel
+    detections: 9.2 GB committed). Off, the memory goes back to Windows after each pass. The kernels and
+    the numbers are the same (only where the buffers live changes; tests/test_memory27.py checks the outputs
+    are bit-identical). Step 1b: the RECOGNISER's session has the arena off too (REC_ARENA): its inputs are single
+    text lines, but the closer look enlarges a line up to 6000 pixels wide and the arena then kept a few hundred MB
+    for the rest of the run (the EAP folder: 65 MB more at the run's peak); the readtext results of real pages are
+    identical with it off (step 1b, 19 reads of 10 pages at 200 and 300 dpi), and the run takes no longer."""
+    import onnxruntime as ort
+    import glue_numpy
+    det = ort.InferenceSession(str(MODELS / "craft_mlt_25k.onnx"), session_options(threads, DET_ARENA),
+                               providers=PROVIDERS)
+    rec = ort.InferenceSession(str(MODELS / "english_g2.onnx"), session_options(threads, REC_ARENA),
+                               providers=PROVIDERS)
     for s in (det, rec):
         if s.get_providers() != PROVIDERS:
             raise RuntimeError(f"an ONNX session is not CPU-only: {s.get_providers()}")
     return glue_numpy.LightReader(det, rec, GLUE_DATA)
 
 
+def free_render_store() -> None:
+    """Rev 2.7 (RUNNER_SPEC limit 15): empties MuPDF's store, the cache of decoded page images that pymupdf keeps for
+    the whole process (up to 256 MB: every scanned page rendered leaves its decoded scan there). Called before each
+    detection, so the detector's memory does not come on top of it. A cache only: a later render decodes the page
+    again and gives the same pixels. Nothing happens when pymupdf is not loaded."""
+    import sys
+    m = sys.modules.get("pymupdf")
+    if m is not None:
+        try:
+            m.TOOLS.store_shrink(100)
+        except Exception:
+            pass
+
+
 class CountingReader:
-    """The reader with a count of model calls (every readtext, rotation retries included)."""
+    """The reader with a count of model calls (every readtext, rotation retries included). Rev 2.7: MuPDF's render
+    store is emptied before each call (free_render_store)."""
 
     def __init__(self, reader: Any):
         self.inner = reader
@@ -75,6 +113,7 @@ class CountingReader:
         self.seconds = 0.0
 
     def readtext(self, image, *args, **kw):
+        free_render_store()
         t = time.perf_counter()
         try:
             return self.inner.readtext(image, *args, **kw)
@@ -546,15 +585,17 @@ class Engine:
             return a[:, :, :3].copy()
 
     def page_image_of(self, page: PageRead, dpi: int = 300):
-        """page_image() of a run page, memoised per (file, page, dpi) for the last IMAGE_MEMO renders.
-        The array is shared and read-only: copy it before changing it."""
+        """page_image() of a run page, memoised per (file, page, dpi) for the last IMAGE_MEMO renders, at most
+        IMAGE_MEMO_MB of them (rev 2.7; the newest is always kept). The array is shared and read-only: copy it
+        before changing it."""
         key = (page.file, page.file_page, int(dpi))
         img = self._images.get(key)
         if img is None:
             img = self.page_image(self._path_of(page), page.file_page, dpi)
             img.flags.writeable = False
             self._images[key] = img
-            while len(self._images) > IMAGE_MEMO:
+            while len(self._images) > 1 and (len(self._images) > IMAGE_MEMO or
+                                             sum(a.nbytes for a in self._images.values()) > IMAGE_MEMO_MB * 2 ** 20):
                 self._images.popitem(last=False)
         else:
             self._images.move_to_end(key)

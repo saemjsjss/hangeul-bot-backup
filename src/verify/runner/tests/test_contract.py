@@ -79,7 +79,7 @@ NAMES = ["MD. SAMPLE ONE", "MD SAMPLE ONE", "SAMPLE ONE", "SAMPLE.ONE", "ONE SAM
 
 class TestModel(unittest.TestCase):
     def test_versions(self):
-        self.assertEqual(M.RUNNER_VERSION, "0.2.6")
+        self.assertEqual(M.RUNNER_VERSION, "0.2.7")
         self.assertEqual(M.BASE_RULES_VERSION, "2026-10-21.3")
         self.assertEqual(M.RUNNER_RULES_VERSION, "2026-10-28.r2.6")
         self.assertEqual(M.RUN_SCHEMA, "runner-run/2")

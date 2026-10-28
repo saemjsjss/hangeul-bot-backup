@@ -17,15 +17,23 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import os
 import sys
 from pathlib import Path
 from typing import List, Optional, Sequence
 
-from . import pipeline
-from . import report as REPORT
-from .botimport import DEFAULT_CACHE_ROOT, PRIVATE
-from .model import PROGRAMS, STOP
-from .safety import redact
+# Rev 2.7 (RUNNER_SPEC limit 15): numpy's OpenBLAS commits about 30 MB for each of its threads when numpy is first
+# imported (one per logical CPU: 363 MB on the owner's 12-thread PC, kept for the whole run). The runner's BLAS
+# products (the closer look's frame-by-class products, 3 x 3 and 2-element geometry) are bit-identical with one
+# thread (step 1b); ONNX Runtime and OpenCV keep their own threads. Set before anything imports numpy; an explicit
+# setting in the environment is kept.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
+from . import pipeline  # noqa: E402
+from . import report as REPORT  # noqa: E402
+from .botimport import DEFAULT_CACHE_ROOT, PRIVATE  # noqa: E402
+from .model import PROGRAMS, STOP  # noqa: E402
+from .safety import redact  # noqa: E402
 
 EXIT_OK, EXIT_CRASH, EXIT_BAD, EXIT_STOP = 0, 1, 2, 3
 NOTE_MAX = 200

@@ -9,9 +9,12 @@ amount or name): the recogniser is not asked "what does this say?" but "how well
 candidate?".
 
   1. Find the text. `box` (pixels of `image`) when the caller knows it; else the page is searched: the CRAFT
-     detector's line boxes, one recogniser pass per box, and a keyword score of every candidate (free text before
-     and after it) picks the line; the boxes beside it on the same line join it (a label before, a further word
-     after). A name a table cell wraps over two lines is tried as the two lines side by side too.
+     detector's line boxes (rev 2.7: a page longer than DETECT_LONG pixels is searched on a copy scaled to
+     DETECT_FIRST, then DETECT_FALLBACK when the line is not found, the boxes mapped back onto the page's own
+     pixels; a shorter page at its own size, as closer-3), one recogniser pass per box on the full-resolution
+     page, and a keyword score of every candidate (free text before and after it) picks the line; the boxes beside
+     it on the same line join it (a label before, a further word after). A name a table cell wraps over two lines
+     is tried as the two lines side by side too.
   2. Prepare the crop: a small one is enlarged 2-3x (Lanczos); printed rules through or under the text are painted
      out (an underline makes a 3 read as a 2); then views: four vertical margins (PADS) x five channels (grey, the
      maximum channel where coloured artwork fades, red, green, blue: the recogniser reads one line differently with
@@ -58,7 +61,13 @@ candidate?".
   8 unclear, 2 wrong before DOTS_ALONE (both on bold serif initials whose dot the shape test could not measure).
 
 CPU only (S5): the recogniser and detector are the engine's CPU sessions (engine.make_reader); the closer look must
-work in the CPU-only app. No network, no files (the caller saves a crop when it wants one). No personal data.
+work in the CPU-only app. Memory (rev 2.7, RUNNER_SPEC limit 15): before, one page search on a 400-dpi A4 page
+committed about 4.4-4.9 GB, which ONNX Runtime's memory arena then kept (9.2 GB after a second search). Now the
+detector's session has the arena off and the search follows the scale rule (DETECT_LONG, DETECT_FIRST,
+DETECT_FALLBACK): the whole process peaks at about 1.1 GB for one search of that page (1.8 GB when the fallback search
+runs too, 1.7 GB for a 2048-pixel page read at its own size), and the memory goes back after the search. Only the
+page being searched stays in the detector and line memos (_hold). No network, no files (the caller saves a crop when
+it wants one). No personal data.
 
 Public: Look, look(), page_image(), MARGIN; bind(); available(); dot_at(); render helpers for tests live in the tests.
 """
@@ -107,7 +116,7 @@ OCCUR_MAX = 3            # lines looked at when the page prints the candidates m
 RUN_GAP = 2.5            # rev 2.6 (checker): line heights (letter to letter) within which a further word beside a
 #                          single value belongs to it (an added MST, MD or BEGUM printed next to the name)
 WORD_BREAK = 1.2         # line heights between two letters the recogniser reads with no space that still split words
-VERSION = "closer-3"
+VERSION = "closer-4"
 
 # rev 2.6: words that end a value instead of adding to it, read beside a single value: a label, a connecting word of
 # a certificate's sentence, a relation column. None of them is a name word; anything else read there is a further
@@ -528,8 +537,16 @@ def _enlarge(rgb: np.ndarray, text_h: float) -> Tuple[np.ndarray, float]:
 # ---------------------------------------------------------------------------------------------------------- locate
 _DET_MEMO: "Dict[Tuple[int, Tuple[int, ...], int], Tuple[Any, List[Tuple[float, float, float, float]]]]" = {}
 _LINE_MEMO: Dict[Tuple[int, Tuple[int, ...], int, int, str], Tuple[Any, np.ndarray]] = {}
-_MEMO_MAX = 4            # pages whose detector boxes are kept
-_LINE_MEMO_MAX = 1500    # line read-outs kept (float32, a few pages' worth)
+_MEMO_MAX = 8            # detector box lists kept (rev 2.7: of ONE page, its turns at one or two scales)
+_LINE_MEMO_MAX = 1500    # line read-outs kept (float32)
+_HELD: List[Any] = [None]  # rev 2.7: the one page the two memos hold (a look on another page empties them)
+DETECT_LONG = 2048       # rev 2.7, the scale rule: a page up to this many pixels long goes to the page search's
+#                          detector at its own size, exactly as closer-3 read it (0 = every page at its own size)
+DETECT_FIRST = 1600      # a longer page is first searched on a copy scaled to this long side ...
+DETECT_FALLBACK = 2048   # ... and, ONLY when that finds no line of the candidates, once more at this long side (0 =
+#                          no second search). Measured on the real set (step 1b): first 1600 then 2048 gives closer-3's
+#                          38 of 130 to review; first 2048 then 1600 gave 40, 2048 alone 41, 1600 alone 39
+DETECT_MIN_SIZE = 20     # the detector's min_size, in the page's own pixels (easyocr's default)
 
 
 def _memo_put(memo: Dict, key: Any, val: Any, cap: int) -> None:
@@ -538,28 +555,81 @@ def _memo_put(memo: Dict, key: Any, val: Any, cap: int) -> None:
         memo.pop(next(iter(memo)))
 
 
+def _hold(rgb: np.ndarray) -> None:
+    """Rev 2.7 (memory, RUNNER_SPEC limit 15): the detector and line memos keep the page they were made of alive, so
+    they hold ONE page, the one being searched: a search on another page empties them first. A memo only: an
+    emptied entry is computed again, the same numbers."""
+    if _HELD[0] is not rgb:
+        _DET_MEMO.clear()
+        _LINE_MEMO.clear()
+        _HELD[0] = rgb
+
+
 def _rot(rgb: np.ndarray, k: int) -> np.ndarray:
     return np.ascontiguousarray(np.rot90(rgb, k)) if k else rgb
 
 
-def _boxes(rgb: np.ndarray, k: int) -> List[Tuple[float, float, float, float]]:
-    """The detector's horizontal line boxes (x0, y0, x1, y1) of the page turned by k quarter turns (memoised)."""
-    key = (id(rgb), tuple(rgb.shape), k)
+def first_long(shape: Sequence[int]) -> int:
+    """The detector's long side for the first search of a page (rev 2.7): 0 (the page's own size) for a page up to
+    DETECT_LONG pixels long, else DETECT_FIRST."""
+    if not DETECT_LONG or float(max(shape[0], shape[1])) <= DETECT_LONG:
+        return 0
+    return DETECT_FIRST
+
+
+def detect_scale(shape: Sequence[int], long_side: Optional[int] = None) -> float:
+    """The factor the page search scales a page by before the detector reads it (rev 2.7): `long_side` pixels on the
+    long side (default: first_long, the first search's), never enlarged (1.0 for a page already that small; 0 = the
+    page's own size)."""
+    cap = first_long(shape) if long_side is None else long_side
+    page_long = float(max(shape[0], shape[1]))
+    if not cap or page_long <= cap:
+        return 1.0
+    return cap / page_long
+
+
+def _boxes(rgb: np.ndarray, k: int, long_side: Optional[int] = None) -> List[Tuple[float, float, float, float]]:
+    """The detector's horizontal line boxes (x0, y0, x1, y1) of the page turned by k quarter turns (memoised), in
+    the pixels of the page itself.
+
+    Rev 2.7 (memory, RUNNER_SPEC limit 15): a page longer than `long_side` (default: first_long, the first
+    search's) pixels is read by the detector as a copy scaled down to that long side (INTER_AREA) and its boxes are
+    scaled back onto the page's own pixels; the recogniser and every score still work on the full-resolution page.
+    A page up to DETECT_LONG goes to the detector as it is (scale 1.0: the boxes are bit for bit those of closer-3). The detector's activations
+    grow with its input (a 400-dpi A4 page went in at 2560 pixels: about 2.4 GB for a moment). The detector's
+    min_size (20 pixels) and the 4-pixel floor apply to the boxes in the page's pixels, as before."""
+    cap = first_long(rgb.shape) if long_side is None else long_side
+    _hold(rgb)
+    key = (id(rgb), tuple(rgb.shape), k, cap)
     hit = _DET_MEMO.get(key)
     if hit is not None and hit[0] is rgb:
         return hit[1]
-    img = _rot(rgb, k)
-    reader = _rec().reader
     import cv2
-    h_list, _free = reader.detect(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
-    boxes = [(float(b[0]), float(b[2]), float(b[1]), float(b[3])) for b in (h_list or [])
-             if b[1] - b[0] > 4 and b[3] - b[2] > 4]
+    from .engine import free_render_store           # rev 2.7: MuPDF's cache of decoded pages, emptied first
+    free_render_store()
+    s = detect_scale(rgb.shape, cap)
+    small = rgb
+    if s < 1.0:
+        small = cv2.resize(rgb, (max(1, int(round(rgb.shape[1] * s))), max(1, int(round(rgb.shape[0] * s)))),
+                           interpolation=cv2.INTER_AREA)
+    img = _rot(small, k)
+    full_w, full_h = (rgb.shape[1], rgb.shape[0]) if k % 2 == 0 else (rgb.shape[0], rgb.shape[1])
+    fx, fy = full_w / float(img.shape[1]), full_h / float(img.shape[0])
+    reader = _rec().reader
+    h_list, _free = reader.detect(cv2.cvtColor(img, cv2.COLOR_RGB2BGR), min_size=0)
+    boxes: List[Tuple[float, float, float, float]] = []
+    for b in (h_list or []):
+        x0, x1, y0, y1 = float(b[0]) * fx, float(b[1]) * fx, float(b[2]) * fy, float(b[3]) * fy
+        if max(x1 - x0, y1 - y0) > DETECT_MIN_SIZE and x1 - x0 > 4 and y1 - y0 > 4:
+            boxes.append((x0, y0, x1, y1))
     _memo_put(_DET_MEMO, key, (rgb, boxes), _MEMO_MAX)
     return boxes
 
 
 def _box_logp(rgb: np.ndarray, k: int, i: int, box: Tuple[float, float, float, float], kind: str) -> np.ndarray:
-    key = (id(rgb), tuple(rgb.shape), k, i, kind)
+    # rev 2.7: keyed by the box itself (not only its index): the boxes depend on the detector's scale
+    _hold(rgb)
+    key = (id(rgb), tuple(rgb.shape), k, i, tuple(float(v) for v in box), kind)
     hit = _LINE_MEMO.get(key)
     if hit is not None and hit[0] is rgb:
         return hit[1]
@@ -696,11 +766,27 @@ def _locate_all(rgb: np.ndarray, labels: List[List[int]], kind: str) -> List[Dic
     row and a footer; a card front and its machine-readable line) is looked at in each place, because a page-wide
     search cannot know which place the OCR read came from. Each hit: {"k", "box" (the joined line, widened over
     ink the detector missed), "cell" (the matched box, widened to the right inside its cell), "below" (the box
-    under the cell: a wrapped cell's second line), "score"}."""
+    under the cell: a wrapped cell's second line), "score", "detect_long" (the detector's long side)}.
+
+    Rev 2.7 (the scale rule): a page up to DETECT_LONG pixels long is searched with the detector at its own size,
+    as closer-3 searched it, and only once. A longer page is searched with the detector on a copy scaled to
+    DETECT_FIRST pixels; only when that finds no line of the candidates, ONE more search runs at DETECT_FALLBACK
+    pixels (a detector loses a different few lines at another scale)."""
+    cap = first_long(rgb.shape)
+    hits = _search(rgb, labels, kind, cap)
+    if hits or not cap or not DETECT_FALLBACK:
+        return hits
+    if abs(detect_scale(rgb.shape, DETECT_FALLBACK) - detect_scale(rgb.shape, cap)) < 1e-9:
+        return hits
+    return _search(rgb, labels, kind, DETECT_FALLBACK)
+
+
+def _search(rgb: np.ndarray, labels: List[List[int]], kind: str, cap: int) -> List[Dict[str, Any]]:
+    """One search of the page (_locate_all) with the detector at long side `cap`."""
     best: Optional[Dict[str, Any]] = None
     scored: List[Tuple[float, int, int]] = []
     for k in (0, 1, 3, 2):
-        boxes = _boxes(rgb, k)
+        boxes = _boxes(rgb, k, cap)
         here: List[Tuple[float, int, int]] = []
         for i, b in enumerate(boxes):
             lp = _box_logp(rgb, k, i, b, kind)
@@ -719,7 +805,7 @@ def _locate_all(rgb: np.ndarray, labels: List[List[int]], kind: str) -> List[Dic
     if best is None or best["score"] < LOCATE_MIN:
         return []
     k = best["k"]
-    boxes = _boxes(rgb, k)
+    boxes = _boxes(rgb, k, cap)
     img = _rot(rgb, k)
     floor = max(OCCUR_MIN, best["score"] - OCCUR_LEAD)
     order = [best["i"]] + [i for s, kk, i in sorted(scored, key=lambda t: -t[0])
@@ -735,7 +821,8 @@ def _locate_all(rgb: np.ndarray, labels: List[List[int]], kind: str) -> List[Dic
         except Exception:
             wide, cell = line, boxes[i]
         sc = next(s for s, kk, j in scored if kk == k and j == i)
-        hits.append({"k": k, "box": wide, "cell": cell, "below": _below(boxes, boxes[i]), "score": sc})
+        hits.append({"k": k, "box": wide, "cell": cell, "below": _below(boxes, boxes[i]), "score": sc,
+                     "detect_long": int(cap)})
         if len(hits) >= OCCUR_MAX:
             break
     return hits
@@ -1424,6 +1511,8 @@ def _look_at(rgb: np.ndarray, hit: Dict[str, Any], cands: List[str], labels: Lis
         return out
     lps_line = read(views_line, keep=single)
     base: Dict[str, Any] = {"rotation": k * 90, "box": [round(v, 1) for v in (x0, y0, x1, y1)], "version": VERSION}
+    if hit.get("detect_long"):
+        base["detect_long"] = hit["detect_long"]          # rev 2.7: the detector's long side of the search
     if cut_why:
         base["cut"] = cut_why
     if single:

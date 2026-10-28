@@ -1,6 +1,6 @@
 # RUNNER_SPEC — test runner for the owner's desktop document checker (prototype)
 
-Status: design, revision 2.6, 28 Oct 2026. Branch `prototype/page-types`, worktree `C:\Hangeul\JARVIS\prototype\page-types`.
+Status: design, revision 2.7, 29 Oct 2026. Branch `prototype/page-types`, worktree `C:\Hangeul\JARVIS\prototype\page-types`.
 Not committed. This file holds no personal data. Every example name, number or date in it is a placeholder.
 
 The runner is a prototype, not the app. It takes either one bundle PDF or one folder of bot-named files,
@@ -519,6 +519,82 @@ updated; where it and this changelog differ, section 7 wins.
   was run from a copy taken from the owner's original download with the same sha256 as the r6 run's page texts.
   Measured on the way: one CPU detection (CRAFT) on a 400-dpi page commits about 4.3 GB, which ONNX Runtime's
   CPU arena keeps (limit 15).
+
+### Revision 2.7 (28-29 Oct, memory: a whole case on the CPU) — changelog
+
+Versions: `RUNNER_VERSION = "0.2.7"`, `RUNNER_RULES_VERSION` unchanged (`"2026-10-28.r2.6"`: no rule changes), same run
+schema. `closer.VERSION = "closer-4"`. Limit 15 of revision 2.6 said one CPU detection on a 400-dpi page committed
+4.3-4.9 GB that ONNX Runtime's arena then kept (9.2 GB after a second page search, about 11 GB on the EAP folder).
+Budget set for this revision: 3 GB peak committed memory for the runner process on each of the four owner cases, on
+both reading paths, at the product's default threads. No change below alters a number any check sees: each one is an
+allocator setting, a memo or a cache, and each was checked bit for bit; the decisions are measured again below.
+
+- **Both ONNX sessions run with the CPU memory arena off** (`engine.DET_ARENA`, `engine.REC_ARENA`,
+  `engine.session_options`). With the arena on, ONNX Runtime kept a detection's activations (1-2.4 GB) for the rest
+  of the process and grew them on the next page; the recogniser's arena kept a few hundred MB after a closer look's
+  wide lines. Off, the memory goes back after each pass. The detector's outputs are bit-identical (step 1 on the real
+  pages; `tests/test_memory27.py`); the recogniser's readtext results are identical on 19 reads of 10 real pages at
+  200 and 300 dpi, and the runs take no longer.
+- **The page search's scale rule** (`closer.DETECT_LONG` 2048, `DETECT_FIRST` 1600, `DETECT_FALLBACK` 2048,
+  `first_long`, `detect_scale`, `_search`). A page up to 2048 pixels long goes to the detector at its own size, as
+  closer-3 searched it, and is searched once: on 10 real pages checked against HEAD's `closer.py` (closer-3) the
+  detector's input and raw output (sha1), the line boxes in all four turns and the whole look are identical. A longer
+  page (the real set's 300- and 400-dpi renders, 2219-6617 pixels) is searched on a copy scaled to 1600 pixels
+  (INTER_AREA), its boxes mapped back onto the page; only when that finds no line of the candidates does one more
+  search run at 2048. The pair was chosen by measurement on the real set's 55 pages longer than 2048 pixels (its 75
+  shorter pages are closer-3's, 24 to review): first 2048 alone gave 41 of 130 to review, 2048 then 1600 gave 40, 1600
+  alone 39, 1600 then 2048 38 (closer-3: 38). That choice was made on the evaluation set itself (two cases separate
+  the orders). The look's detail gains `detect_long` (the detector's long side of the search that found the line).
+- **What a run keeps between detections is bounded.** MuPDF's render store (pymupdf keeps up to 256 MB of decoded
+  scans for the process) is emptied before every detection (`engine.free_render_store`, called by
+  `CountingReader.readtext` and `closer._boxes`); a later render decodes again, the same pixels. The render memo is
+  also capped by size (`engine.IMAGE_MEMO_MB` 200, the newest render always kept). The closer's detector and line
+  memos hold one page, the one being searched (`closer._hold`); the confirmer keeps the high-resolution image of the
+  page being looked at (`names.HI_KEEP` 1).
+- **One OpenBLAS thread** (`src.verify.runner.__main__` sets `OPENBLAS_NUM_THREADS=1` before numpy loads, unless the
+  environment sets it). numpy's OpenBLAS committed about 30 MB for each of its threads when numpy was imported, 363
+  MB on the owner's 12-thread PC: the largest single holder. The runner's BLAS products (the closer look's
+  frame-by-class products, 3 x 3 and 2-element geometry) are bit-identical with one thread (tests); only a level-1
+  dot over about 100000 elements differs, which the runner never computes. ONNX Runtime and OpenCV keep their own
+  threads.
+- **Threads: the default is kept** (ONNX Runtime's own: one per physical core, 6 on the owner's PC). Measured on the
+  EAP folder (GPU texts, before the cuts above): peak 3316 / 3313 / 3314 MB at 2 / 4 / 6 threads, 215 / 157 / 145 s;
+  the summary and all 11 closer looks identical in every field. Memory does not depend on the thread count, so no
+  lower default is needed.
+- **Tried, not kept:** the detector's memory pattern off (no gain), a garbage collection before every read (no gain),
+  a 64 MB render memo (35 MB less at the peak, more renders; the OpenBLAS change made it unnecessary).
+- **Measured** (runner process, Windows peak committed memory, the product's default threads, one run at a time on a
+  quiet PC; limit 15):
+
+  | case | GPU texts (run_case.py, r8) | CPU (--cpu, fresh cache) | before (rev 2.7 step 1, GPU texts) |
+  |------|------|------|------|
+  | owner folder 3 | 2267 MB, 113 s | 2302 MB, 393 s | 2669 MB |
+  | owner folder 9 | 2328 MB, 102 s | **3195 MB**, 555 s | 1839 MB |
+  | EAP folder | 2747 MB, 148 s | 2779 MB, 399 s | 3315 MB |
+  | test 1 | 1920 MB, 82 s | 2228 MB, 194 s | 2004 MB |
+
+  Folder 9 on the CPU path is over the 3 GB budget: its peak is the bot's own first-pass reading (`dv.read_pages` at
+  200 dpi) of a page larger than A4 (about 18 x 16 inches: a 3678 x 3156 render), which the detector reads at its
+  2560-pixel canvas (2560 x 2197): about 2.9 GB of activations for a moment over a 0.2 GB base. That reading is the
+  bot's and its texts must not change, so it was left as it is (limit 15). One page search (closer look) on a made-up
+  400-dpi A4 page: 1.1 GB for the whole process when the line is found at 1600, 1.8 GB with the fallback search,
+  1.7 GB for a 2048-pixel page read at its own size; afterwards the process is back to about 0.2 GB.
+- **Re-measured with the final code** (closer sha256 964d877244d7 as measured; d37c6a64e4bb is the same text with
+  the file's LF line endings restored). The real set in production mode (as the runner
+  calls the look, the runner's candidates): the 55 pages longer than 2048 pixels and 10 shorter ones run, the other 65
+  shorter pages are closer-3's rows: 0 false PASS, 0 false FAIL, 0 wrong dot, 38 of 130 to review; every one of the
+  130 decisions is closer-3's (`closer_eval\results\s1b_final_c8`; the fallback search ran on 5 pages and found the
+  line on 1). The checker's hunt (`closer_eval\check\hunt_s1b_results.json`): 186 looks, 0 false PASS, 0 wrong dot,
+  every look in box and page mode as with closer-3; the 15 controls 28 "same" of 30. The four owner cases as
+  `runs\<case>_r8` with the r6 commands: every summary line identical to r6 except the output-path line (and folder
+  9's "not a PDF or image" line, absent because its copy holds only the checked files); every closer look's decision
+  identical (f3 7, f9 7, EAP 11, test 1 7 looks). Test 1's mother's-name FAIL, lost at 1600 pixels in step 1, is back.
+- **Checks.** `tests/test_memory27.py` (made-up data): the scale rule (a page up to 2048 pixels gives closer-3's boxes,
+  with a stub and with the real detector; a longer page is scaled to 1600; the fallback runs once and only when the
+  line is not found on a scaled page), both arenas off and the recogniser's reading unchanged by it, the render memo's
+  MB cap, the render store emptied before every read and its memory given back, the closer memos holding one page,
+  the one-thread OpenBLAS setting and its bit-identical products, one page search under 1.6 GB and a search with the
+  fallback under 2.3 GB.
 
 ---------------------------------------------------------------------------------------------------------
 
@@ -2832,10 +2908,15 @@ whitespace does not count, A1), Q11 (GPA consistency: removed, critique 20), Q12
     purple "MD" beside a black name gives "same"); a typed name and its typed honorific share one ink. A parent field
     that names clearly another person on ONE read is FLAG "not compared" (a misparsed label reads the same way),
     never FAIL; two pages agreeing make it a difference.
-15. **Revision 2.6, memory (measured, not changed).** The CPU detector (CRAFT, `craft_mlt_25k.onnx`) on a 400-dpi A4
-    page (a page-wide closer look) raises the process's committed memory from about 0.5 GB to 4.8 GB (a made-up
-    page, `fixer4\mem_detect.py`), and ONNX Runtime's CPU memory arena keeps it; with pages of several sizes the
-    runner process on the EAP folder reached about 11 GB committed. A PC with 8 GB of RAM would page heavily.
-    No decision depends on it; options for the owner's app: the session option `enable_cpu_mem_arena = False`,
-    or detecting on a page scaled to the light engine's 200 dpi and mapping the boxes back (both need the
-    measurements re-run).
+15. **Revision 2.7, memory (measured).** The runner process's peak committed memory at the product's default threads
+    on the four owner cases: with GPU texts (run_case.py) 1.9-2.75 GB; on the CPU path (every page read on the CPU)
+    2.2-2.8 GB, except owner folder 9 at 3.2 GB (the 3 GB budget is missed there). Before revision 2.7 the EAP folder
+    reached 3.3 GB with GPU texts and about 11 GB in revision 2.6. What sets a peak now is one detection at the
+    detector's own 2560-pixel canvas: the bot's 200-dpi reading of a page larger than A4 (folder 9: 2.9 GB for a
+    moment), a 300-dpi page read whole by `doccheck.language_rows` or `identity` (2.4 GB), a large photo read by the
+    bot; the process's base between detections is about 0.2-0.5 GB (models, the page in hand). A closer look's page
+    search peaks at 1.1-1.8 GB for the whole process and gives the memory back. Those 2560-canvas readings are the
+    bot's (or read like the bot's) and their texts must not change, so a page larger than A4 read on the CPU needs
+    about 3.2 GB; a PC with 8 GB of RAM runs one case at a time. Options for the owner's app: accept 3.3 GB as the
+    budget, or read over-size pages on the card, or read them at a smaller canvas on the CPU (that changes their
+    texts: the measurements would have to be re-run).

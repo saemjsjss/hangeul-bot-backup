@@ -36,6 +36,7 @@ REREAD_MIN_CONF = 0.80
 REREAD_CAN_FAIL = True     # A1: a confirmed difference is FAIL (no audit gate)
 LOOK_MAX = 80              # closer looks per run (owner 28 Oct), shared by every caller of the confirmer
 LOOK_DPI = 400             # the closer look's render of a vector page (a scan: its own resolution)
+HI_KEEP = 1                # rev 2.7 (memory, RUNNER_SPEC limit 15): Confirmer.image keeps the page being looked at
 SOURCE = "runner:names"
 PEOPLE = ("student", "father", "mother")
 _NEUTRAL = ("parent", "taxpayer", "proprietor", "employee", "holder")   # vocabulary persons (critique 4)
@@ -1579,12 +1580,13 @@ class Confirmer:
 
     # ------------------------------------------------------------------ the closer look (owner 28 Oct)
     def image(self, i: int) -> Any:
-        """The high-resolution page image of run page i (closer.page_image), the last 4 kept."""
+        """The high-resolution page image of run page i (closer.page_image), the last HI_KEEP kept (rev 2.7: one,
+        the page being looked at; the engine's memo keeps recent renders within its MB cap)."""
         img = self._hi.get(i)
         if img is None:
             img = closer.page_image(self.engine, self.pages[i], LOOK_DPI)
             self._hi[i] = img
-            while len(self._hi) > 4:
+            while len(self._hi) > HI_KEEP:
                 self._hi.popitem(last=False)
         else:
             self._hi.move_to_end(i)

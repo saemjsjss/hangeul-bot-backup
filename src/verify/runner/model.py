@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-RUNNER_VERSION = "0.2.6"
+RUNNER_VERSION = "0.2.7"
 BASE_RULES_VERSION = "2026-10-21.3"      # the bot rules in the worktree's src/verify (commit 07b1f22)
 RUNNER_RULES_VERSION = "2026-10-28.r2.6"   # + the owner's 21-28 Oct decisions (A1-A8, the 28 Oct rules), runner only
 RUN_SCHEMA = "runner-run/2"
