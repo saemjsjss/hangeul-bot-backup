@@ -565,5 +565,180 @@ class TestConfirmer(unittest.TestCase):
         self.assertEqual(res.rereads[0]["effect"], "names.mother FAIL")
 
 
+# ============================================================================================ owner 28 Oct
+class Look:
+    """closer.Look, made by hand (decision, best, the rest neutral)."""
+
+    def __new__(cls, decision, best, cands):
+        from src.verify.runner import closer
+        return closer.Look(decision, best, {c: 0.0 for c in cands}, 0.5, 10, 10, None, "test")
+
+
+class CloserFake:
+    """A closer-mode confirmer: `truth` maps a run page to the spelling (letters and dots) the page prints; the
+    look picks the candidate equal to it (dots too for kind "dots"), else "unclear"."""
+    closer = True
+
+    def __init__(self, truth):
+        self.truth, self.log, self.calls = truth, [], []
+
+    def look(self, page, candidates, kind="name"):
+        self.calls.append((page, tuple(candidates), kind))
+        t = self.truth.get(page)
+        if t is None:
+            return Look("unclear", candidates[0], candidates)
+        key = S.form if kind == "dots" else S.letters
+        hit = next((c for c in candidates if key(c) == key(t)), None)
+        if hit is None:
+            return Look("unclear", candidates[0], candidates)
+        return Look("same" if hit == candidates[0] else "differs", hit, candidates)
+
+    def pair(self, page, reference, variant, kind="name"):
+        res = self.look(page, [reference, variant], kind)
+        return res.decision
+
+    def __call__(self, page_index, variant, reference=""):
+        return "unclear"
+
+
+class TestBoardPapers(unittest.TestCase):
+    def test_which_papers_are_board_papers(self):
+        def u(title, level="", text="Transcript"):
+            c = Case()
+            unit = c.add("academic", [text], title)
+            unit.level = level
+            return unit, c.pages
+        self.assertTrue(N.board_paper(*u("ACADEMIC HSC")))
+        self.assertTrue(N.board_paper(*u("ACADEMIC (HSC, SSC)")))
+        self.assertTrue(N.board_paper(*u("ACADEMIC", level="SSC")))
+        self.assertFalse(N.board_paper(*u("ACADEMIC DEGREE")))
+        self.assertFalse(N.board_paper(*u("ACADEMIC", level="degree")))
+        self.assertTrue(N.board_paper(*u("ACADEMIC", text="Board of Intermediate and Secondary Education Dakhil")))
+        self.assertTrue(N.board_paper(*u("ACADEMIC", text="Madrasah Education Board Alim Examination")))
+        self.assertFalse(N.board_paper(*u("ACADEMIC", text="Sample University Bachelor of Science CGPA")))
+        c = Case()
+        self.assertFalse(N.board_paper(c.add("family_cert", ["x"]), c.pages))
+
+    def test_board_papers_dots_are_not_judged(self):
+        """Owner 28 Oct: "board papers md. is fine, no fail for that" - passport MD. + a board paper MD + another
+        document MD. is no 'mixed' FAIL; the board paper gets a NOTE; its letters stay strict."""
+        c = base_case()
+        hsc = c.add("academic", [academic(student="MD EXAMPLE SAMPLE")] * 2, "ACADEMIC HSC")
+        deg = c.add("academic", [academic(student="MD. EXAMPLE SAMPLE")] * 2, "ACADEMIC DEGREE")
+        res = run(c, ident_of(), FakeConfirm("confirmed"))
+        self.assertEqual(rules(res, hsc.uid), [("names.student_dots", NOTE)])
+        self.assertIn(N.BOARD_DOTS_NOTE, res.per_unit[hsc.uid][0].message)
+        self.assertEqual(rules(res, deg.uid), [])
+        line = next(f for f in res.summary if f.rule == "names.student")
+        self.assertEqual(line.verdict, PASS)
+        c2 = base_case()
+        hsc2 = c2.add("academic", [academic(student="MD. EXAMPLE SAMPLX")] * 2, "ACADEMIC HSC")
+        res2 = run(c2, ident_of(), FakeConfirm("confirmed"))
+        self.assertEqual(rules(res2, hsc2.uid), [("names.student", FAIL)])      # letters stay strict
+
+
+class TestCloserMode(unittest.TestCase):
+    """names.evaluate with the closer look (a fake looker standing in for closer.look on the page images)."""
+
+    def test_dots_come_from_the_closer_look(self):
+        # passport MD. ; the NID's page read lost the dot but the look shows it; the employment letter has none
+        c = base_case()
+        nid = c.add("student_nid", ["NID Name MD EXAMPLE SAMPLE Date of Birth"], "STUDENT NID")
+        emp = c.add("trade_license", ["To whom it may concern employment letter"], "EMPLOYMENT CERTIFICATE")
+        truth = {0: "MD. EXAMPLE SAMPLE", nid.pages[0]: "MD. EXAMPLE SAMPLE", emp.pages[0]: "MD EXAMPLE SAMPLE"}
+        res = run(c, ident_of(), CloserFake(truth), extra=[("student", emp.uid, "MD. EXAMPLE SAMPLE", emp.pages[0])])
+        self.assertEqual(rules(res, nid.uid), [])
+        self.assertEqual(rules(res, emp.uid), [("names.student_dots", FAIL)])
+
+    def test_an_unclear_dot_look_is_flag_never_fail(self):
+        c = base_case()
+        nid = c.add("student_nid", ["NID Name MD. EXAMPLE SAMPLE Date of Birth"], "STUDENT NID")
+        emp = c.add("trade_license", ["To whom it may concern employment letter"], "EMPLOYMENT CERTIFICATE")
+        truth = {0: "MD. EXAMPLE SAMPLE", nid.pages[0]: "MD. EXAMPLE SAMPLE"}       # the letter's page: unclear
+        res = run(c, ident_of(), CloserFake(truth), extra=[("student", emp.uid, "MD EXAMPLE SAMPLE", emp.pages[0])])
+        self.assertEqual(rules(res, emp.uid), [("names.student_dots", FLAG)])
+
+    def test_a_misread_letter_is_corrected_on_its_page(self):
+        c = base_case()
+        u = c.add("academic", [academic(mother="DEMO SAMPIE")], "ACADEMIC DEGREE")
+        res = run(c, ident_of(), CloserFake({u.pages[0]: "DEMO SAMPLE"}))
+        self.assertEqual(rules(res, u.uid), [])
+        self.assertEqual(next(f for f in res.summary if f.rule == "names.mother").verdict, PASS)
+
+    def test_a_real_one_letter_difference_fails(self):
+        c = base_case()
+        u = c.add("academic", [academic(mother="DEMO SAMPLA")], "ACADEMIC DEGREE")
+        ident = ident_of()
+        ident.mother.pages = (0,)
+        res = run(c, ident, CloserFake({u.pages[0]: "DEMO SAMPLA", 0: "DEMO SAMPLE"}))
+        self.assertEqual(rules(res, u.uid), [("names.mother", FAIL)])
+        f = res.per_unit[u.uid][0]
+        self.assertEqual((f.evidence["closer_variant"], f.evidence["closer_reference"]), ("differs", "same"))
+
+    def test_every_page_of_the_document_is_looked_at(self):
+        """Two pages read the same variant: both looks "same" -> a misread, no finding; one "same" and one unclear ->
+        FLAG (the unclear page may print the variant), never FAIL; one page "differs" -> the document prints it."""
+        ident = ident_of()
+        ident.mother.pages = (0,)
+        for truth_of, want in (
+                (lambda u: {u.pages[0]: "DEMO SAMPLE", u.pages[1]: "DEMO SAMPLE", 0: "DEMO SAMPLE"}, []),
+                (lambda u: {u.pages[0]: "DEMO SAMPLE", 0: "DEMO SAMPLE"}, [("names.mother", FLAG)]),
+                (lambda u: {u.pages[0]: "DEMO SAMPLE", u.pages[1]: "DEMO SAMPLA", 0: "DEMO SAMPLE"},
+                 [("names.mother", FAIL)])):
+            c = base_case()
+            u = c.add("academic", [academic(mother="DEMO SAMPLA")] * 2, "ACADEMIC DEGREE")
+            with self.subTest(want=want):
+                conf = CloserFake(truth_of(u))
+                res = run(c, ident, conf)
+                self.assertEqual(rules(res, u.uid), want)
+                self.assertEqual({p for p, _c, k in conf.calls if k == "name" and p != 0}, set(u.pages))
+
+    def test_the_reference_page_showing_the_variant_is_flag(self):
+        """The passport's own page shows the variant's spelling: the reference read may be the misread, so the
+        difference is FLAG, never FAIL (and never an outvote by other documents)."""
+        c = base_case()
+        u = c.add("academic", [academic(student="MD. EXAMPLE SAMPLX")], "ACADEMIC DEGREE")
+        res = run(c, ident_of(), CloserFake({u.pages[0]: "MD. EXAMPLE SAMPLX", 0: "MD. EXAMPLE SAMPLX"}))
+        self.assertEqual(rules(res, u.uid), [("names.student", FLAG)])
+        f = res.per_unit[u.uid][0]
+        self.assertIn("may be the misread", f.message)
+        self.assertEqual((f.evidence["closer_variant"], f.evidence["closer_reference"]), ("differs", "differs"))
+
+    def test_other_documents_never_outvote_a_confirmed_difference(self):
+        """Owner 28 Oct: three documents print the same variant (each confirmed on its page) and the passport's page
+        prints the reference: every one of them is FAIL, never downgraded by their number."""
+        c = base_case()
+        us = [c.add("academic", [academic(mother="DEMO SAMPLA")], f"ACADEMIC {k}") for k in ("DEGREE", "DIPLOMA")]
+        us.append(c.add("student_nid", ["NID Name MD. EXAMPLE SAMPLE Mother DEMO SAMPLA Date"], "STUDENT NID"))
+        ident = ident_of()
+        ident.mother.pages = (0,)
+        truth = {u.pages[0]: "DEMO SAMPLA" for u in us}
+        truth[0] = "DEMO SAMPLE"
+        res = run(c, ident, CloserFake(truth))
+        for u in us:
+            self.assertIn(("names.mother", FAIL), rules(res, u.uid))
+        self.assertEqual(next(f for f in res.summary if f.rule == "names.mother").verdict, FAIL)
+
+    def test_a_misparsed_label_is_searched_for_the_name_itself(self):
+        """A single read too unlike the name ("not compared", FLAG) gets a closer look for the reference on its page:
+        printed there clearly -> no finding; not there -> the FLAG stays (never PASS)."""
+        c = base_case()
+        u = c.add("academic", [academic(mother="OTHERWORD ANOTHERWORD")], "ACADEMIC DEGREE")
+        res = run(c, ident_of(), CloserFake({u.pages[0]: "DEMO SAMPLE"}))
+        self.assertEqual(rules(res, u.uid), [])
+        self.assertEqual(next(f for f in res.summary if f.rule == "names.mother").verdict, PASS)
+        res = run(c, ident_of(), CloserFake({u.pages[0]: "OTHERWORD ANOTHERWORD"}))
+        self.assertEqual(rules(res, u.uid), [("names.mother_unread", FLAG)])
+
+    def test_an_address_word_under_a_one_word_name_is_no_difference(self):
+        fam = ("Family Certificate SL NAME RELATION ID NO BIRTH DATE ADDRESS 01 GAMMA SAMPLE SELF 1234567890 "
+               "01-06-2003 Vill: Somewhere 02 TESTER FATHER 2345678901 01-02- Vill: Somewhere TOWNNAME 1967 "
+               "DISTRICTX 03 DEMO SAMPLE MOTHER 3456789012 28-03-1976 Vill: Somewhere")
+        c = base_case()
+        u = c.add("family_cert", [fam], "FAMILY CERTIFICATE")
+        res = run(c, ident_of(father="TESTER"), CloserFake({}))
+        self.assertEqual([r for r in rules(res, u.uid) if r[0] == "names.father"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

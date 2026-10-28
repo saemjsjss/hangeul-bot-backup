@@ -30,10 +30,11 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tupl
 from . import report as REPORT
 from . import verdict as V
 from .model import (BASE_RULES_VERSION, NOTE, PROGRAMS, RUN_SCHEMA, RUNNER_RULES_VERSION, RUNNER_VERSION,
-                    DerivedRecord, DocUnit, Finding, PageRead, RunResult, set_page_numbering)
+                    DerivedRecord, DocUnit, Finding, Notice, PageRead, RunResult, set_page_numbering)
 
 VERBOSE = True                                   # progress lines on stderr (stage names and seconds only)
 OWNER_FINES = ("trade_license", "employment_certificate")
+BANK_IMAGE_DPI = 150                             # bank.ink_signatures is calibrated at this resolution
 CHAIN_RULE_PREFIXES = ("financial.", "bank.holder")
 
 
@@ -202,6 +203,14 @@ def _run(m: _Modules, rs: _Run, input_path: Path, program: str, out: Path, *, to
             pages: List[PageRead] = list(eng.read_source(src, staged, given))
         rs.partial["pages"] = pages
         set_page_numbering(pages)             # findings name the page inside its file (folder mode)
+        turned: List[Dict[str, Any]] = []
+        turn = getattr(m.pagetype, "turn_junk_pages", None)
+        read_turned = getattr(eng, "read_turned", None)
+        if callable(turn) and callable(read_turned):  # rev 2.5: a sideways page read as junk is read turned
+            with clock("turn"):
+                turned = list(call_opt(turn, pages, read_turned,
+                                       line_ratio=getattr(eng, "line_ratio", None)) or [])
+        extra["turned"] = turned
         with clock("typing"):
             types = list(m.pagetype.type_pages(pages))
         rs.partial["types"] = types
@@ -222,6 +231,7 @@ def _run(m: _Modules, rs: _Run, input_path: Path, program: str, out: Path, *, to
         rs.partial["identity"] = ident
         with clock("split"):
             res = m.split.finish(seg, types, pages, m.identity.refs(ident), program)
+            _turned_notice(m, res, turned, src.mode)
         rs.partial["split"] = res
         with clock("identity"):
             ident = m.identity.finish_identity(ident, res.units, pages, births, confirm)
@@ -257,10 +267,13 @@ def _run(m: _Modules, rs: _Run, input_path: Path, program: str, out: Path, *, to
                 def solvency_pdf(i: int) -> Optional[Path]:
                     return eng.cut_page(pages[i], work_dir)
 
+                def page_image(i: int) -> Any:                 # rev 2.5: the handwritten-signature look
+                    return eng.page_image_of(pages[i], BANK_IMAGE_DPI)
+
                 for u in res.units:
                     if u.key == "bank":
-                        o = m.bank.check_bank_unit(u, [pages[i].text for i in u.pages], list(u.pages), ident, cov,
-                                                   confirm, solvency_pdf)
+                        o = call_opt(m.bank.check_bank_unit, u, [pages[i].text for i in u.pages], list(u.pages),
+                                     ident, cov, confirm, solvency_pdf, page_image=page_image)
                         bank_out[u.uid] = o
                         bank_map[u.uid] = list(o.findings)
                 _bank_files(res.units, bank_out, bank_map)
@@ -316,6 +329,17 @@ def _run(m: _Modules, rs: _Run, input_path: Path, program: str, out: Path, *, to
     rs.log.append(f"result {overall} | {headline}")
     _write_log(m, rs, r)
     return r
+
+
+def _turned_notice(m: _Modules, res: Any, turned: Sequence[Dict[str, Any]], mode: str) -> None:
+    """Rev 2.5: one NOTE notice naming every page read turned (scanned sideways or upside down)."""
+    fn = getattr(m.pagetype, "turned_note", None)
+    msg = fn(turned, mode) if callable(fn) else ""
+    if not msg or res is None:
+        return
+    done = [int(r["page"]) for r in turned if r.get("angle")]
+    res.notices.append(Notice(kind=NOTE, pages=(min(done) + 1, max(done) + 1), message=msg,
+                              units=tuple(u.uid for u in res.units if any(i in u.pages for i in done))))
 
 
 def _bank_files(units: List[DocUnit], bank_out: Dict[str, Any], bank_map: Dict[str, List[Finding]]) -> None:

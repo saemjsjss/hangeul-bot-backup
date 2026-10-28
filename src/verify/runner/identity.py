@@ -24,7 +24,8 @@ from . import birth, names, strict
 from .model import FLAG, NOTE, BirthFacts, DocUnit, Finding, Identity, NameRef, PageRead
 
 SOURCE = "runner:identity"
-_PARENT_RULES = ("identity.parents_from_passport", "identity.parents_unknown", "identity.parents_from_nid")
+_PARENT_RULES = ("identity.parents_from_passport", "identity.parents_unknown", "identity.parents_from_nid",
+                 "identity.tail_not_printed")
 
 
 def _bot():
@@ -228,6 +229,11 @@ def expiry_from_label(pp_text: str, find_dates: Callable[[str], List[Any]]) -> O
     return None
 
 
+def _closer_mode(confirm: Any) -> bool:
+    """The confirmer takes closer looks (owner 28 Oct): names.Confirmer on the real engine, or a test double."""
+    return bool(getattr(confirm, "closer", False)) and callable(getattr(confirm, "pair", None))
+
+
 def _note(verdict: str, rule: str, message: str, pages: Sequence[int] = (), **evidence: Any) -> Finding:
     return Finding(verdict, rule, message, SOURCE, tuple(pages), dict(evidence))
 
@@ -313,8 +319,22 @@ def _parent_refs(ident: Identity, reads: List["names.Read"], pages: List[PageRea
                 longer = f"{written} {d.get('tail_written') or ' '.join(tail)}"
                 if (_tail_on_another_page(person, longer, d["unit"], pg, reads)
                         or any(strict.compare(q, longer, any_order=True, dots=False) == "EQUAL"
-                               for q in _qr_parent_names(births, d["unit"], (pg,), person))
-                        or confirm(pg, longer) == "confirmed"):
+                               for q in _qr_parent_names(births, d["unit"], (pg,), person))):
+                    written, tail = longer, ()
+                elif _closer_mode(confirm):
+                    # owner 28 Oct: the closer look on the certificate's page: is the line printed on after the
+                    # name ("differs": the longer spelling) or is that OCR of the artwork / Bangla print ("same")?
+                    ans = confirm.pair(pg, written, longer)
+                    if ans == "differs":
+                        written, tail = longer, ()
+                    elif ans == "same":
+                        tail = ()
+                        ident.notes.append(_note(NOTE, "identity.tail_not_printed",
+                                                 f"the {person}'s name on the birth certificate ends at {written}: "
+                                                 f"the closer look shows no further words after it (the page read's "
+                                                 f"'{' '.join(d.get('tail') or ())}' was not print)",
+                                                 (names._p1(pages, pg),), person=person))
+                elif confirm(pg, longer) == "confirmed":
                     written, tail = longer, ()
             ref = NameRef(parts=tuple(strict.words(written)), written=written, source=d["how"],
                           unit=d["unit"], pages=(pg,) if pg >= 0 else (), tail=tail)
@@ -333,6 +353,49 @@ def _parent_refs(ident: Identity, reads: List["names.Read"], pages: List[PageRea
                                      f"passport — the {person}'s documents cannot be compared strictly; check by eye",
                                      person=person))
         setattr(ident, person, ref)
+
+
+def verify_references(ident: Identity, units: List[DocUnit], pages: List[PageRead], reads: List["names.Read"],
+                      confirm: Any) -> None:
+    """Owner 28 Oct: a parent's reference is ONE document's read (the birth certificate; else the passport field) and
+    can be a misread (owner folder 3: one letter, t read as l). When other documents print another spelling, the
+    closer look on the reference's OWN page decides between the two; when it shows the other spelling ("differs"),
+    the reference is corrected and every document is judged against the corrected one. Never by counting documents:
+    without a decided look the reference stands and each difference is judged on its own (FLAG unless confirmed)."""
+    if not _closer_mode(confirm):
+        return
+    for person in ("father", "mother"):
+        ref = getattr(ident, person)
+        written = ref.written
+        pgs = [i for i in (ref.pages or ()) if isinstance(i, int) and i >= 0]
+        if not written or not strict.letters(written) or not pgs:
+            continue
+        seen: Dict[str, List[str]] = {}
+        spelled: Dict[str, str] = {}
+        for r in reads:
+            if r.person != person or r.unit == ref.unit or r.src in names._MACHINE_ORDER:
+                continue
+            j = names.judge_read(written, r)
+            if j.status != "DIFF" or j.loose or j.added or not strict.letters(j.written):
+                continue
+            lk = strict.letters(j.written)
+            seen.setdefault(lk, [])
+            if r.unit not in seen[lk]:
+                seen[lk].append(r.unit)
+            spelled.setdefault(lk, j.written)
+        for lk in sorted(seen, key=lambda k: -len(seen[k]))[:2]:
+            v = spelled[lk]
+            if confirm.pair(pgs[0], written, v) != "differs":
+                continue
+            old = written
+            setattr(ident, person, dataclasses.replace(ref, parts=tuple(strict.words(v)), written=v, confirmed=True,
+                                                       tail=()))
+            ident.notes.append(_note(NOTE, "identity.reference_corrected",
+                                     f"the {person}'s name on the {ref.source} was read {old}; the closer look on "
+                                     f"page {names._p1(pages, pgs[0])} shows {v} (the spelling other documents print): "
+                                     f"the reference is corrected", (names._p1(pages, pgs[0]),), person=person,
+                                     read=old, corrected=v))
+            break
 
 
 def _nid_name(person: str, u: DocUnit, reads: List["names.Read"], parent: NameRef,
@@ -372,6 +435,49 @@ def _nid_name(person: str, u: DocUnit, reads: List["names.Read"], parent: NameRe
     mrz_ok = any(strict.compare(w, m.parts, any_order=True, dots=False) == "EQUAL" for m in mrz_reads)
     return NameRef(parts=tuple(strict.words(w)), written=w, source=f"{person} NID", unit=u.uid, pages=ps,
                    confirmed=len(ps) >= 2 or mrz_ok)
+
+
+def _mrz_order(r: "names.Read") -> List[Tuple[Tuple[str, ...], int]]:
+    """The printed passport name in MRZ order (surname first) with its number of surname words: the data page's Given
+    Name(s) + Surname read knows its surname words; the personal-data page's one line does not, so each split of it
+    is a candidate (the last word as the surname first)."""
+    words = tuple(strict.words(r.written))
+    if not words:
+        return []
+    n = int(getattr(r, "surname_n", 0) or 0)
+    if r.src == "VIZ given+surname" and 0 < n <= len(words):
+        return [(words[len(words) - n:] + words[:len(words) - n], n)]
+    return [(words[k:] + words[:k], len(words) - k) for k in range(len(words) - 1, 0, -1)] or [(words, len(words))]
+
+
+def _mrz_by_closer_look(cands: List["names.Read"], mrzname: Optional[Dict[str, Any]], confirm: Any,
+                        pages: List[PageRead], pp_pages: List[int], unit_of: Dict[int, str]) -> Optional[Dict[str, Any]]:
+    """Owner 28 Oct: the MRZ name line verified with the closer look. Needed when the MRZ name is missing or not well
+    formed, or when its letters differ from the printed name's. The printed name in MRZ order (and the MRZ's own
+    read, when there is one) are the candidates on the passport page; a decided look for the printed letters makes
+    them the MRZ name (well formed: the look found them on the code line). None: no change."""
+    mrz_parts = tuple(mrzname.get("parts") or ()) if mrzname else ()
+    look = getattr(confirm, "look", None)
+    if not callable(look):
+        return None
+    for r in cands:
+        orders = _mrz_order(r)
+        if mrz_parts and mrzname.get("ok") and any(strict.compare(o, mrz_parts, any_order=True, dots=False) == "EQUAL"
+                                                   for o, _n in orders):
+            return None                                       # the MRZ and the printed name agree already
+        page = mrzname.get("page", r.page) if mrzname else r.page
+        if page not in pp_pages:
+            page = r.page
+        for o, n_sur in orders[:3]:
+            alt = " ".join(mrz_parts) if mrz_parts and strict.letters(mrz_parts) != strict.letters(o) else ""
+            res = look(page, [" ".join(o)] + ([alt] if alt else []), "name")
+            if res is None or res.decision != "same":
+                continue
+            return {"parts": tuple(o), "ok": True, "truncated": False, "merged": False,
+                    "surname": " ".join(o[:n_sur]), "given": " ".join(o[n_sur:]), "line1": "", "page": page,
+                    "unit": unit_of.get(page, r.unit),
+                    "closer": {"decision": res.decision, "margin": res.margin, "variants": res.variants}}
+    return None
 
 
 # ============================================================================ build / finish
@@ -435,6 +541,14 @@ def build_identity(units: List[DocUnit], pages: List[PageRead], births: Dict[Tup
     cands = [r for r in reads if r.unit in pp_uids and r.person == "student" and r.parts and
              r.src in ("VIZ given+surname", "personal page name")]
     cands.sort(key=lambda r: 0 if r.src == "VIZ given+surname" else 1)
+    # owner 28 Oct: MRZ line 1 read reliably. When its OCR is noisy (not well formed, or other letters than the
+    # printed name), the closer look verifies the printed name against MRZ line 1 itself ('<' a separator).
+    if cands and _closer_mode(confirm) and pp_pages:
+        got = _mrz_by_closer_look(cands, mrzname, confirm, pages, pp_pages, unit_of)
+        if got is not None:
+            mrzname, name_src = got, "passport MRZ (closer look)"
+            reread_fields.append("name line (closer look)")
+            reread_pages.append(got["page"])
     student = NameRef()
     if mrzname and mrzname.get("parts"):
         mrz_words = tuple(mrzname["parts"])
@@ -549,6 +663,11 @@ def finish_identity(ident: Identity, units: List[DocUnit], pages: List[PageRead]
     confirm = confirm or names._unclear
     reads, _ = names.collect_reads(units, pages, births, money=True)
     _parent_refs(ident, reads, pages, confirm, births)
+    ident.notes = [n for n in ident.notes if n.rule != "identity.reference_corrected"]
+    verify_references(ident, units, pages, reads, confirm)      # owner 28 Oct: the closer look, never a count
+    if _closer_mode(confirm):
+        ident.__dict__["_closer"] = confirm                      # passport_for_language's closer look (not a field)
+        ident.__dict__["_lang_pages"] = [i for u in units if u.key == "language_cert" for i in u.pages]
     for person, key in (("father", "father_nid"), ("mother", "mother_nid")):
         nref = NameRef()
         for u in units:
@@ -591,4 +710,31 @@ def passport_for_language(ident: Identity) -> Dict[str, Any]:
     """What language.check_language_file gets (critique 12): the date of birth ONLY when trusted."""
     return {"surname": ident.surname, "given_names": ident.given_names, "passport_no": ident.passport_no,
             "dob": ident.dob if ident.dob_trusted else None, "name_verified": ident.name_verified,
-            "name_trusted": ident.name_trusted}
+            "name_trusted": ident.name_trusted,
+            # owner 28 Oct: the printed name when MRZ line 1 is not usable, and the closer look for a difference
+            "printed_name": ident.student.written or "", "printed_confirmed": bool(ident.student.confirmed),
+            "closer": _language_closer(ident)}
+
+
+def _language_closer(ident: Identity) -> Optional[Callable[[str, str], Tuple[str, str]]]:
+    """(certificate word, passport word) -> (what the certificate's page prints, what the passport page prints), each
+    "same" (the passport's word) | "differs" (the certificate's) | "unclear"; None outside closer mode. The
+    certificate's page is the language certificate's page whose read holds the certificate's word, else its first
+    page (the look searches the page for either spelling), else the first other page whose read holds the word."""
+    conf = ident.__dict__.get("_closer")
+    if conf is None:
+        return None
+    pp = [i for i in (ident.student.pages or ()) if isinstance(i, int) and i >= 0]
+    lang = [i for i in (ident.__dict__.get("_lang_pages") or []) if isinstance(i, int) and i >= 0 and i not in pp]
+
+    def fn(cert_word: str, pp_word: str) -> Tuple[str, str]:
+        pages = getattr(conf, "pages", None) or []
+        vp = next((i for i in lang if i < len(pages) and strict.find_run(cert_word, pages[i].text or "")),
+                  lang[0] if lang else None)
+        find = getattr(conf, "find_page", None)
+        if vp is None and callable(find):
+            vp = find(cert_word, exclude=pp)
+        var = conf.pair(vp, pp_word, cert_word) if vp is not None else "unclear"
+        ref = conf.pair(pp[-1], pp_word, cert_word) if pp else "unclear"
+        return var, ref
+    return fn

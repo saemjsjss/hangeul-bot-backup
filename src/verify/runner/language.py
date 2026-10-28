@@ -5,6 +5,9 @@ A port of the lab's language.py, trimmed (critique 20) and put on the runner's o
     EnglishScore, a medium-of-instruction letter, anything unrecognised) is PRESENT only.
   * Removed extras: the 60-day expiry warning, the administrator's-date and retake 60-day FLAGs, the
     General Training FLAG and the "verify online" authenticity NOTEs.
+  * Names (owner 28 Oct): when MRZ line 1 is not usable the passport's PRINTED name is the reference (never
+    "passport name not available" when it is known), and a word that reads differently gets the closer look on
+    the certificate's page and on the passport's (passport["closer"]): an OCR misread is no difference.
   * Names (A1, critique 14): the candidate's name is compared with the passport's MRZ words by
     strict.compare(any_order=True, dots=False) (the MRZ is a machine read) and judged by strict.judge. A
     difference is FAIL only when both spellings are confirmed (the passport's MRZ name confirmed by its
@@ -666,45 +669,108 @@ def _validity(test: str, test_date: Optional[dt.date], today: dt.date,
     return PASS, f"valid until {last.isoformat()}"
 
 
+def _word_pairs(pp_words: Sequence[str], cert_words: Sequence[str]) -> List[Tuple[str, str]]:
+    """(passport word, certificate word) pairs that differ, in any order ("" for a word the other lacks): each
+    certificate word takes the closest unused passport word within a few letters (describes a difference only)."""
+    rest, out = list(pp_words), []
+    for w in cert_words:
+        if w in rest:
+            rest.remove(w)
+            continue
+        p = min(rest, key=lambda z: strict._edit(z, w)) if rest else ""
+        if p and strict._edit(p, w) <= max(2, len(p) // 2):
+            out.append((p, w))
+            rest.remove(p)
+        else:
+            out.append(("", w))
+    return out + [(p, "") for p in rest]
+
+
+def _closer_words(closer: Optional[Callable[[str, str], Tuple[str, str]]], pp_words: Sequence[str],
+                  cert_written: str) -> Tuple[str, List[Tuple[str, str, str, str]]]:
+    """Owner 28 Oct: the closer look on each word that reads differently, on the certificate's page and on the
+    passport's. -> ("misread" every certificate word shows the passport's spelling | "confirmed" a word differs on
+    the certificate and the passport prints its own | "unclear" | "" no look), [(passport word, certificate word,
+    certificate look, passport look)]."""
+    pairs = _word_pairs(pp_words, strict.words(cert_written))
+    if closer is None or not pairs or any(not p or not c for p, c in pairs):
+        return "", []
+    got = []
+    for p, c in pairs:
+        try:
+            v, r = closer(c, p)
+        except Exception:
+            v, r = "unclear", "unclear"
+        got.append((p, c, v, r))
+    if all(v == "same" for _, _, v, _ in got):
+        return "misread", got
+    if any(v == "differs" and r == "same" for _, _, v, r in got):        # one word confirmed is a difference
+        return "confirmed", got
+    return "unclear", got
+
+
 def _name_finding(f: Dict[str, Any], passport: Dict[str, Any], covered_fn: Optional[Callable[[str], bool]],
                   cert_written: Optional[str], clean: bool, corroborated: bool) -> Tuple[str, str, str]:
-    """The candidate's name against the passport's MRZ name (A1, one policy, section 7).
+    """The candidate's name against the passport's name (A1, one policy, section 7; owner 28 Oct).
 
-    EQUAL (any word order, dots aside: the MRZ is a machine read) -> PASS. Otherwise strict.judge:
-    covered by an affidavit (covered_fn: names.covered, both spellings in one same-person group) -> NOTE;
-    confirmed -> FAIL; anything else -> FLAG "check by eye". Confirmed needs BOTH spellings confirmed:
-    the passport's MRZ name by its printed name (passport["name_verified"]), and the certificate's name by
-    a second, independent read: the IELTS TRF number, printed apart from the name field, spells the
-    certificate's name (family 3 + first 1) and not the passport's."""
+    The passport's name is its MRZ line 1 (a machine read) when well formed, else its PRINTED name (never "not
+    available" when the printed name is known). EQUAL (any word order: the certificate prints the family and first
+    names in fields of its own; dots aside, they go to the dot rule) -> PASS. Otherwise the closer look on each word
+    that reads differently, on the certificate's page and on the passport's (passport["closer"], identity.py):
+    every certificate word showing the passport's spelling -> PASS (an OCR misread); a word that differs on the
+    certificate while the passport prints its own -> confirmed. Then strict.judge: covered by an affidavit
+    (covered_fn: names.covered) -> NOTE; confirmed -> FAIL; anything else -> FLAG "check by eye". Without a closer
+    look, confirmed needs BOTH spellings confirmed as before: the passport's name (MRZ confirmed by its printed name,
+    or the printed name confirmed), and the certificate's by the IELTS TRF number, which spells it apart from the
+    name field."""
     sur, giv = passport.get("surname") or "", passport.get("given_names") or ""
     pp_words = tuple(strict.words(sur)) + tuple(strict.words(giv))
+    source = "MRZ"
     if pp_words and passport.get("name_trusted") is False:
         pp_words = ()                    # an MRZ line 1 that is not well formed is not a name source
+    printed = passport.get("printed_name") or ""
+    if not pp_words and strict.letters(printed):
+        pp_words, source = tuple(strict.words(printed)), "printed"
     if not pp_words:
-        return FLAG, "name", "passport name not available (MRZ line 1 not read cleanly): name not compared"
+        return FLAG, "name", ("passport name not available (neither MRZ line 1 nor the printed name could be read): "
+                              "name not compared")
     if not cert_written or not strict.letters(cert_written):
         return FLAG, "name", "candidate name not read on the certificate"
     kind = strict.compare(cert_written, pp_words, any_order=True, dots=False)
+    against = "the passport" if source == "MRZ" else "the passport's printed name (MRZ line 1 not read cleanly)"
     if kind == "EQUAL":
-        return PASS, "name", "name matches the passport"
+        return PASS, "name", f"name matches {against}"
     covered = bool(covered_fn(cert_written)) if covered_fn else False
+    how = _KIND_WORDS.get(kind, kind.lower())
+    looked, got = _closer_words(passport.get("closer"), pp_words, cert_written)
+    if looked == "misread" and not covered:
+        return PASS, "name", (f"name matches {against}: the closer look shows the passport's spelling on the "
+                              f"certificate (the page read was an OCR misread)")
+    if looked:
+        verdict = strict.judge(kind, covered, looked == "confirmed")
+        if verdict == NOTE:
+            return NOTE, "name", f"name differs from {against} ({how}); an affidavit covers both spellings"
+        if verdict == FAIL:
+            return FAIL, "name", (f"name differs from {against} ({how}; the closer look confirms the certificate's "
+                                  f"and the passport's spellings) and no affidavit covers it")
+        return FLAG, "name", (f"name may differ from {against} ({how}; the closer look could not tell): "
+                              f"check by eye")
     trf_letters = (f.get("trf_number") or "")[10:14]
-    pp_letters = _trf_letters(sur, giv)
+    pp_letters = _trf_letters(sur, giv) if source == "MRZ" else ""
     trf_says_other = bool(corroborated and len(trf_letters) == 4 and len(pp_letters) == 4
                           and trf_letters != pp_letters)
     cert_confirmed = bool(clean and trf_says_other)
-    pp_confirmed = bool(passport.get("name_verified"))
-    how = _KIND_WORDS.get(kind, kind.lower())
+    pp_confirmed = bool(passport.get("name_verified")) if source == "MRZ" else bool(passport.get("printed_confirmed"))
     verdict = strict.judge(kind, covered, cert_confirmed and pp_confirmed)
     if verdict == NOTE:
-        return NOTE, "name", f"name differs from the passport ({how}); an affidavit covers both spellings"
+        return NOTE, "name", f"name differs from {against} ({how}); an affidavit covers both spellings"
     if verdict == FAIL:
-        return FAIL, "name", (f"name differs from the passport ({how}; the TRF number spells the certificate's "
+        return FAIL, "name", (f"name differs from {against} ({how}; the TRF number spells the certificate's "
                               "name too) and no affidavit covers it")
     if cert_confirmed and not pp_confirmed:
         return FLAG, "name", (f"name differs from the passport's MRZ ({how}), but the MRZ name is not confirmed by "
                               "the passport's printed name (MRZ line 1 has no check digit): check by eye")
-    return FLAG, "name", f"name may differ from the passport ({how}; the read is not confirmed): check by eye"
+    return FLAG, "name", f"name may differ from {against} ({how}; the read is not confirmed): check by eye"
 
 
 def _identity(f: Dict[str, Any], passport: Dict[str, Any], covered_fn: Optional[Callable[[str], bool]],

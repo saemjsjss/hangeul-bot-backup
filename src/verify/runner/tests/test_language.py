@@ -244,5 +244,42 @@ class TestExtrasRemoved(unittest.TestCase):
         self.assertEqual(L.rows_text(items), "Family Name SAMPLE | STAMP\nFirst Name")
 
 
+class TestPrintedNameAndCloserLook(unittest.TestCase):
+    """Owner 28 Oct: the printed passport name when MRZ line 1 is not usable; the closer look for a difference."""
+
+    def test_the_printed_name_is_used_when_mrz_line_1_is_not_usable(self):
+        pp = dict(PP, name_trusted=False, printed_name="MD. EXAMPLE SAMPLE", printed_confirmed=True)
+        rep = L.check_language(trf(family="SAMPLE", first="MD EXAMPLE"), pp, "EAP", TODAY)
+        v = verdicts(rep)["name"]
+        self.assertEqual(v, PASS)
+        why = next(w for x, c, w in rep["findings"] if c == "name")
+        self.assertIn("printed name", why)
+        self.assertNotIn("not available", why)
+
+    def test_a_misread_word_is_no_difference(self):
+        pp = dict(PP, name_trusted=False, printed_name="MD. EXAMPLE SAMPLE", printed_confirmed=True,
+                  closer=lambda cert_word, pp_word: ("same", "same"))
+        rep = L.check_language(trf(family="SAMPLX", first="MD EXAMPLE"), pp, "EAP", TODAY)
+        self.assertEqual(verdicts(rep)["name"], PASS)
+
+    def test_a_confirmed_difference_fails_and_an_unclear_one_flags(self):
+        for answer, want in ((("differs", "same"), FAIL), (("unclear", "same"), FLAG), (("differs", "unclear"), FLAG)):
+            with self.subTest(answer=answer):
+                pp = dict(PP, name_trusted=False, printed_name="MD. EXAMPLE SAMPLE", printed_confirmed=True,
+                          closer=lambda cert_word, pp_word, a=answer: a)
+                rep = L.check_language(trf(family="SAMPLX", first="MD EXAMPLE"), pp, "EAP", TODAY)
+                self.assertEqual(verdicts(rep)["name"], want)
+
+    def test_one_misread_word_and_one_real_difference(self):
+        """Two words read differently: one is a misread (the look shows the passport's spelling), the other is
+        printed differently and the passport prints its own: the name differs (FAIL), never an all-or-nothing
+        FLAG."""
+        def closer(cert_word, pp_word):
+            return ("same", "same") if cert_word == "EXAMPIE" else ("differs", "same")
+        pp = dict(PP, name_trusted=False, printed_name="MD. EXAMPLE SAMPLE", printed_confirmed=True, closer=closer)
+        rep = L.check_language(trf(family="SAMPLX", first="MD EXAMPIE"), pp, "EAP", TODAY)
+        self.assertEqual(verdicts(rep)["name"], FAIL)
+
+
 if __name__ == "__main__":
     unittest.main()

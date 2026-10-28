@@ -527,6 +527,9 @@ _FATHER = r"F[ae][tl]?h[ea]r\W{0,3}s?"          # Father's / Fathers / Father' s
 _MOTHER = r"M[o0][tl]?h[ea]r\W{0,3}s?"
 _NAMEL = r"N[ae]r?n?m?e"
 _JUNK = r"(?:[^\w\s]{1,3}\s*)?"                   # one stray OCR mark after a value (integration, test 1)
+# rev 2.5: OCR item-number noise before the next item ("<A> <B> 3 3) Mother's Name", owner EAP folder): up to three
+# stray item numbers ("3", "3)", "3 3)") between a value and the next label
+_ITEMNO = r"(?:\b\d{1,2}\s?[)}\].]?\W{0,2}\s*){0,3}"
 
 
 def _clean_name(s: str) -> str:
@@ -568,15 +571,17 @@ def printed_tin_fields(text: str) -> Dict[str, str]:
                   r"registered\s+'?tax\s*payer", t, re.I)
     if m:
         out["certify_name"] = _clean_name(m.group(1))
-    for pat in (r"\b1\W{0,2}\s*" + _NAMEL + r"\s*[:\-]?\s*(" + _NAME_CHARS + r"{3,70}?)\s*(?:\b2\W{0,3})?\s*" + _FATHER + r"\s*" + _NAMEL,
+    for pat in (r"\b1\W{0,2}\s*" + _NAMEL + r"\s*[:\-]?\s*(" + _NAME_CHARS + r"{3,70}?)\s*" + _ITEMNO + r"\s*" + _FATHER
+                + r"\s*" + _NAMEL,
                 r"\b1\W{0,2}\s*" + _NAMEL + r"\s*[:\-]?\s*(" + _NAME_CHARS + r"{3,70}?)\s*\b2\s?[)}\].]",
-                r"\b" + _NAMEL + r"\s*[:\-]?\s*(" + _NAME_CHARS + r"{3,70}?)\s*(?:\b2\W{0,3})?\s*" + _FATHER + r"\s*" + _NAMEL):
+                r"\b" + _NAMEL + r"\s*[:\-]?\s*(" + _NAME_CHARS + r"{3,70}?)\s*" + _ITEMNO + r"\s*" + _FATHER + r"\s*"
+                + _NAMEL):
         m = re.search(pat, t, re.I)
         if m:
             out["name"] = _clean_name(m.group(1))
             break
     # _JUNK: one stray OCR mark between the value and the next item ("... <A> <B> @ 3) Mother's Name", test 1)
-    for pat in (_FATHER + r"\s*" + _NAMEL + r"\s*[:\-]?\s*(" + _NAME_CHARS + r"{3,70}?)\s*" + _JUNK + r"(?:\b3\W{0,3})?\s*"
+    for pat in (_FATHER + r"\s*" + _NAMEL + r"\s*[:\-]?\s*(" + _NAME_CHARS + r"{3,70}?)\s*" + _JUNK + _ITEMNO + r"\s*"
                 + _MOTHER + r"\s*" + _NAMEL,
                 r"\b2\s?[)}\].]\s*\S{0,12}\s*" + _NAMEL + r"\s*[:\-]?\s*(" + _NAME_CHARS + r"{3,70}?)\s*" + _JUNK
                 + r"\b3\s?[)}\].]"):
@@ -584,8 +589,8 @@ def printed_tin_fields(text: str) -> Dict[str, str]:
         if m:
             out["father"] = _clean_name(m.group(1))
             break
-    m = re.search(_MOTHER + r"\s*" + _NAMEL + r"\s*[:\-]?\s*(" + _NAME_CHARS + r"{3,70}?)\s*(?:\b4\W{0,4}\w?\W{0,2})?\s*"
-                  r"(?:Current|Present|Address)", t, re.I)
+    m = re.search(_MOTHER + r"\s*" + _NAMEL + r"\s*[:\-]?\s*(" + _NAME_CHARS + r"{3,70}?)\s*" + _ITEMNO
+                  + r"(?:\b4\W{0,4}\w?\W{0,2})?\s*(?:Current|Present|Address)", t, re.I)
     if m:
         out["mother"] = _clean_name(m.group(1))
     return out
@@ -682,8 +687,19 @@ def verdicts(qr: Optional[Dict[str, str]], cmp: Optional[Dict[str, Any]], qr_see
     t = cmp.get("tin")
     if t == "EQUAL":
         out.append((PASS, "the QR's TIN matches the printed TIN", "tin.qr_tin"))
+    elif t == "CLOSER_EQUAL":
+        out.append((PASS, "the QR's TIN matches the printed TIN (a closer look at the print reads the QR's digits; the "
+                          "page read had misread a digit)", "tin.qr_tin"))
     elif t == "DIFFERENT":
         out.append((FAIL, "the QR's TIN is not the printed TIN - the certificate may be altered", "tin.qr_tin"))
+    elif t == "CLOSER_DIFFERENT":
+        # rev 2.5: never FAIL on it. The page read and the closer look are the same kind of recogniser on the same
+        # print, so they can repeat one misread of a look-alike digit (owner folder 3: a closer-look version read the
+        # TIN's last 3 as 2 in every view; the print is the QR's number by eye). Only a difference beyond OCR's reach
+        # (tin_agreement "DIFFERENT") is FAIL.
+        out.append((FLAG, "the printed TIN reads one or two look-alike digits off the QR's, and a closer look at the "
+                          "print reads the same - check by eye (if the print really differs, the certificate may be "
+                          "altered)", "tin.qr_tin"))
     else:
         out.append((FLAG, "the printed TIN could not be read clearly enough to compare with the QR", "tin.qr_tin"))
 
@@ -774,6 +790,58 @@ def _printed_page(fields: Sequence[str], printed: Dict[str, str], page_texts: Op
     return None
 
 
+CLOSER_DPI = 400               # a vector (text-layer) page
+CLOSER_SCAN_DPI = (150, 400)   # a scanned page: its own resolution, within these (closer.page_image's rule)
+
+
+def closer_dpi(closer: Any, path, page: int) -> int:
+    """The render resolution for the closer look: a scan at its own resolution (rendering a 150 dpi scan at 400 dpi
+    adds no detail and doubles the closer look's time: owner folder 3's TIN 85 s -> about 25 s, the same decision);
+    a vector page at CLOSER_DPI."""
+    fn = getattr(closer, "native_dpi", None)
+    nd = fn(path, page) if callable(fn) else None
+    if not nd:
+        return CLOSER_DPI
+    return int(max(CLOSER_SCAN_DPI[0], min(CLOSER_SCAN_DPI[1], round(float(nd)))))
+
+
+def tin_closer_look(path, page: int, qr_tin: str, printed_tin: str) -> Tuple[str, Dict[str, Any]]:
+    """The printed TIN against the QR's when the page read differs from it by look-alike digits (tin_agreement
+    "OCR_DIGITS"): the closer look (closer.look, kind "digits", on a render of the page at closer_dpi; candidates[0]
+    = the QR's digits) decides. "same" -> "CLOSER_EQUAL" (PASS: the print is the QR's number; the page read misread a
+    digit); "differs" -> "CLOSER_DIFFERENT" (both reads of the print give another number: still FLAG check by eye,
+    never FAIL - the two reads are one kind of recogniser and can share a look-alike misread); "unclear" or no closer
+    look -> "OCR_DIGITS" (FLAG check by eye). Returns (kind, evidence)."""
+    info: Dict[str, Any] = {"how": "closer look", "page": page, "candidates": 2}
+    try:
+        import importlib
+        closer = importlib.import_module(f"{__package__}.closer")
+    except ImportError:
+        info["how"] = "no closer look available"
+        return "OCR_DIGITS", info
+    try:
+        dpi = closer_dpi(closer, path, page) if Path(str(path)).suffix.lower() == ".pdf" else CLOSER_DPI
+        info["dpi"] = dpi
+        img = render_page(path, page, dpi)
+        if img is None:
+            info["how"] = "the page did not render"
+            return "OCR_DIGITS", info
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        look = closer.look(img, None, [qr_tin, printed_tin], kind="digits")
+    except _CODE_FAULTS:
+        raise
+    except Exception as e:                       # a page that will not render: no closer look, the FLAG stays
+        info["how"] = f"closer look failed ({type(e).__name__})"
+        return "OCR_DIGITS", info
+    info.update(decision=look.decision, margin=round(float(look.margin), 3), agree=int(look.agree),
+                variants=int(look.variants), note=str(look.note or ""))
+    if look.decision == "same":
+        return "CLOSER_EQUAL", info
+    if look.decision == "differs":
+        return "CLOSER_DIFFERENT", info
+    return "OCR_DIGITS", info
+
+
 def check_tin_certificate(path, text: str, page_types: Optional[List[str]] = None, max_pages: int = 20,
                           confirm: Optional[Callable[[int, str], str]] = None, *,
                           page_texts: Optional[Sequence[str]] = None,
@@ -831,6 +899,12 @@ def check_tin_certificate(path, text: str, page_types: Optional[List[str]] = Non
     printed = printed_tin_fields(text)
     cmp = compare(qr, printed, text) if qr else None
     conf: Dict[str, Dict[str, Any]] = {}
+    if qr and cmp and cmp.get("tin") == "OCR_DIGITS" and path is not None:
+        # rev 2.5 (owner, 28 Oct): a number that reads differently is looked at again before any verdict
+        k = _printed_page(("tin",), printed, page_texts)
+        if k is None:
+            k = next((j for j, t in enumerate(page_types or []) if t == "tin"), 0)
+        cmp["tin"], conf["tin"] = tin_closer_look(path, k, qr.get("tin", ""), printed.get("tin", ""))
     name_ok = father_ok = False
     if qr and cmp:
         if cmp["name"] not in ("EQUAL", "EMPTY") and not cmp["name_mixed"]:

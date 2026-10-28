@@ -286,7 +286,9 @@ class TestBuildIdentity(unittest.TestCase):
         lang = I.passport_for_language(ident)
         self.assertIsNone(lang["dob"])                        # untrusted (critique 12)
         self.assertTrue(lang["name_trusted"])
-        self.assertEqual(set(lang), {"surname", "given_names", "passport_no", "dob", "name_verified", "name_trusted"})
+        self.assertEqual(set(lang), {"surname", "given_names", "passport_no", "dob", "name_verified", "name_trusted",
+                                     "printed_name", "printed_confirmed", "closer"})     # owner 28 Oct
+        self.assertIsNone(lang["closer"])                    # no closer look without the real recogniser
         c = Case()
         c.add("passport", [passport_text(L1 + "\n" + line2())])
         self.assertEqual(I.passport_for_language(build(c))["dob"], dt.date(2000, 1, 1))
@@ -367,6 +369,109 @@ class TestFinishIdentity(unittest.TestCase):
         self.assertEqual(ident.mother, NameRef())
         self.assertIn(("identity.parents_from_nid", NOTE), rules(ident))
         self.assertEqual(rules(ident).count(("identity.parents_unknown", FLAG)), 1)
+
+
+# ============================================================================================ owner 28 Oct
+class CloserFake:
+    """A closer-mode confirmer: `truth` maps a run page to the spellings it prints (letters compared); a look picks
+    the candidate printed there, else "unclear"."""
+    closer = True
+
+    def __init__(self, truth):
+        self.truth, self.calls, self.log = truth, [], []
+
+    def look(self, page, candidates, kind="name"):
+        from src.verify.runner import closer
+        self.calls.append((page, tuple(candidates)))
+        printed = [S.letters(t) for t in self.truth.get(page, ())]
+        hit = next((c for c in candidates if S.letters(c) in printed), None)
+        if hit is None:
+            return closer.Look("unclear", candidates[0], {}, 0.0, 10, 0, None, "test")
+        return closer.Look("same" if hit == candidates[0] else "differs", hit, {}, 0.5, 10, 10, None, "test")
+
+    def pair(self, page, reference, variant, kind="name"):
+        return self.look(page, [reference, variant], kind).decision
+
+    def __call__(self, page_index, variant, reference=""):
+        return "unclear"
+
+
+BC_TEXT = ("BIRTH REGISTRATION CERTIFICATE Name MD. EXAMPLE SAMPLE Father's Name TESTER SAMPLE NOR Father's "
+           "Nationality Bangladeshi Mother's Name DEMO SAMPLX Mother's Nationality Bangladeshi")
+
+
+class TestCloserLook(unittest.TestCase):
+    def setUp(self):
+        shutil.rmtree(WORK, ignore_errors=True)
+
+    def case(self):
+        c = Case()
+        c.add("passport", [passport_text(L1 + "\n" + line2(), parents=False)])
+        bc = c.add("birth_cert", [BC_TEXT])
+        nid = c.add("mother_nid", ["NATIONAL ID CARD Name DEMO SAMPLE Father TESTER OLD Date of Birth"],
+                    role="mother", role_how="name")
+        fam = c.add("family_cert", ["FAMILY CERTIFICATE Father's Name TESTER SAMPLE Mother's Name DEMO SAMPLE "
+                                    "Date of Issue"])
+        births = {tuple(bc.pages): BirthFacts(pages=tuple(bc.pages), english_pages=list(bc.pages))}
+        return c, bc, births
+
+    def test_a_misread_reference_is_corrected_by_the_look_on_its_own_page(self):
+        c, bc, births = self.case()
+        conf = CloserFake({bc.pages[0]: ["DEMO SAMPLE", "TESTER SAMPLE"]})
+        ident = I.finish_identity(build(c, births, confirm=conf), c.units, c.pages, births, conf)
+        self.assertEqual(ident.mother.written, "DEMO SAMPLE")
+        self.assertIn(("identity.reference_corrected", NOTE), rules(ident))
+
+    def test_an_unclear_look_never_corrects_by_counting_documents(self):
+        c, bc, births = self.case()
+        conf = CloserFake({})
+        ident = I.finish_identity(build(c, births, confirm=conf), c.units, c.pages, births, conf)
+        self.assertEqual(ident.mother.written, "DEMO SAMPLX")                # two documents agree: no outvote
+        self.assertNotIn(("identity.reference_corrected", NOTE), rules(ident))
+
+    def test_a_tail_the_look_does_not_see_is_dropped(self):
+        c, bc, births = self.case()
+        conf = CloserFake({bc.pages[0]: ["TESTER SAMPLE"]})
+        ident = build(c, births, confirm=conf)
+        self.assertEqual((ident.father.written, ident.father.tail), ("TESTER SAMPLE", ()))
+        self.assertIn(("identity.tail_not_printed", NOTE), rules(ident))
+        conf2 = CloserFake({bc.pages[0]: ["TESTER SAMPLE NOR"]})
+        self.assertEqual(build(c, births, confirm=conf2).father.written, "TESTER SAMPLE NOR")
+        self.assertEqual(build(c, births, confirm=CloserFake({})).father.tail, ("NOR",))   # unclear: kept, FLAG later
+
+    def test_a_noisy_mrz_name_line_is_verified_by_the_look(self):
+        c = Case()
+        noisy = ("P<BGDSAMPLE<<MD<EXAMPLE<<<<<<<<<KKKCCX<<<<<<<<<<<")[:44]
+        c.add("passport", [passport_text("P<BGDSAMQLE<<MD<EXAMPLE<KK<<C<<\n" + line2())])
+        plain = build(c)
+        conf = CloserFake({0: ["SAMPLE MD EXAMPLE"]})
+        ident = build(c, confirm=conf)
+        self.assertTrue(ident.name_trusted)
+        self.assertEqual(S.letters(ident.student.parts), S.letters("SAMPLE MD EXAMPLE"))
+        self.assertEqual(ident.student.written, "MD. EXAMPLE SAMPLE")            # the printed name: dot reference
+        self.assertEqual(ident.surname, "SAMPLE")
+        self.assertTrue(noisy and plain is not None)
+
+    def test_language_gets_the_printed_name_and_the_look(self):
+        c, bc, births = self.case()
+        conf = CloserFake({})
+        ident = I.finish_identity(build(c, births, confirm=conf), c.units, c.pages, births, conf)
+        lang = I.passport_for_language(ident)
+        self.assertEqual(lang["printed_name"], "MD. EXAMPLE SAMPLE")
+        self.assertTrue(callable(lang["closer"]))
+
+    def test_the_language_look_is_taken_on_the_certificate_page(self):
+        """The certificate's word is looked at on the language certificate's own page (its read may come from a
+        separate row read, so the page is not searched by text alone), the passport's word on the passport page."""
+        c, bc, births = self.case()
+        lc = c.add("language_cert", ["IELTS Test Report Form Family Name SAMPLX First Name MD EXAMPLE"])
+        conf = CloserFake({lc.pages[0]: ["SAMPLE"], 0: ["SAMPLE"]})
+        ident = I.finish_identity(build(c, births, confirm=conf), c.units, c.pages, births, conf)
+        fn = I.passport_for_language(ident)["closer"]
+        self.assertEqual(fn("SAMPLX", "SAMPLE"), ("same", "same"))           # a misread on the certificate
+        self.assertIn((lc.pages[0], ("SAMPLE", "SAMPLX")), conf.calls)
+        conf.truth[lc.pages[0]] = ["SAMPLX"]
+        self.assertEqual(fn("SAMPLX", "SAMPLE"), ("differs", "same"))        # printed so: a confirmed difference
 
 
 if __name__ == "__main__":

@@ -7,9 +7,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-RUNNER_VERSION = "0.2.4"
+RUNNER_VERSION = "0.2.6"
 BASE_RULES_VERSION = "2026-10-21.3"      # the bot rules in the worktree's src/verify (commit 07b1f22)
-RUNNER_RULES_VERSION = "2026-10-28.r2.4"   # + the owner's 21-27 Oct decisions (A1-A8), applied in the runner only
+RUNNER_RULES_VERSION = "2026-10-28.r2.6"   # + the owner's 21-28 Oct decisions (A1-A8, the 28 Oct rules), runner only
 RUN_SCHEMA = "runner-run/2"
 PAGE_TEXTS_SCHEMA = "runner-page-texts/1"   # gpuread.py writes it, engine.load_page_texts reads it (5.2.1)
 
@@ -114,6 +114,9 @@ class PageRead:
     seconds: float
     image_only: bool                 # no text layer and one embedded image covering >= 50% of the page
     engine: str = ""                 # "layer" | "gpu" (served from --page-texts) | "cpu" (runner light engine)
+    # rev 2.5: degrees the page was turned (clockwise) for the reading kept, when its first read was junk and a turned
+    # read typed better (pagetype.turn_junk_pages); 0 = as scanned
+    turned: int = 0
 
 
 @dataclass
@@ -129,6 +132,9 @@ class PageType:
     nid_numbers: List[str]
     birth_dates: List[str]           # ISO dates read after a birth label
     holder: List[str]                # name parts after a "Name" label (never Father's/Mother's/Husband's)
+    # rev 2.5: "<type> / <type> -> <winner> (<how>)" when the page's two best types tied and pagetype.break_ties
+    # settled it (its own title, else its neighbours); "" otherwise
+    tie: str = ""
 
 
 @dataclass

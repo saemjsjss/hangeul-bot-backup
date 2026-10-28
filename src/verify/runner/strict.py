@@ -173,7 +173,14 @@ def dot_rule(reference: Optional[Name],
             else:
                 out[doc] = "FAIL" if (firm and ref is not None) else "FLAG"
         elif sure:
-            out[doc] = "PASS" if c <= sure else "FLAG"
+            s = next(iter(sure))
+            if ref is not None and s != ref and any(ref in cands[d] for d, _, _ in others):
+                # rev 2.5 (integrator, CHECK_0001): the confirmed dots differ from the reference's while another
+                # document reads the reference's dots (not confirmed): the dots may be mixed. A document following
+                # the reference is never the one that fails; the confirmed different one is FLAG, never PASS.
+                out[doc] = "PASS" if c == {ref} else "FLAG"
+            else:
+                out[doc] = "PASS" if c <= sure else "FLAG"
         else:
             out[doc] = "PASS" if (ref is not None and c == {ref}) else "FLAG"
     return out

@@ -166,6 +166,7 @@ class TestPinnedMessages(unittest.TestCase):
         patterns += [p for ps in D.KEEP_ONLY.values() for p in ps]
         patterns += [p for t in D.REWRITE.values() for p in t]
         patterns += [D.APOSTILLE_PAGE1] + D.HOLDER_ROWS
+        patterns += D.OPENING_BALANCE_ROWS + D.QR_NONE_ROWS + [D.NOTARISED_ROW]        # rev 2.5
         missing = [p for p in patterns if not any(re.search(p, s) for s in lits)]
         self.assertEqual(missing, [])
 

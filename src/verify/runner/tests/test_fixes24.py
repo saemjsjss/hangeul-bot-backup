@@ -136,11 +136,30 @@ FAMILY_FLAT = ("Family Certificate Name GAMMA SAMPLE No Name Relation Age NID Ma
 
 class TestWrappedCells(unittest.TestCase):
     def rows(self, text):
-        return [(r.person, r.written) for r in N.extract_family_cert({"pages": [text]}) if r.src == "table row"]
+        return [(r.person, " ".join([r.written] + list(r.wrap))) for r in N.extract_family_cert({"pages": [text]})
+                if r.src == "table row"]
 
     def test_a_wrapped_name_cell_is_read_whole(self):
         self.assertEqual(self.rows(FAMILY_WRAPPED), [("student", "GAMMA SAMPLE"), ("father", "TESTER SAMPLE"),
                                                      ("mother", "DEMO SAMPLE")])
+        reads = [r for r in N.extract_family_cert({"pages": [FAMILY_WRAPPED]}) if r.src == "table row"]
+        self.assertEqual([(r.written, r.wrap) for r in reads][1], ("TESTER", ("SAMPLE",)))   # kept apart
+        father = reads[1]
+        self.assertEqual(N._wrap_choice("TESTER SAMPLE", father, False).written, "TESTER SAMPLE")
+
+    def test_an_address_word_under_a_one_word_name_is_not_taken(self):      # owner checker 28 Oct (made up)
+        fam = ("SL NAME RELATION ID NO BIRTH DATE ADDRESS 01 GAMMA SAMPLE SELF 1234567890 01-06-2003 Vill: Somewhere "
+               "02 TESTER FATHER 2345678901 01-02- Vill: Somewhere TOWNNAME 1967 DISTRICTX 03 DEMO SAMPLE MOTHER "
+               "3456789012 28-03-1976 Vill: Somewhere")
+        reads = [r for r in N.extract_family_cert({"pages": [fam]}) if r.src == "table row"]
+        father = next(r for r in reads if r.person == "father")
+        self.assertEqual((father.written, father.wrap), ("TESTER", ("TOWNNAME",)))
+        self.assertEqual(N._wrap_choice("TESTER", father, False).written, "TESTER")          # the name IS one word
+        self.assertEqual(N.judge_read("TESTER", N._wrap_choice("TESTER", father, False)).status, "MATCH")
+        # the second line within OCR distance of the reference's dropped surname: taken (the closer look decides)
+        self.assertEqual(N._wrap_choice("TESTER TOWNNANE", father, False).written, "TESTER TOWNNAME")
+        # unrelated to the reference's last word: not taken
+        self.assertEqual(N._wrap_choice("TESTER SAMPLE", father, False).written, "TESTER")
 
     def test_one_line_cells_are_unchanged(self):
         self.assertEqual(self.rows(FAMILY_FLAT), [("student", "GAMMA SAMPLE"), ("father", "TESTER"),
@@ -225,17 +244,19 @@ class TestWrappedReread(unittest.TestCase):
 
 
 # ============================================================================================ 6. not compared
-class TestUnreadAfterOutvote(unittest.TestCase):
-    def test_no_not_compared_flag_where_the_document_shows_the_agreed_spelling(self):
+class TestUnreadFlag(unittest.TestCase):
+    def test_no_not_compared_flag_where_the_document_shows_the_name(self):
+        """Owner 28 Oct: no outvote any more; a document whose other page reads the name (here a confirmed other
+        spelling) gets no "not compared" FLAG for a misparsed label on its apostille page."""
         c = RefCase()
         mixed = c.add("academic", ["e-Apostille page Mother zq Qwrtz Plmk", reading("DEMO SAMPLE")], "ACADEMIC HSC")
         others = [c.add("family_cert", [reading("DEMO SAMPLE")] * 2, "FAMILY CERTIFICATE"),
                   c.add("academic", [reading("DEMO SAMPLE")] * 2, "ACADEMIC SSC")]
         res = c.run(FakeConfirm("confirmed"))
-        self.assertEqual(verdicts(res, c.bc.uid), [("names.mother_reference", FLAG)])
-        self.assertEqual(verdicts(res, mixed.uid), [("names.mother", NOTE)])
+        self.assertEqual(verdicts(res, c.bc.uid), [])
+        self.assertEqual(verdicts(res, mixed.uid), [("names.mother", FAIL)])
         for u in others:
-            self.assertEqual(verdicts(res, u.uid), [("names.mother", NOTE)])
+            self.assertEqual(verdicts(res, u.uid), [("names.mother", FAIL)])
 
     def test_the_flag_stays_without_an_outvote(self):
         c = RefCase()

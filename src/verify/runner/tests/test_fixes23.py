@@ -288,32 +288,70 @@ def verdicts(res, uid, person="mother"):
     return sorted((f.rule, f.verdict) for f in res.per_unit.get(uid, []) if f.rule.startswith(f"names.{person}"))
 
 
-class TestOutvotedReference(unittest.TestCase):
-    def test_agreeing_documents_do_not_fail_against_a_single_read(self):     # owner folder 3, made up
+class CloserConfirm:
+    """A closer-mode confirmer (owner 28 Oct) for tests: pair(page, reference, variant) -> the decision `decide`
+    gives for (page, reference, variant); look(page, candidates, kind) -> None (no dots look)."""
+    closer = True
+
+    def __init__(self, decide):
+        self.decide, self.calls, self.log = decide, [], []
+
+    def pair(self, page, reference, variant, kind="name"):
+        self.calls.append((page, reference, variant))
+        return self.decide(page, reference, variant)
+
+    def look(self, page, candidates, kind="name"):
+        return None
+
+    def __call__(self, page_index, variant, reference=""):
+        return "unclear"
+
+
+class TestNoOutvote(unittest.TestCase):
+    """Owner 28 Oct: a misread is never resolved by outvoting with other documents (the revision 2.3 outvote is
+    gone); the closer look on the reference's own page decides whether the reference was misread."""
+
+    def test_agreeing_documents_never_outvote_a_confirmed_reference(self):     # legacy re-read: no closer look
         c = RefCase()
         docs = [c.add("academic", [reading("DEMO SAMPLE")] * 2, "ACADEMIC HSC"),
                 c.add("family_cert", [reading("DEMO SAMPLE")] * 2, "FAMILY CERTIFICATE"),
                 c.add("academic", [reading("DEMO SAMPLE")] * 2, "ACADEMIC SSC")]
-        res = c.run(FakeConfirm("confirmed"))              # even the reference's own re-read "confirms" it
-        self.assertEqual(verdicts(res, c.bc.uid), [("names.mother_reference", FLAG)])
+        res = c.run(FakeConfirm("confirmed"))
         for u in docs:
-            self.assertEqual(verdicts(res, u.uid), [("names.mother", NOTE)], u.title)
-        self.assertNotIn(FAIL, [f.verdict for fs in res.per_unit.values() for f in fs])
-        self.assertEqual(res.per_person["mother"], FLAG)
-        line = next(f for f in res.summary if f.rule == "names.mother")
-        self.assertEqual(line.verdict, FLAG)
-        self.assertIn("spelling not confirmed (3 other documents agree on DEMO SAMPLE)", line.message)
-        self.assertNotIn("spelled differently", line.message)
-        ref_f = next(f for f in res.per_unit[c.bc.uid] if f.rule == "names.mother_reference")
-        self.assertIn("check by eye", ref_f.message)
-        self.assertEqual(ref_f.evidence["units"], [u.uid for u in docs])
+            self.assertEqual(verdicts(res, u.uid), [("names.mother", FAIL)], u.title)
+        self.assertEqual(verdicts(res, c.bc.uid), [])
+        self.assertFalse(hasattr(N, "_outvoted") or hasattr(N, "ref_independently_confirmed"))
 
-    def test_an_unconfirmed_reference_gives_one_flag_not_one_per_document(self):
+    def test_an_added_honorific_confirmed_on_its_page_stays_fail(self):        # the outvote turned this into FLAG
+        c = RefCase(ref_mother="DEMO SAMPLE")
+        docs = [c.add("academic", [reading("MST DEMO SAMPLE")], "A"), c.add("family_cert", [reading("MST DEMO SAMPLE")], "B")]
+
+        def decide(page, reference, variant):
+            if page in c.bc.pages:
+                return "same"                               # the birth certificate prints the reference
+            return "differs"                                # each document prints the added MST
+        res = c.run(CloserConfirm(decide))
+        self.assertEqual([verdicts(res, u.uid) for u in docs], [[("names.mother", FAIL)]] * 2)
+
+    def test_the_reference_page_look_corrects_nothing_by_itself_when_unclear(self):
         c = RefCase()
         docs = [c.add("academic", [reading("DEMO SAMPLE")], "A"), c.add("family_cert", [reading("DEMO SAMPLE")], "B")]
-        res = c.run(FakeConfirm("unclear"), confirmed=False)
-        self.assertEqual(verdicts(res, c.bc.uid), [("names.mother_reference", FLAG)])
-        self.assertEqual([verdicts(res, u.uid) for u in docs], [[("names.mother", NOTE)]] * 2)
+
+        def decide(page, reference, variant):
+            return "unclear" if page in c.bc.pages else "differs"
+        res = c.run(CloserConfirm(decide), confirmed=True)
+        self.assertEqual([verdicts(res, u.uid) for u in docs], [[("names.mother", FLAG)]] * 2)
+        f = res.per_unit[docs[0].uid][0]
+        self.assertIn("could not confirm", f.message)
+        self.assertEqual(f.evidence["closer_reference"], "unclear")
+
+    def test_a_misread_on_the_variant_page_is_no_difference(self):
+        c = RefCase(ref_mother="DEMO SAMPLE")
+        u = c.add("academic", [reading("DEMO SAMPIE")], "A")
+        res = c.run(CloserConfirm(lambda page, reference, variant: "same"))
+        self.assertEqual(verdicts(res, u.uid), [])
+        line = next(f for f in res.summary if f.rule == "names.mother")
+        self.assertEqual(line.verdict, PASS)
 
     def test_one_other_document_still_fails_against_a_confirmed_reference(self):
         c = RefCase()
@@ -324,34 +362,23 @@ class TestOutvotedReference(unittest.TestCase):
 
     def test_a_document_printing_the_reference_confirms_it(self):
         c = RefCase()
-        a = c.add("academic", [reading("DEMO SAMPLE")] * 2, "A")
-        b = c.add("family_cert", [reading("DEMO SAMPLE")] * 2, "B")
-        c.add("academic", [reading("DEMO SAMPLX")] * 2, "C")                   # agrees with the reference
-        res = c.run(FakeConfirm("confirmed"))
+        a = c.add("academic", [reading("DEMO SAMPLE")], "A")
+        c.add("academic", [reading("DEMO SAMPLX")], "C")                   # prints the reference
+
+        def decide(page, reference, variant):
+            return "unclear" if page in c.bc.pages else "differs"
+        res = c.run(CloserConfirm(decide))
         self.assertEqual(verdicts(res, a.uid), [("names.mother", FAIL)])
-        self.assertEqual(verdicts(res, b.uid), [("names.mother", FAIL)])
-        self.assertEqual(verdicts(res, c.bc.uid), [])
 
-    def test_a_qr_machine_read_or_an_account_holder_confirms_it(self):
-        for kw in ({"machine": [MachineRead(unit="D01", person="mother", name="DEMO SAMPLX", source="birth QR",
-                                            page=0)]},
-                   {"extra": [("mother", "DBANK", "DEMO SAMPLX", 9)]}):
-            with self.subTest(kw=list(kw)):
-                c = RefCase()
-                a = c.add("academic", [reading("DEMO SAMPLE")] * 2, "A")
-                b = c.add("family_cert", [reading("DEMO SAMPLE")] * 2, "B")
-                res = c.run(FakeConfirm("confirmed"), **kw)
-                self.assertEqual(verdicts(res, a.uid), [("names.mother", FAIL)])
-                self.assertEqual(verdicts(res, b.uid), [("names.mother", FAIL)])
-
-    def test_a_trade_licence_owner_printing_the_reference_confirms_it(self):
+    def test_a_qr_machine_read_confirms_the_reference(self):
         c = RefCase()
-        a = c.add("academic", [reading("DEMO SAMPLE")] * 2, "A")
-        b = c.add("family_cert", [reading("DEMO SAMPLE")] * 2, "B")
-        c.add("trade_license", ["Trade License Name of Proprietor DEMO SAMPLX Nature of Business Shop"], "TL")
-        res = c.run(FakeConfirm("confirmed"))
+        a = c.add("academic", [reading("DEMO SAMPLE")], "A")
+        mr = MachineRead(unit=c.bc.uid, person="mother", name="DEMO SAMPLX", source="birth QR", page=0)
+
+        def decide(page, reference, variant):
+            return "unclear" if page in c.bc.pages else "differs"
+        res = c.run(CloserConfirm(decide), machine=[mr])
         self.assertEqual(verdicts(res, a.uid), [("names.mother", FAIL)])
-        self.assertEqual(verdicts(res, b.uid), [("names.mother", FAIL)])
 
     def test_documents_that_disagree_with_each_other_keep_the_old_rule(self):
         c = RefCase()
@@ -365,31 +392,11 @@ class TestOutvotedReference(unittest.TestCase):
     def test_a_third_unconfirmed_spelling_is_at_most_flag(self):
         c = RefCase()
         a = c.add("academic", [reading("DEMO SAMPLE")] * 2, "A")
-        b = c.add("family_cert", [reading("DEMO SAMPLE")] * 2, "B")
         x = c.add("academic", [reading("DEMO SAMPLZ")], "C")
         res = c.run(FakeConfirm("unclear"))
         self.assertEqual(verdicts(res, x.uid), [("names.mother", FLAG)])
-        self.assertEqual(verdicts(res, a.uid), [("names.mother", NOTE)])
-        self.assertEqual(verdicts(res, c.bc.uid), [("names.mother_reference", FLAG)])
+        self.assertEqual(verdicts(res, a.uid), [("names.mother", FAIL)])       # two pages agree: confirmed
         self.assertNotIn(PASS, [v for _, v in verdicts(res, x.uid)])
-
-    def test_the_dot_rule_runs_over_the_agreeing_documents(self):
-        c = RefCase(ref_mother="MST DEMO SAMPLX")
-        a = c.add("academic", [reading("MST. DEMO SAMPLE")] * 2, "A")
-        b = c.add("family_cert", [reading("MST DEMO SAMPLE")] * 2, "B")
-        res = c.run(FakeConfirm("confirmed"))
-        self.assertEqual(verdicts(res, c.bc.uid), [("names.mother_reference", FLAG)])
-        dots = [f for u in (a, b) for f in res.per_unit.get(u.uid, []) if f.rule == "names.mother_dots"]
-        self.assertTrue(dots)                                  # mixed dots across them: never a silent PASS
-        self.assertTrue(all(f.verdict in (FLAG, FAIL) for f in dots))
-
-    def test_independent_confirmation_helper(self):
-        c = RefCase()
-        ref = N._reference(c.ident(), "mother")
-        reads, _ = N.collect_reads(c.units, c.pages, {})
-        self.assertFalse(N.ref_independently_confirmed("mother", ref, c.ident(), reads, []))
-        mr = MachineRead(unit="D09", person="mother", name="SAMPLX DEMO", source="board QR", page=3)
-        self.assertTrue(N.ref_independently_confirmed("mother", ref, c.ident(), reads, [mr]))
 
 
 class TestBirthQrParents(unittest.TestCase):

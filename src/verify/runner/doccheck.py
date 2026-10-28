@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import importlib
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -52,6 +53,11 @@ DROP: Dict[str, List[str]] = {
              r"^carries a seal and signature", r"^no seal or signature of any kind found"],
     "trade_license": [r"^TIN and trade licence are both in the name of", r"^the TIN names '"],
 }
+# owner rule 28 Oct (rev 2.5): the bank OPENING-BALANCE rule is dropped (only the solvency balance counts). The bot's
+# opening_balance_check rows (any verdict) become one NOTE OPENING_BALANCE_NOTE.
+OPENING_BALANCE_ROWS: List[str] = [r"^no line is labelled as the opening balance", r"^the statement opens at ",
+                                   r"^opening balance .{0,24} BDT is within the expected range"]
+OPENING_BALANCE_NOTE = "opening balance not judged (owner rule 28 Oct)"
 # academic units whose board QR was read: the bot's page-level "no QR" rows (qr_check is skipped there too)
 DROP_BOARD_QR: List[str] = [r"^no QR code and nothing showing it is the online registration copy",
                             r"^a QR code is on the page but could not be read", r"^no QR code on this document"]
@@ -173,23 +179,28 @@ def bot_findings(rows: List[Tuple[str, str]], fn: str, unit: DocUnit, pages: Lis
     return [Finding(v, f"bot.{fn}", part_page_refs(m, unit, pages), f"bot:{fn}", pg) for v, m in rows]
 
 
-_PAGE_REF = re.compile(r"\b(pages?)\s+(\d+)(?:\s*([-–])\s*(\d+))?\b")
+# rev 2.5: a page word and EVERY number of the list after it: "page 2", "pages 2-3", "page 2, 3", "pages 2 and 3",
+# "page(s) 2, 5" (the bot's sideways NOTE), "pages 2, 3 and 5"
+_PAGE_N = r"\d{1,3}(?!\d|,\d{3})"           # a page number, never the head of an amount ("1,800,000")
+_PAGE_REF = re.compile(r"\b(pages?|page\(s\))\s+(" + _PAGE_N + r"(?:\s*(?:[-–]|,|\band\b|&)\s*" + _PAGE_N + r")*)")
+_PAGE_NUM = re.compile(r"\d+")
 
 
 def part_page_refs(message: str, unit: DocUnit, pages: Optional[Sequence[PageRead]]) -> str:
     """Folder mode, revision 2.3: a unit cut out of a file that holds several documents (DocUnit.part) is read by
     the bot as its own file, so a bot message's "page N" is the N-th page of the cut; it becomes the page inside the
-    input file, as every other folder message names it. Any other unit: the message unchanged."""
+    input file, as every other folder message names it. Revision 2.5: every number of a page list is mapped ("page
+    2, 3", "pages 2 and 3", "page(s) 2", "pages 2-3"), not only the first. Any other unit: the message unchanged."""
     if not getattr(unit, "part", "") or not pages or not message:
         return message
 
-    def one(k: str) -> str:
-        n = int(k)
-        return str(input_page(unit.pages[n - 1], pages)) if 0 < n <= len(unit.pages) else k
+    def one(m: "re.Match") -> str:
+        n = int(m.group(0))
+        return str(input_page(unit.pages[n - 1], pages)) if 0 < n <= len(unit.pages) else m.group(0)
 
     def rep(m: "re.Match") -> str:
-        word, a, dash, b = m.groups()
-        return f"{word} {one(a)}" + (f"{dash}{one(b)}" if b else "")
+        word, nums = m.groups()
+        return f"{word} {_PAGE_NUM.sub(one, nums)}"
 
     return _PAGE_REF.sub(rep, message)
 
@@ -471,6 +482,175 @@ def nid_number_rows(page_texts: List[str], unit: DocUnit, pages: Optional[List[P
     return [Finding(v, "nid.number", m, src, pg, dict(ev)) for v, m in dv.nid_number_agreement(per_page, every)]
 
 
+# --- NID back side (owner rule 28 Oct, rev 2.5) --------------------------------------------------------------
+# A smart NID's back carries a TD1 machine-readable zone (ICAO 9303 part 5): line 1 "I<BGD" + the document number
+# (9 characters + check digit; a 10-digit NID: 9 digits, "<", the 10th digit and the check digit in the optional
+# data), line 2 the date of birth + check, the sex, the expiry + check, line 3 the name. The number and the two
+# dates carry check digits, so a back that belongs to another person can be CONFIRMED: the owner's folder 9 mother
+# NID file held the father's card back (in the scan and in the translation). An old laminated card has no MRZ: only
+# reliable signals, else a NOTE.
+_MRZ_W = (7, 3, 1)
+_TD1_L1 = re.compile(r"[IK1L|][\s<]{0,3}[B8][G6C][D0O]\s*((?:[0-9]\s?){9})\s?([0-9<])\s?((?:[0-9]\s?){0,8})\s?(?=<)")
+_TD1_L2 = re.compile(r"(?<![0-9])((?:[0-9]\s?){6})([0-9])\s?([MF<])\s?((?:[0-9]\s?){6})([0-9])(?![0-9])")
+_TD1_NAME = re.compile(r"([A-Z]{2,}(?:<[A-Z]{2,})*)\s?<<\s?([A-Z]{2,}(?:\s?<\s?[A-Z]{2,})*)")
+ROLE_SEX = {"father": "M", "mother": "F"}
+NID_BACK_SRC = "runner:nid_back"
+
+
+def mrz_check_digit(s: str) -> int:
+    """ICAO 9303 check digit: digits as themselves, A-Z as 10-35, '<' as 0, weights 7-3-1."""
+    tot = 0
+    for k, ch in enumerate(s):
+        v = int(ch) if ch.isdigit() else (ord(ch) - 55 if "A" <= ch <= "Z" else 0)
+        tot += v * _MRZ_W[k % 3]
+    return tot % 10
+
+
+def _yymmdd(s: str, today=None) -> Optional["dt.date"]:
+    import datetime as _dt
+    try:
+        yy, mm, dd = int(s[:2]), int(s[2:4]), int(s[4:6])
+        now = (today or _dt.date.today()).year % 100
+        return _dt.date((1900 if yy > now else 2000) + yy, mm, dd)
+    except ValueError:
+        return None
+
+
+def td1_reads(text: str, today=None) -> List[Dict[str, Any]]:
+    """Every TD1 (smart NID back) machine-readable zone in one page's OCR text: {"number", "number_ok", "dob",
+    "dob_ok", "sex", "line2_ok", "name"} (a field None when unread). Line 1 and line 2 are found apart (OCR joins and
+    splits the lines); the date of birth counts only with its own check digit, the sex letter when at least one of the
+    two date check digits beside it agrees (rev 2.6; the line is anchored digit by digit, so the letter sits in place).
+    OCR's "K<BGD" / "I<860" / lower case are read as the printed "I<BGD"."""
+    t = (text or "").upper()
+    out: List[Dict[str, Any]] = []
+    nums = []
+    for m in _TD1_L1.finditer(t):
+        head, chk, ext = (re.sub(r"\s", "", g or "") for g in m.groups())
+        if chk == "<" and ext:                          # a long number: its last digits and check in the optional data
+            number, chk = head + ext[:-1], ext[-1]
+        else:
+            number = head
+        ok = chk.isdigit() and mrz_check_digit(number) == int(chk)
+        nums.append((number, ok))
+    lines2 = []
+    for m in _TD1_L2.finditer(t):
+        dob, c1, sex, exp, c2 = (re.sub(r"\s", "", g) for g in m.groups())
+        d_ok, e_ok = mrz_check_digit(dob) == int(c1), mrz_check_digit(exp) == int(c2)
+        # rev 2.6 (checker's rules probe): the sex letter sits between the two dated fields, which the pattern
+        # anchors digit by digit; ONE of their check digits agreeing shows a real line 2 with the letter in place
+        # (a misread date digit is a substitution, not a shift). The date of birth itself still needs its own check.
+        lines2.append({"dob": _yymmdd(dob, today) if d_ok else None, "dob_ok": d_ok, "exp_ok": e_ok,
+                       "sex": sex if ((d_ok or e_ok) and sex in "MF") else None, "line2_ok": d_ok and e_ok})
+    name = None
+    if nums or any(x["line2_ok"] for x in lines2):
+        nm = _TD1_NAME.search(t.replace(" <", "<").replace("< ", "<"))
+        if nm:
+            name = (nm.group(1) + " " + nm.group(2)).replace("<", " ")
+    good2 = [x for x in lines2 if x["line2_ok"]] or [x for x in lines2 if x["dob_ok"] or x["exp_ok"]]
+    for k in range(max(len(nums), 1 if good2 else 0)):
+        number, ok = nums[k] if k < len(nums) else (None, False)
+        l2 = good2[k] if k < len(good2) else (good2[0] if good2 else {})
+        out.append({"number": number if ok else None, "number_ok": ok, "number_read": number,
+                    "dob": l2.get("dob"), "dob_ok": bool(l2.get("dob_ok")), "sex": l2.get("sex"),
+                    "line2_ok": bool(l2.get("line2_ok")), "name": name})
+    return [r for r in out if r["number_ok"] or r["line2_ok"]]
+
+
+def _digits_apart(a: str, b: str) -> int:
+    if len(a) != len(b):
+        return max(len(a), len(b))
+    return sum(1 for x, y in zip(a, b) if x != y)
+
+
+def nid_back_rows(page_texts: List[str], unit: DocUnit, pages: Optional[List[PageRead]], ident: Optional[Identity],
+                  today=None) -> List[Finding]:
+    """nid.back_side (owner rule 28 Oct): does the card's back side (its MRZ, in the scan and/or the translation)
+    belong to the person on the front and to the file's role? Signals, each from an MRZ field whose check digit
+    agrees: the number (vs the front's number, read on the unit's pages: 3 digits or more apart, never an OCR slip),
+    the date of birth (vs the front's labelled date) and the sex (vs the role: father M, mother F; the student: the
+    passport's). Two signals or more that differ = CONFIRMED -> FAIL "the back side of this NID belongs to another
+    person"; one -> FLAG check by eye; compared and all equal -> PASS; no MRZ read (an old laminated card has none)
+    -> NOTE (never judged)."""
+    dv = _bot().dv
+    pg = unit_pages(unit, pages)
+    role = NID_KEYS.get(unit.key, "")
+    want_sex = ROLE_SEX.get(role) or ((getattr(ident, "sex", "") or "").upper()[:1] if role == "student" else "")
+    reads: List[Tuple[int, Dict[str, Any]]] = []
+    front_nums: Dict[str, List[int]] = {}
+    front_dobs: Dict[Any, List[int]] = {}
+    for k, t in enumerate(page_texts):
+        for r in td1_reads(t, today):
+            reads.append((k, r))
+        for n in dv.nid_numbers(t or ""):
+            front_nums.setdefault(n, []).append(k)
+        d = dv.labelled_dob(t or "")
+        if d:
+            front_dobs.setdefault(d, []).append(k)
+    if not reads:
+        return [Finding(NOTE, "nid.back_side", "the card's back side was not compared with its front (no machine-"
+                                               "readable zone read; an old laminated card has none)", NID_BACK_SRC, pg)]
+    mrz_nums = {r["number"] for _, r in reads if r["number"]}
+    fronts = {n: ks for n, ks in front_nums.items() if n not in mrz_nums}
+    signals: Dict[str, str] = {}
+    agree: List[str] = []
+    ev: Dict[str, Any] = {"role": role, "mrz_pages": sorted({input_page(unit.pages[k], pages) if k < len(unit.pages)
+                                                             else k + 1 for k, _ in reads}), "reads": len(reads)}
+    # the number
+    for _, r in reads:
+        n = r["number"]
+        if not n:
+            continue
+        same = [f for f in front_nums if f == n]
+        if same:
+            agree.append("number")
+            break
+        far = [f for f in fronts if len(f) == len(n) and _digits_apart(f, n) >= 3]
+        if far and len(far) == len([f for f in fronts if len(f) == len(n)]):
+            signals["number"] = f"the back's number {n} is not the front's {far[0]}"
+            break
+    # the date of birth
+    for _, r in reads:
+        d = r["dob"]
+        if not d or not front_dobs:
+            continue
+        if d in front_dobs:
+            agree.append("date of birth")
+        else:
+            f = sorted(front_dobs, key=lambda x: -len(front_dobs[x]))[0]
+            signals["dob"] = f"the back's date of birth {d.isoformat()} is not the front's {f.isoformat()}"
+        break
+    # the sex against the role
+    sexes = [r["sex"] for _, r in reads if r["sex"]]
+    if sexes and want_sex in ("M", "F"):
+        s = max(set(sexes), key=sexes.count)
+        if s != want_sex:
+            whose = {"father": "the father's", "mother": "the mother's", "student": "the student's"}.get(role, "this")
+            signals["sex"] = f"the back says sex {s} on {whose} card"
+        else:
+            agree.append("sex")
+    ev.update(signals=dict(signals), agree=list(dict.fromkeys(agree)),
+              mrz=[{"page": k, "number_ok": r["number_ok"], "line2_ok": r["line2_ok"]} for k, r in reads])
+    if "number" in agree and set(signals) == {"dob"}:
+        # the back's checked number IS the front's: one card. The front's date of birth (an OCR read, no check
+        # digit) read otherwise is a misread of the front, not another person's back
+        ev["dob_note"] = signals.pop("dob")
+        ev["signals"] = dict(signals)
+    if len(signals) >= 2:
+        both = len({k for k, _ in reads}) >= 2
+        return [Finding(FAIL, "nid.back_side", "the back side of this NID belongs to another person ("
+                        + "; ".join(signals.values()) + ")" + (" — in the scan and the translation" if both else ""),
+                        NID_BACK_SRC, pg, ev)]
+    if signals:
+        return [Finding(FLAG, "nid.back_side", "the back side of this NID may belong to another person ("
+                        + "; ".join(signals.values()) + ") — check by eye", NID_BACK_SRC, pg, ev)]
+    if agree:
+        return [Finding(PASS, "nid.back_side", "the back side (machine-readable zone) matches the front ("
+                        + ", ".join(dict.fromkeys(agree)) + ")", NID_BACK_SRC, pg, ev)]
+    return [Finding(NOTE, "nid.back_side", "the card's back side was read but could not be compared with its front "
+                                           "(nothing on the front to compare)", NID_BACK_SRC, pg, ev)]
+
+
 # --- board QR (A6 c) -----------------------------------------------------------------------------------------
 _QR_NAME_LABEL = re.compile(r"(?i)name\s*[:=]")
 _QR_NOT_STUDENT = re.compile(r"(?i)(father|mother|husband|guardian|parent)\W{0,4}s?\W{0,3}$")
@@ -595,6 +775,201 @@ def financial_kind_rows(rows: List[Tuple[str, str]], u: DocUnit, text: str, path
     return out
 
 
+# --- what the bot's "notarised" seal was (evidence only; owner question pending, rev 2.5) -------------------------
+NOTARISED_ROW = r"^notarised \(wording or seal found\)$"
+SEAL_RENDER_DPI = 150          # == page_checks.seal_present
+SEAL_MAX_PAGES = 4
+
+
+def seal_components(img_bgr) -> List[Dict[str, Any]]:
+    """The violet / red seal-coloured blobs page_checks.seal_present counts (its own masks and sizes), described:
+    the box as page fractions, the colour, the share of yellow / green around it and `emblem_like` (a round red
+    blob near the top centre with yellow / green around it: the government monogram printed on an NBR / Union
+    Parishad form, not a notary's stamp)."""
+    import cv2
+    import numpy as np
+    H, W = img_bgr.shape[:2]
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    violet = ((h > 115) & (h < 165) & (s > 60) & (v > 60)).astype("uint8")
+    red = ((s > 90) & (v > 70) & ((h < 10) | (h > 170))).astype("uint8")
+    # the monogram: a red disc holding a yellow map, in a green ring (yellow or green around the red)
+    green = ((h > 20) & (h < 90) & (s > 60) & (v > 50))
+    out: List[Dict[str, Any]] = []
+    for name, mask, need in (("violet", violet, 0.0008), ("red", red, 0.0015)):
+        m = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+        n, _, stats, _ = cv2.connectedComponentsWithStats(m, 8)
+        for i in range(1, n):
+            x, y, w, hh, area = (int(stats[i, k]) for k in range(5))
+            if area <= need * H * W:
+                continue
+            # the monogram's map and ring lie inside and AROUND its red disc: measured in the box grown by half its size
+            gx0, gy0 = max(0, int(x - w / 2)), max(0, int(y - hh / 2))
+            gx1, gy1 = min(W, int(x + w * 1.5)), min(H, int(y + hh * 1.5))
+            g = float(green[gy0:gy1, gx0:gx1].mean()) if gx1 > gx0 and gy1 > gy0 else 0.0
+            cx, cy = (x + w / 2) / W, (y + hh / 2) / H
+            round_ = 0.7 <= (w / max(hh, 1)) <= 1.4
+            out.append({"colour": name, "box": [round(x / W, 3), round(y / H, 3), round((x + w) / W, 3),
+                                                round((y + hh) / H, 3)],
+                        "area": round(area / (H * W), 4), "green_around": round(g, 3), "round": round_,
+                        "emblem_like": bool(name == "red" and cy < 0.30 and 0.30 <= cx <= 0.70 and round_
+                                            and g >= EMBLEM_GREEN)})
+    return out
+
+
+EMBLEM_GREEN = 0.01            # share of yellow / green pixels around a red disc: the government monogram
+# printed words that say the paper is a government office's own (its seal is the office's, not a notary's)
+OFFICE_SEAL_WORDS = re.compile(r"(?i)seal\s+of\s+(?:the\s+)?(?:tax\s+)?office|commissioner\s+of\s+taxes|"
+                               r"deputy\s+commissioner|tax\s+circle|seal\s+of\s+the\s+official|union\s+parishad|"
+                               r"chairman|upazila\s+nirbahi")
+
+
+def seal_evidence(text: str, path: Optional[Path], dv: Any, R: Any) -> Dict[str, Any]:
+    """Evidence for the bot's "notarised (wording or seal found)" row: which of the two proved it. The wording
+    (R.NOTARY_WORDS, the bot's fuzzy has_any), else the seal colour, with every seal-coloured blob described
+    (seal_components) and `emblem_like_only` = every blob looks like the government emblem (the owner question: is
+    a government emblem / tax-office seal a notarisation?). Never changes the verdict."""
+    ev: Dict[str, Any] = {"wording": bool(dv.has_any(text or "", R.NOTARY_WORDS))}
+    if ev["wording"] or path is None:
+        ev["how"] = "wording" if ev["wording"] else "none"
+        return ev
+    import cv2
+    import numpy as np
+    blobs: List[Dict[str, Any]] = []
+    try:
+        p = Path(path)
+        if p.suffix.lower() in (".jpg", ".jpeg", ".png"):
+            img = cv2.imdecode(np.fromfile(str(p), dtype=np.uint8), cv2.IMREAD_COLOR)
+            imgs = [img] if img is not None else []
+        else:
+            import pymupdf
+            imgs = []
+            with pymupdf.open(str(p)) as doc:
+                for k, pg in enumerate(doc):
+                    if k >= SEAL_MAX_PAGES:
+                        break
+                    pix = pg.get_pixmap(dpi=SEAL_RENDER_DPI)
+                    a = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+                    imgs.append(cv2.cvtColor(a[:, :, :3], cv2.COLOR_RGB2BGR))
+        for k, img in enumerate(imgs):
+            for b in seal_components(img):
+                blobs.append(dict(b, page=k + 1))
+    except _faults():
+        raise
+    except Exception as e:                       # evidence only: never a crash
+        ev["error"] = type(e).__name__
+    ev["how"] = "seal colour" if blobs else "none"
+    ev["seals"] = blobs[:12]
+    ev["emblem_like"] = sum(1 for b in blobs if b["emblem_like"])
+    ev["emblem_like_only"] = bool(blobs) and all(b["emblem_like"] for b in blobs)
+    words = OFFICE_SEAL_WORDS.search(text or "")
+    ev["office_paper"] = bool(words)
+    if words:
+        ev["office_words"] = words.group(0)
+    if blobs and (ev["emblem_like_only"] or words):
+        what = []
+        if ev["emblem_like"]:
+            what.append("the government emblem printed at the top of the form")
+        if words and not ev["emblem_like_only"]:
+            what.append(f"the issuing office's own seal (the paper prints \"{words.group(0)}\")")
+        ev["note"] = ("no notary wording; the seal colour found looks like " + " and ".join(what) + ", not a notary's "
+                      "stamp — owner question pending (is that a notarisation?); the verdict is the bot's")
+    return ev
+
+
+def with_seal_evidence(fs: List[Finding], text: str, path: Optional[Path], dv: Any, R: Any) -> List[Finding]:
+    """The bot's "notarised (wording or seal found)" PASS gets seal_evidence() in its evidence (run.json); the
+    verdict and the message stay the bot's."""
+    out = []
+    for f in fs:
+        if f.verdict == PASS and re.search(NOTARISED_ROW, f.message or ""):
+            f = Finding(f.verdict, f.rule, f.message, f.source, f.pages,
+                        dict(f.evidence or {}, notarised=seal_evidence(text, path, dv, R)))
+        out.append(f)
+    return out
+
+
+# --- a QR the bot's page check did not find (rev 2.5) -----------------------------------------------------------
+QR_NONE_ROWS = [r"^no QR code on this document", r"^a QR code is on the page but could not be read",
+                r"^no QR code and nothing showing it is the online registration copy"]
+QR_LADDER_PAGES = 20
+# the documents an issuing office prints with a verification QR (Union Parishad / City Corporation trade licences and
+# family certificates): only their "no QR" rows get the (slow, ~25 s a page) closer look
+QR_LADDER_FINES = frozenset({"trade_license", "family_cert"})
+QR_LADDER_NONE = " (a QR-like block on {where} was looked at closely with the crop/threshold QR ladder; nothing decoded)"
+
+
+def qr_ladder_rows(prs: List[Finding], unit: DocUnit, pages: Optional[List[PageRead]]) -> List[Finding]:
+    """Rev 2.5: before the runner reports that a document has no QR (or an unreadable one), the crop/threshold QR
+    ladder (tin.read_qr, deep) looks again: a degraded licence QR (owner folder 3) that it decodes turns the bot's row
+    into PASS "QR code read on page N (closer look: ...)". Nothing decoded: the bot's row stays."""
+    hits = [f for f in prs if f.rule == "page.qr" and any(re.search(p, f.message) for p in QR_NONE_ROWS)]
+    if not hits or unit.path is None or (unit.fine or unit.key) not in QR_LADDER_FINES:
+        return prs
+    tin = _runner_mod("tin")
+    PC = _bot().PC
+    found, looked = [], []
+    t0 = time.perf_counter()
+    try:
+        for k in range(min(len(unit.pages) or 1, QR_LADDER_PAGES)):
+            img = tin.render_page(Path(unit.path), k, 250)
+            if img is None:
+                continue
+            # only a page that shows a QR-like square (finder patterns or a QR-textured block) is looked at closely;
+            # the deep stages (400 dpi, more thresholds: 25-45 s a page) only where QR finder patterns are seen (a
+            # textured block alone is often a seal or a photo, owner folders 3 and 9: the deep stages never decoded one)
+            finders = tin._finder_boxes(img)
+            if not (finders or tin._blob_boxes(img)):
+                continue
+            looked.append(k)
+            r = tin.read_page(Path(unit.path), k, img, deep=bool(finders))
+            codes = [str(c) for c in (r.get("codes") or []) if c]
+            if codes and _meaningful(codes, tin):
+                found.append((k, codes, str(r.get("stage") or "")))
+                break
+    except _faults():
+        raise
+    except Exception:
+        return prs
+    secs = round(time.perf_counter() - t0, 1)
+
+    def page_of(k: int) -> int:
+        run = unit.pages[k] if 0 <= k < len(unit.pages) else None
+        return input_page(run, pages) if run is not None else k + 1
+
+    if not found:
+        # nothing decoded: the bot's row (and verdict) stays. When a QR-like block was looked at, the message says so
+        # (a blurred QR the ladder cannot decode either, owner folder 3 p5: whether that FLAGs is an owner question);
+        # when no page shows a QR-like block, the row is the bot's, word for word
+        if not looked:
+            return [Finding(f.verdict, f.rule, f.message, f.source, f.pages,
+                            dict(f.evidence or {}, qr_ladder="no QR-like block on any page", qr_ladder_s=secs))
+                    if any(f is h for h in hits) else f for f in prs]
+        where = ("page " if len(looked) == 1 else "pages ") + ", ".join(str(page_of(k)) for k in looked)
+        tail = QR_LADDER_NONE.format(where=where)
+        return [Finding(f.verdict, f.rule, f.message + tail, f.source, f.pages,
+                        dict(f.evidence or {}, qr_ladder="tried, nothing decoded", qr_ladder_pages=[page_of(k)
+                                                                                                for k in looked],
+                             qr_ladder_s=secs))
+                if any(f is h for h in hits) else f for f in prs]
+    k, codes, stage = found[0]
+    run = unit.pages[k] if 0 <= k < len(unit.pages) else None
+    n = input_page(run, pages) if run is not None else k + 1
+    new = Finding(PASS, "page.qr", f"QR code read on page {n} with a closer look (crop/threshold ladder): "
+                                   + ", ".join(c[:48] for c in codes[:2]), "runner:qr_ladder", (n,),
+                  {"stage": stage, "bot": [f.message for f in hits], "apostille": any(_is_apostille(c, PC)
+                                                                                    for c in codes)})
+    out, done = [], False
+    for f in prs:
+        if any(f is h for h in hits):
+            if not done:
+                out.append(new)
+                done = True
+            continue
+        out.append(f)
+    return out
+
+
 def holds_tin_pages(unit: DocUnit) -> bool:
     return unit.fine == "tin_certificate" or any(len(s) > 2 and s[2] == "tin_certificate" for s in unit.sub)
 
@@ -626,20 +1001,117 @@ _PP_LABEL = re.compile(r"(?i)passport\s*(?:no|number|num)\b\.?")
 _PP_NUMBER = re.compile(r"(?<![A-Z0-9])([A-Z]{1,2}\d{7,8})(?![A-Z0-9])")
 
 
-def dob_rows(text: str, ident: Identity, unit: DocUnit, pages: Optional[List[PageRead]] = None) -> List[Finding]:
+def closer_look(eng: Any, page: PageRead, candidates: Sequence[str], kind: str, box=None) -> Optional[Any]:
+    """closer.look() (Agent A's closer look, CPU ONNX engine) at a high-resolution render of one run page:
+    candidates[0] is the reference. None when the closer look is not available (no closer module, no engine, a page
+    that will not render): the caller then keeps its FLAG (a false PASS is worse than a FLAG)."""
+    if eng is None or page is None or len([c for c in candidates if c]) < 2:
+        return None
+    try:
+        closer = _runner_mod("closer")
+    except ImportError:
+        return None
+    try:
+        img = closer.page_image(eng, page)
+        if img is None:
+            return None
+        return closer.look(img, box, list(candidates), kind=kind)
+    except _faults():
+        raise
+    except Exception:                                # a page that will not render: no closer look
+        return None
+
+
+_DATE_RAW = re.compile(r"\d{1,2}\s*[./-]\s*\d{1,2}\s*[./-]\s*\d{4}|\d{4}\s*[./-]\s*\d{1,2}\s*[./-]\s*\d{1,2}|"
+                       r"\d{1,2}\s*(?:st|nd|rd|th)?[ ,.-]*[A-Za-z]{3,9}[ ,.-]+\d{4}")
+
+
+def raw_date(text: str, d: Any) -> str:
+    """The date as printed in `text` that dv.find_dates reads as d (the first one after a birth label first), or
+    ""."""
+    dv = _bot().dv
+    t = text or ""
+    lab = re.search(r"(?i)birth|dob", t)
+    order = list(_DATE_RAW.finditer(t, lab.start())) if lab else []
+    order += [m for m in _DATE_RAW.finditer(t) if m not in order]
+    for m in order:
+        if d in dv.find_dates(m.group(0)):
+            return m.group(0)
+    return ""
+
+
+def as_printed(raw: str, d: Any, ref: Any) -> str:
+    """`raw` (a printed form of date d) rewritten to say date `ref` in the same layout (zero padding, separators and
+    the month word kept): the reference spelling the closer look compares the print with."""
+    if not raw:
+        return ""
+    months = ["", "January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
+              "November", "December"]
+    nums = re.findall(r"\d+", raw)
+    word = re.search(r"[A-Za-z]{3,9}", raw)
+    if word:                                         # "01 January 2000" -> day and year numbers, the month word
+        day_s, year_s = nums[0], nums[-1]
+        mw = word.group(0)
+        new_m = months[ref.month][:len(mw)] if len(mw) <= 3 else months[ref.month]
+        new_m = new_m.upper() if mw.isupper() else new_m
+        out = raw.replace(mw, new_m, 1)
+        out = re.sub(r"^\s*" + re.escape(day_s), str(ref.day).zfill(len(day_s)), out, count=1)
+        return out[: len(out) - len(year_s)] + str(ref.year) if out.endswith(year_s) else out
+    if len(nums) != 3:
+        return ""
+    if len(nums[0]) == 4:
+        want = [ref.year, ref.month, ref.day]
+    elif int(nums[0]) == d.month and int(nums[1]) == d.day and d.day != d.month:
+        want = [ref.month, ref.day, ref.year]
+    else:
+        want = [ref.day, ref.month, ref.year]
+    it = iter(want)
+    return re.sub(r"\d+", lambda m: str(next(it)).zfill(len(m.group(0))), raw)
+
+
+def dob_rows(text: str, ident: Identity, unit: DocUnit, pages: Optional[List[PageRead]] = None,
+             eng: Any = None) -> List[Finding]:
     """doc.dob_consistency: the labelled date of birth on the student NID or the SSC certificate against the
-    passport's TRUSTED date. PASS / FLAG, never FAIL; nothing when either is unread."""
+    passport's TRUSTED date. PASS / FLAG, never FAIL; nothing when either is unread. Rev 2.5 (owner, 28 Oct: a date
+    that reads differently is looked at again before any verdict): the run's own page reads count with the bot's
+    read; when a read differs from the passport's date the closer look compares the print with the two spellings
+    (closer.look kind "digits") — it supports the passport's date: PASS; otherwise FLAG check by eye."""
     if not (ident.dob and ident.dob_trusted):
         return []
-    d = _bot().dv.labelled_dob(text or "")
-    if not d:
+    dv = _bot().dv
+    reads: List[Tuple[Any, Optional[int], str]] = []          # (date, run page or None for the bot's read, its text)
+    for i in (unit.pages if pages else []):
+        if 0 <= i < len(pages):
+            dd = dv.labelled_dob(pages[i].text or "")
+            if dd:
+                reads.append((dd, i, pages[i].text or ""))
+    d0 = dv.labelled_dob(text or "")
+    if d0:
+        reads.append((d0, None, text or ""))
+    if not reads:
         return []
     pg = unit_pages(unit, pages)
-    if d == ident.dob:
-        return [Finding(PASS, "doc.dob_consistency", f"date of birth {d} on the {unit.title or unit.key} is the "
-                                                     f"passport's ({ident.dob_source or 'MRZ'})", SRC, pg)]
-    return [Finding(FLAG, "doc.dob_consistency", f"the {unit.title or unit.key} gives date of birth {d}, the passport "
-                                                 f"{ident.dob} ({ident.dob_source or 'MRZ'}) — check by eye", SRC, pg)]
+    title = unit.title or unit.key
+    src = ident.dob_source or "MRZ"
+    if all(dd == ident.dob for dd, _, _ in reads):
+        return [Finding(PASS, "doc.dob_consistency", f"date of birth {ident.dob} on the {title} is the passport's "
+                                                     f"({src})", SRC, pg)]
+    d, run, raw_text = next((x for x in reads if x[0] != ident.dob))
+    look_page = run if run is not None else next((i for _, i, _ in reads if i is not None), None)
+    if look_page is None and pages and unit.pages:
+        look_page = unit.pages[0]
+    raw = raw_date(raw_text, d)
+    ref_raw = as_printed(raw, d, ident.dob)
+    ev: Dict[str, Any] = {"reads": [[x.isoformat(), i] for x, i, _ in reads], "variant": d.isoformat()}
+    look = closer_look(eng, pages[look_page] if (pages and look_page is not None) else None, [ref_raw, raw], "digits")
+    if look is not None:
+        ev["closer"] = {"decision": look.decision, "margin": round(float(look.margin), 3), "note": look.note}
+        if look.decision == "same":
+            return [Finding(PASS, "doc.dob_consistency", f"date of birth {ident.dob} on the {title} is the passport's "
+                                                         f"({src}; one read gave {d}, a closer look at the print "
+                                                         f"reads {ident.dob})", SRC, pg, ev)]
+    return [Finding(FLAG, "doc.dob_consistency", f"the {title} gives date of birth {d}, the passport {ident.dob} "
+                                                 f"({src}) — check by eye", SRC, pg, ev)]
 
 
 def passport_no_rows(text: str, ident: Identity, unit: DocUnit,
@@ -715,9 +1187,55 @@ def language_rows(unit: DocUnit, pages: List[PageRead], eng: Any, ident: Identit
 
 
 # --- the loop ------------------------------------------------------------------------------------------------
+# the bot's (page_checks.academic_check) mixed-level FLAG: its level reader takes "Alim" anywhere on the page for HSC,
+# so a Dakhil (SSC) transcript of an "... Alim Madrasah" reads as HSC (owner folder 9)
+MIXED_LEVELS = r"^the pages after the e-Apostille on page (\d+) are not all for one qualification \((.*?)\) — "
+_LEVEL_DETAIL = re.compile(r"page (\d+): ([A-Z]+)")
+
+
+def level_override(m: str, unit: DocUnit, pages: Optional[List[PageRead]]) -> Optional[Finding]:
+    """Rev 2.5: the bot's "not all for one qualification (page 5: SSC, page 6: HSC)" FLAG, re-judged by the runner's
+    level reader (pagetype.level_of: the EXAMINATION a page names decides between HSC and SSC — Dakhil = SSC, Alim =
+    HSC — never a word of the institution's name). When the runner reads ONE level on every page the bot named, the
+    row becomes PASS "... followed by <LEVEL> certificate/transcript"; otherwise None (the bot's FLAG stays). The page
+    numbers are the bot's (pages of the file it read: the unit)."""
+    hit = re.search(MIXED_LEVELS, m)
+    if not hit or not pages:
+        return None
+    PT = _runner_mod("pagetype")
+    named = [(int(k), lv) for k, lv in _LEVEL_DETAIL.findall(hit.group(2))]
+    if not named:
+        return None
+    ours: Dict[int, str] = {}
+    for k, _ in named:
+        if not (0 < k <= len(unit.pages)):
+            return None
+        lv = PT.level_of(pages[unit.pages[k - 1]].text or "")
+        if lv is None:
+            return None
+        ours[k] = lv[0]
+    if len(set(ours.values())) != 1:
+        return None
+    lv = next(iter(ours.values()))
+    if unit.level and unit.level.upper() != lv.upper():
+        return None
+    where = ", ".join(str(k) for k, _ in named)
+    msg = (f"e-Apostille on page {hit.group(1)} is followed by {lv} certificate/transcript (page {where}) — the level "
+           "is read from the examination each page names (Dakhil = SSC, Alim = HSC), not from an institution's name")
+    return Finding(PASS, "academic.level", part_page_refs(msg, unit, pages), SRC, unit_pages(unit, pages),
+                   {"bot": m, "bot_levels": {str(k): v for k, v in named}, "runner_levels": {str(k): v for k, v in
+                                                                                         ours.items()}})
+
+
 def _academic_rows(rows: List[Tuple[str, str]], unit: DocUnit, pages: List[PageRead], mode: str) -> List[Finding]:
     keep, order = [], []
+    lifted: List[Finding] = []
     for v, m in rows:
+        if v == FLAG:
+            alt = level_override(m, unit, pages)
+            if alt is not None:
+                lifted.append(alt)
+                continue
         hit = re.search(APOSTILLE_PAGE1, m)
         if mode == "bundle" and hit:
             k = int(hit.group(1))
@@ -728,7 +1246,7 @@ def _academic_rows(rows: List[Tuple[str, str]], unit: DocUnit, pages: List[PageR
                                  "that level's pages", SRC, (n,)))
             continue
         keep.append((v, m))
-    return bot_findings(keep, "check_academic", unit, pages) + order
+    return bot_findings(keep, "check_academic", unit, pages) + lifted + order
 
 
 def _error(rule: str, message: str, unit: DocUnit, pages: List[PageRead]) -> Finding:
@@ -803,8 +1321,9 @@ def check_documents(units: List[DocUnit], pages: List[PageRead], rec: DerivedRec
             rows = _rewrite(_drop(rows, DROP[key]), REWRITE.get(key))
             fs += bot_findings(rows, "check_nid", u, pages)
             fs += nid_number_rows([pages[i].text for i in u.pages], u, pages)
+            fs += nid_back_rows([pages[i].text for i in u.pages], u, pages, ident, today)     # rev 2.5
             if key == "student_nid":
-                fs += dob_rows(text, ident, u, pages)
+                fs += dob_rows(text, ident, u, pages, eng)
         elif key in DEATH_KEYS:
             parent = DEATH_KEYS[key]
             if not parent:
@@ -841,9 +1360,9 @@ def check_documents(units: List[DocUnit], pages: List[PageRead], rec: DerivedRec
             machine.extend(mr)
             board_read = skip_qr = bool(qf)
             if (u.level or "").upper() == "SSC":
-                fs += dob_rows(text, ident, u, pages)
+                fs += dob_rows(text, ident, u, pages, eng)
         elif key == "bank":
-            rows = _drop(dv.check_bank(text, view, sizes, program, path, texts), DROP["bank"])
+            rows = opening_balance_dropped(_drop(dv.check_bank(text, view, sizes, program, path, texts), DROP["bank"]))
             _assert_no_holder_rows(rows)
             fs += bot_findings(rows, "check_bank", u, pages)
             fs += passport_no_rows(text, ident, u, pages)
@@ -854,7 +1373,8 @@ def check_documents(units: List[DocUnit], pages: List[PageRead], rec: DerivedRec
             fs += bot_findings(rows, "check_financial", u, pages)
             skip_qr = holds_tin_pages(u)
         elif key == "income_tax":
-            fs += bot_findings(dv.check_income_tax(text, view, sizes, program, path), "check_income_tax", u, pages)
+            fs += with_seal_evidence(bot_findings(dv.check_income_tax(text, view, sizes, program, path),
+                                                  "check_income_tax", u, pages), text, path, dv, B.R)   # rev 2.5
         elif key == "language_cert":
             fs += language_rows(u, pages, eng, ident, program, today, aff, person_reads)
         elif key == "affidavit":
@@ -871,6 +1391,8 @@ def check_documents(units: List[DocUnit], pages: List[PageRead], rec: DerivedRec
                 prs = [_error("page.checks", f"could not check the pages ({_why(e, path)})", u, pages)]
             if board_read:
                 prs = [f for f in prs if not any(re.search(p, f.message) for p in DROP_BOARD_QR)]
+            if not skip_qr:                          # rev 2.5: the QR ladder before "no QR" (issuing-office papers)
+                prs = qr_ladder_rows(prs, u, pages)
             fs += prs
         return fs
 
@@ -893,6 +1415,22 @@ def check_documents(units: List[DocUnit], pages: List[PageRead], rec: DerivedRec
             if u.key == "income_tax":
                 _income_tax_info(per_unit[u.uid], u, pages, program)
     return DocChecks(per_unit=per_unit, machine=machine, bundle=bundle, person_reads=person_reads)
+
+
+def opening_balance_dropped(rows: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    """Owner rule 28 Oct: the opening-balance rule is dropped. Every row of the bot's opening_balance_check (PASS,
+    NOTE or FLAG) is removed; when there was one, a single NOTE OPENING_BALANCE_NOTE takes its place (never a FLAG
+    or FAIL)."""
+    out: List[Tuple[str, str]] = []
+    noted = False
+    for v, m in rows:
+        if any(re.search(p, m) for p in OPENING_BALANCE_ROWS):
+            if not noted:
+                out.append((NOTE, OPENING_BALANCE_NOTE))
+                noted = True
+            continue
+        out.append((v, m))
+    return out
 
 
 def _assert_no_holder_rows(rows: List[Tuple[str, str]]) -> None:

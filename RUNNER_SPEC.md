@@ -1,6 +1,6 @@
 # RUNNER_SPEC — test runner for the owner's desktop document checker (prototype)
 
-Status: design, revision 2.4, 28 Oct 2026. Branch `prototype/page-types`, worktree `C:\Hangeul\JARVIS\prototype\page-types`.
+Status: design, revision 2.6, 28 Oct 2026. Branch `prototype/page-types`, worktree `C:\Hangeul\JARVIS\prototype\page-types`.
 Not committed. This file holds no personal data. Every example name, number or date in it is a placeholder.
 
 The runner is a prototype, not the app. It takes either one bundle PDF or one folder of bot-named files,
@@ -215,6 +215,311 @@ Every line of the re-run was compared with the page images by eye. Versions: `RU
   rows unchanged (`fiscal_year_check`, the business start date, the notarisation) — `doccheck.financial_kind_rows`.
 - **Checks.** `tests/test_fixes24.py` (made-up data); `test_fixes23.TestCutParts` now asserts no priming.
 
+### Revision 2.5, part A (28 Oct, the owner's closer-look and board-paper rules) — changelog
+
+Owner, 28 Oct: "make sure if the reader misreads one letter of a name before giving verdict it will take a closer look
+and give correct verdict ... industry standard"; "board papers md. is fine, no fail for that". These override section 7
+where they differ.
+
+- **`closer.py` (new): the closer look, a verification of KNOWN values.** `look(image, box, candidates, kind)` ->
+  `Look(decision, best, scores, margin, variants, agree, dot, note, detail)`; `page_image(engine, page, dpi=400)` (a
+  vector page at 400 dpi, a scan at its own resolution, a JPG as it is); `MARGIN` (0.12 nats per reference character;
+  `MIN_SCORE` -1.6, `MOST` 0.6, `DISSENT` 0.1). The text is found by the CRAFT detector's line boxes and a keyword
+  score of every candidate (the boxes beside it on its line join it; a wrapped table cell is also tried as its two
+  lines side by side). Views: four vertical margins x five channels (grey, darkest channel, R, G, B) plus contrast
+  stretch, Otsu and adaptive binarisation, sharpening, thicker and thinner strokes and two skews; small lines are
+  enlarged 2-3x (Lanczos); printed rules (an underline turns a 3 into a 2) are painted out. On every view the
+  english_g2 recogniser (the engine's CPU ONNX session, never DirectML) gives per-frame softmaxes and the CTC forward
+  log-likelihood of EACH candidate is computed (case-blind letters; a space or a label's colon free; '.' its own
+  class for kind "dots"; '<' a separator), over the candidates' own region of the line (a label before or a field
+  after is not counted; a word one candidate adds is). "same" / "differs" only when the winner leads by >= MARGIN
+  on average AND in >= 60% of the views, with <= 10% of the views backing another candidate by the margin;
+  else "unclear". Two independent experts besides: the letter-shape check (a small letter's height against the
+  word's own ascender and x lines: t / l, i / l, n / h ...; owner folder 3's birth certificate read "t" as "l" in
+  every view) and, for dots, a geometric dot detector (a small solid blob on the baseline between the letters). A
+  single candidate is verified against the recogniser's own reading of its place.
+- **Names (`names.py`).** The Confirmer takes closer looks when the engine carries the recogniser (`Confirmer.look`,
+  `.pair`, logged in `names_rereads` with the crop `work/look_pNN_k.png`); a plain test confirmer keeps the legacy
+  re-read rule. Before a difference becomes a finding BOTH sides are looked at: the variant's page ("same": a misread,
+  no finding, the log's effect "misread corrected by closer look") and the reference's own page. FAIL = the variant
+  supported on its page (or two pages / a machine read agreeing, the look not "same") AND the reference supported
+  (its look "same"; when unclear, a machine read or another document printing it) AND no affidavit; else FLAG. **The
+  revision 2.3 outvote is removed** (`_outvoted`, `ref_independently_confirmed`): other documents never decide a
+  spelling. `identity.verify_references` (finish_identity): when other documents print another spelling of a parent,
+  the closer look on the birth certificate's own page decides; "differs" corrects the reference (NOTE
+  `identity.reference_corrected`). The birth certificate's tail ("reads on with NOR") is looked at: "same" drops it
+  (NOTE `identity.tail_not_printed`), "differs" takes it, "unclear" keeps the FLAG.
+- **Dots.** When the reads disagree on a dot, each document's dots (and the passport's) come from a closer look of
+  kind "dots"; an unclear look leaves the OCR dots unconfirmed (FLAG at most). **Board papers** (an academic unit of
+  level SSC / HSC, a title naming SSC / HSC / JSC / JDC / Dakhil / Alim, or a page printing an education board's
+  examination with no university word: `names.board_paper`) are left out of the dot rule; their letters stay
+  strict; a NOTE "board papers' dots not judged (owner rule 28 Oct)" where their dots differ.
+- **Family table.** A wrapped name cell's second line is kept apart (`Read.wrap`) and taken in only on name-like
+  evidence (`names._wrap_choice`: the read with it IS the reference, or the read is the reference minus its last
+  word(s) and the second line is within OCR distance of them); an address word under a one-word name is never taken.
+- **Identity / language.** MRZ line 1 with a noisy read (not well formed, or letters other than the printed name's):
+  the printed name in MRZ order is verified on the passport page with the closer look ("same": it becomes the MRZ
+  name, well formed; the printed name stays the dot reference). A language certificate's name is compared with the
+  passport's PRINTED name when MRZ line 1 is not usable (never "passport name not available" when it is known); a
+  word that reads differently gets the closer look on the certificate's page and the passport's
+  (`passport_for_language()["closer"]`).
+- **Closer look, second pass (Agent A2, 28 Oct; measured on Agent C's real set, 130 cases from the four owner cases
+  and the corpus).** The first version gave 3 false "differs" on misreads (a wrapped family-table cell read from its
+  first line only, twice; a bold italic certificate whose a / t the recogniser reads as u / l in every view) and left
+  the q of a name out of the crop. Changes:
+  - **Every difference must hold by itself** (`closer.segments`, `differences_hold`, `SEG_MIN` 2.0 nats): the places
+    where the winning spelling differs from another candidate are found by a minimal edit alignment; for each place
+    the winner is scored against itself with that ONE place taken from the other candidate. "same" / "differs" need
+    every place to favour the winner by >= SEG_MIN (mean over the views). A spelling that wins on the sum while one of
+    its places reads the other way is not what the print shows (a third spelling, or a misread the recogniser shares):
+    "unclear". This is what keeps a real one-letter difference from "same" when the OCR variant also adds an
+    unprinted word, and a shared italic misread from "differs".
+  - **Added words must read as print** (`added_reads`, `ADDED_MIN` -1.6 per letter): letters the winner has where the
+    other spelling has none (an MST, a tail "NOR") must read as those letters by themselves; artwork, a stamp or a
+    Bangla line scores below it: "unclear".
+  - **A wrapped line** (`line_under`: the ink line right under the box, no table border between) is tried as the
+    line's continuation in box mode too. When the line alone and the line with the one under it support different
+    spellings, "unclear" (a wrapped cell or the next row: the look cannot tell); the two-line reading decides only
+    when the line alone reads as no candidate or both agree.
+  - **Descenders** stay in the crop (`tighten` grows the ink band over its thin rows: a q cut at the baseline reads a
+    or c).
+  - **Near-unanimous views** (`MOST` 0.6 -> 0.85): a decision needs >= 85% of the views to back the winner by the
+    margin. Folder 3's SSC prints the mother's name in bold italic on a guilloche background; 19 of 28 views read one
+    letter fewer, which gave a false "differs" (a false FAIL in the end-to-end run). Views that split like this mean
+    the print is ambiguous to the recogniser: "unclear" (FLAG), never a verdict.
+  - **Dots**: the dot's shape (a solid blob on the baseline between the letters) decides when the recogniser's lead
+    is below `DOTS_ALONE` (it drops printed dots, most of all a dot glued to the next word, "MD.NAME"); without a
+    measured shape the recogniser alone may confirm a dot (lead >= DOTS_ALONE) but never "no dot". `Look.dot` is
+    given only with a decision. A dot-only place is judged by these rules, not by SEG_MIN.
+  - **Measured** (box mode, `selftest/closer_eval` cases): real set 130 cases (75 the reference printed, 55 a real or
+    constructed difference): 0 false "same", 0 false "differs", 21 unclear (16%: script-font degree certificates,
+    bold italic board papers, the two wrapped family-table cells, 4 dots on HSC / SSC / CV pages), Look.dot 18 right,
+    0 wrong. Before this pass: 0 / 3 / 29. Synthetic sample of 400 (made-up names, 19 Windows fonts, nine
+    degradations): 371 right, 1 false "same" and 1 false "differs", both a LETTER inside a digit string (O for 0 in
+    the print; I for 1 in the reference: the recogniser's digit context reads the digit; no government number prints
+    letters among its digits), 27 unclear (6.8%, mostly Edwardian Script and bold serif dots), Look.dot 66 right, 0
+    wrong. About 2-3 s a look on the CPU. End to end, owner folder 3: the old closer's TIN "differs" and the SSC
+    mother's false FAIL are gone; NAMES is FLAG on two bold italic / script board-paper lines that split the views.
+  - **Limits.** One recogniser: a print it misreads in nearly every view cannot be verified by it; such looks come out
+    "unclear" (FLAG), never a verdict. The built-in Windows OCR (Windows.Media.Ocr, en-US, present on this PC, no
+    download) was tried on five such crops as a possible second judge and misread them too; a better second engine
+    would need the owner's decision.
+- **Names, second pass.** Every page (up to 3, `names.LOOK_PAGES`) of a document that reads the variant is looked at:
+  "differs" on any page -> the document prints it; "same" on every page -> a misread (no finding); else "unclear".
+  Two pages agreeing confirm the variant only when no look on them says "same". The reference's own page showing the
+  variant -> FLAG ("the passport's own read may be the misread"), never FAIL. A "not compared" read (a misparsed
+  label) first gets a closer look for the reference itself on its page: printed clearly -> no finding. The language
+  look is taken on the language certificate's own pages (`identity._language_closer`; the certificate's name comes
+  from a separate row read, so its page is not found by text alone).
+
+### Revision 2.5, part B (28 Oct, documents: the owner's new rules and the by-eye check of the four cases) — changelog
+
+These override sections 5.8-5.9 where they differ.
+
+- **NID back side (owner rule 28 Oct; `doccheck.nid_back_rows`, rule `nid.back_side`).** A smart NID's back carries a
+  TD1 machine-readable zone (ICAO 9303): line 1 `I<BGD` + the number (9 digits, `<`, the 10th digit and its check digit
+  in the optional data), line 2 the date of birth + check, the sex, the expiry + check, line 3 the name. `td1_reads`
+  finds every MRZ in each page's text (the scan and the translation) and keeps a field only when its check digit agrees
+  (line 2's sex only when both its date checks agree). Signals against the front and the file's role: the number (3+
+  digits off the front's number read on the unit's pages: never an OCR slip), the date of birth (against the front's
+  labelled date) and the sex (against the role: father M, mother F, the student the passport's). Two signals or more =
+  confirmed: FAIL "the back side of this NID belongs to another person (...)" (+ "in the scan and the translation" when
+  both carry it); one: FLAG check by eye; the back's checked number equal to the front's = one card (a front date read
+  otherwise is an OCR misread: PASS, `dob_note` in the evidence); no MRZ (an old laminated card): NOTE, never judged.
+- **Opening balance dropped (owner rule 28 Oct).** Every row of the bot's `opening_balance_check` (PASS / NOTE / FLAG)
+  leaves the bank unit; one NOTE "opening balance not judged (owner rule 28 Oct)" takes its place
+  (`doccheck.opening_balance_dropped`). The runner has no opening-balance rule of its own.
+- **`bank.seal`: handwritten signatures and round stamps.** Besides the stamp colour (`PC.seal_present` on the one-page
+  cut) and the wording, the solvency page image (150 dpi) is searched (`bank.ink_marks`): long rules and underlines
+  are taken out, pen strokes crossing the removed signature line are mended; a joined ink blob below the letterhead is
+  a signature when it is 1.9+ printed-word heights tall and 2.5+ wide with a fill of 0.03-0.26 AND its longest single
+  pen stroke is 1.4+ word heights tall, 2.5+ wide, with its own fill at most 0.27 (printed words and name stamps: at
+  most ~1.5 tall or 2.4 wide, or a fill of 0.37+). Blobs closer than one word height are one signature; more than 4: a
+  noisy scan, nothing trusted. A round piece of ink with one large inner hole (35%+ of its box) is a stamp's ring: a
+  stamp by its shape, whatever its colour. The message says what was found ("stamp and 2 handwritten signatures found
+  ...", "handwritten signature found, no stamp, ...", "round stamp (its ring's shape) found ..."). Calibrated on the
+  four owner solvency pages (two signatures each: all eight found, no printed block taken) and nine other pages. A
+  signature without a stamp is PASS (5.9.2 "seal or signature"); owner question listed.
+- **Checker regressions.** The present-only ID card / CV is never cut into checked documents (`split.segment_folder`:
+  key `id_card_cv`, a file name saying ID card / CV / resume, or pages mostly typed as one). `doccheck.part_page_refs`
+  maps every number of a page list ("page 2, 3", "pages 2 and 3", "page(s) 2", "pages 2-3"), never an amount.
+- **Sideways scans (`pagetype.turn_junk_pages`, `engine.read_turned`).** An OCR'd page typed "other" with 8+ words of
+  which under 10% are common English / document words is read again turned on the CPU light engine (kept in the case
+  cache, `RUNNER-TURN`). Which turns: `engine.text_line_ratio` (no reading: the ink smeared along the rows and along
+  the columns, the bars each makes compared) says which way the text lines run: down the page (ratio <= 0.5; the four
+  sideways certificates 0.02-0.04) 90 and 270; across it (>= 1.5; every upright text page 1.57 and up: a Bangla or
+  handwritten page reads as junk the right way up, CHECK_0001 p14) only 180; otherwise 90, 270, 180. A turned read
+  that types as a document and reads clearly better (20%+ common words, +15 points) replaces the page's text
+  (`PageRead.turned`). One NOTE names every page read turned
+  ("scanned sideways or upside down, turned to be read: <file> p2, 5 - the student should upload them the right way
+  up").
+- **Academic levels.** An e-Apostille followed by a page that names no level starts a new level unit when the next
+  page that names a level names another level than the set's (EAP folder: HSC p1-3, SSC p4-6, no longer HSC p1-5).
+  The bot's "not all for one qualification" FLAG (its level words take "Alim" in a madrasah's name for HSC) is
+  re-judged by the runner's level reader (the examination the page names: Dakhil = SSC, Alim = HSC): one level on
+  every page the bot named gives PASS `academic.level` (`doccheck.level_override`); otherwise the bot's FLAG stays.
+- **TIN.** The printed parents' labels are found after OCR item-number noise ("3 3) Mother's Name"). When the printed
+  TIN is one or two digits off the QR's (`OCR_DIGITS`), the closer look (`closer.look`, kind "digits", candidates
+  [the QR's, the page read's], a 400 dpi render) decides: "same" PASS (the page read misread a digit); "differs" or
+  "unclear" FLAG check by eye, never FAIL (the page read and the closer look are one kind of recogniser and can share
+  a look-alike misread: an earlier closer-look version read owner folder 3's last digit wrong in every view). A
+  difference beyond OCR's reach stays FAIL.
+- **Page-type ties (`pagetype.break_ties`, `PageType.tie`).** A page whose two best financial types score the same
+  (TIN / income tax / trade licence / employment) is settled by a title in its head, else by its neighbours (a page
+  opening with a government letterhead starts a document: the next page's type; otherwise the page before's); the
+  winner gets +3 so the split follows (owner folder 9: TIN p5, income tax p6-17).
+- **A QR the page check did not find (`doccheck.qr_ladder_rows`).** On a trade licence or a family certificate whose
+  bot row says "no QR code" (or an unreadable one), every page showing a QR-like square is read with tin's crop /
+  threshold ladder (its deep stages only where QR finder patterns are seen): a decoded QR gives PASS "QR code read on
+  page N with a closer look"; nothing decoded leaves the bot's row, which then names the pages looked at. Owner folder
+  3's licence QR (a blurred 150 dpi scan) does not decode: whether a QR that is there but cannot be read should FLAG
+  is an owner question.
+- **The income tax's "notarised" PASS: evidence only.** The bot's `seal_present` PASS gets `evidence.notarised` in
+  run.json: the wording, every seal-coloured blob (colour, box, roundness, the green / yellow around it),
+  `emblem_like_only` (a round red blob at the top centre with green around it: the government monogram) and the
+  office's own seal words ("Seal of Tax Office"). The verdict stays the bot's (owner question pending).
+- **Date of birth (`doc.dob_consistency`).** The run's page reads count with the bot's; a read that differs from the
+  passport's date gets the closer look (kind "digits", the print against the passport's date written in the print's
+  own layout): "same" PASS; otherwise FLAG.
+- **A weak page next to the named document.** Inside one folder file, a document whose every page reads at most partly
+  like any document and lies next to the document the file's name names joins it (EAP folder: the ECA file's second
+  page is no employment certificate).
+- **Checks.** `tests/test_fixes25.py` (made-up data, synthetic images, the closer look stubbed).
+
+### Revision 2.5, integration (28 Oct, the closer look as the runner calls it; the four owner cases re-run) — changelog
+
+Versions: `RUNNER_VERSION = "0.2.5"`, `RUNNER_RULES_VERSION = "2026-10-28.r2.5"`, same run schema. `closer.VERSION =
+"closer-2"`. Section 7 is rewritten for the closer look; where parts A and B and section 7 differ, section 7 wins.
+
+- **The page search (the closer look with `box=None`, as names.py, tin.py and doccheck.py call it).** Agent C's
+  production-mode measure (the whole page, the runner's own candidates) found what the box-mode measure could not:
+  18 errors on the real set (16 false "differs", 2 false "same"). Three causes, three changes in `closer.py`:
+  - **A word the detector missed** (`_extend_ink`, `EXTEND_GAP` 1.5 line heights, `EXTEND_REACH` 14): the CRAFT
+    detector often leaves out a short word after a name (an italic or underlined surname). The look then saw the line
+    one word short and "confirmed" an OCR read that had dropped that word (15 of the 16 false "differs"; owner folder
+    9's HSC transcript mother, a false FAIL end to end). The found line is now widened over the ink in the core of its
+    band on either side, word gaps under 1.5 line heights, never across a vertical rule; horizontal rules are no ink.
+    An added word the detector missed is now seen too (it could only have hidden a real difference before).
+  - **A page that prints the name in more than one place** (`_locate_all`, `_combine`; `OCCUR_LEAD` 0.5 nats per
+    character, `OCCUR_MIN` -1.0, `OCCUR_MAX` 3): the search took the single best-matching line, which can be another
+    place than the one the OCR read came from (a family certificate's footer printing the reference while its table
+    row prints a short form: a false "same"; an NID card front printing the reference number while the back's MRZ
+    carries another: a false "same"). Every line matching about as well as the best is looked at; all places must
+    give the same decision (and, for dots, the same dot), else "unclear" ("the page prints the name in more than one
+    place and they do not agree").
+  - **A wrapped table cell** (`hit["cell"]`): the second line is now found under the matched cell (not under the
+    joined table row), and the two-line view stitches the line only up to the end of that cell.
+- **A weak read is no confirmed difference** (`DIFFERS_MIN` -1.0 nats per character): "differs" needs the winning
+  spelling to read as clear print; a script print the recogniser reads at -1.2 per character (owner folder 9's
+  Dakhil certificate, a garbled OCR read of the father's name that won on a two-line view: a false FAIL end to end)
+  is "unclear". Cost on the real box-mode set: four real differences in script prints go from "differs" to "unclear".
+- **The dot's shape** (`dot_at`): the window reaches back under the left letter's box (up to 0.6 letter heights, never
+  before the letter's own place: a script t's crossbar or an N's swash runs on over the dot after it, and the old
+  window saw clean paper there); "no dot" only when the paper in the gap is clean, not merely under Otsu's cut (a
+  blurred dot: "cannot tell"); a two-line view measures the dot on the line alone. Four of the five wrong dots of
+  the synthetic set are gone.
+- **The dot rule with one confirmed pattern** (`strict.dot_rule`): when the confirmed dots differ from the
+  reference's while another document reads the reference's dots (unconfirmed), a document following the reference
+  is PASS and the confirmed different one FLAG; before, the different one was PASS and the followers FLAG
+  (CHECK_0001: the employment certificate's father without the dot of the passport, the NID and the TIN).
+- **Measured** (`selftest/closer_eval`, TARGETS.md; closer-2, sha256 `02092e485e83`): see section 7 ("Measured accuracy").
+- **The reference's own page printing the name twice** (`names._reference_places`): a passport prints the father
+  in its Father field and its emergency contact; when one place is settled and the other is not, the settled places
+  decide the REFERENCE's dots (they agree and none says otherwise). Never used for a document being judged.
+- **The four owner cases, re-run with the final code** (runs `owner_f3_r5`, `owner_f9_r5`, `owner_eap1_r5`,
+  `test1_r5`; every line compared with the by-eye truth). The EAP folder (PASS, NOTEs only) and CHECK_0001 (HSC and
+  SSC FAIL: no e-Apostille and the mother's real one-letter difference; EMPLOYMENT CERTIFICATE FAIL: the father's
+  initial without the dot the passport, the NID and the TIN print; TIN FLAG: the non-government web address; NIDs
+  PASS; 4 MISSING) match on every line. Folder 9 matches on every line but one: the HSC transcript's dropped-word
+  misread (a false FAIL before) is now settled as the reference, the MOTHER NID's foreign back side FAILs, the bank
+  PASSes on two handwritten signatures with the opening balance a NOTE; the Dakhil certificate's ornate script
+  father's name (by eye the reference; a false FAIL before) is FLAG "check by eye". Folder 3: FAMILY CERTIFICATE and
+  TRADE LICENSE FAIL as expected, the TIN and the birth certificate PASS; the HSC transcript's bold italic student
+  name and the SSC certificate's bold italic mother's name (by eye the reference) stay FLAG "check by eye". Those
+  three board-paper lines are prints the one recogniser cannot verify either way (its views split); a second
+  engine is owner question Q23.
+- **Checks.** `tests/test_fixes25i.py` (made-up data: the dot rule with one confirmed pattern, the combination of
+  places, the ink widening, a reference in a footer with a short form in a row, a dropped last word).
+
+### Revision 2.6 (28 Oct, after the independent check of the closer look) — changelog
+
+Versions: `RUNNER_VERSION = "0.2.6"`, `RUNNER_RULES_VERSION = "2026-10-28.r2.6"`, same run schema. `closer.VERSION =
+"closer-3"`. An independent checker hunted for false PASSes with 82 new made-up cases (37 fonts the synthetic set never
+used) and 27 made-up bundles run through `names.evaluate` with the real CPU recogniser. Two-spelling looks never said
+"same" on a real difference; two wiring paths and one blind spot let a real difference through as PASS. Section 7 is
+updated; where it and this changelog differ, section 7 wins.
+
+- **An added word the look cannot settle is FLAG, never the same name** (`names.evaluate`; Q18 default changed). A
+  value read once that adds a word other than an honorific (BEGUM, KHATUN: neither is an honorific) was kept as a
+  difference only when the closer look said "differs"; "unclear", or no look, made it the name inside it (PASS).
+  Checker bundles W03b (+Khatun in a script print), W21 (+Begum in blackletter) and W22 (+Begum in a script print)
+  passed. Now only a look that shows the reference ("same": the added word is not printed with the name) drops the
+  word; "differs" keeps a confirmed difference (FAIL when the reference is supported and no affidavit covers it);
+  "unclear" or no look keeps it unconfirmed: FLAG "check by eye". W03b, W21, W22: FLAG.
+- **A single spelling is verified with the words beside it** (`closer.beside_words`, `RUN_GAP` 2.5 line heights,
+  `WORD_BREAK` 1.2, `LABEL_WORDS`, `LEFT_TITLES`, `MRZ_HEAD`). `names` asks for ONE spelling when a label's read is
+  too unlike the name to compare (is the name printed on the page at all?) and `identity` when the passport MRZ has no
+  name. That look scored only the reference's own letters, so an MST, MD or BEGUM printed right before or after the
+  name was never seen: checker cases K03-K05 came out "same" in both modes, and bundles W11 and W24 (a garbled label
+  read; the page prints the name + Mst / + BEGUM) PASSed. Now the recogniser's own reading beside the value is read
+  in every view: a further word within 2.5 line heights (not a label, a connecting word, a next field's label, a
+  number, a colon-ended label, a leading title, or a passport MRZ line's "P<" + issuing-state header) in more than 10%
+  of the views makes the look "unclear: the line reads a further word beside the value". K03-K05: unclear in both
+  modes; W11, W24: FLAG. Ten single-spelling controls (the page prints the reference after a label) stay "same" in
+  box mode (7 of 10 on the page search: 3 unclear, never "differs").
+- **The dot probe** (`names._dot_probe`, `names.dot_places`, `DOT_PROBE_MAX` 12, `LOOK_RESERVE` 16). When every read
+  shows the same dots, no look was taken, and the recogniser is known to drop printed dots: checker bundle W16 (the
+  passport and the NID "MD", the degree printing "MD." that OCR read "MD") PASSed where the dot rule says FAIL. Now,
+  when the name has a place for a dot (a word of one or two letters, or an honorific of three or fewer, before the
+  last word), each non-board document is looked at with the other dot pattern too, up to 12 looks a run and never
+  into the last 16 of the look budget. A pattern the look sees with BOTH judges (the dot's shape measured and the
+  recogniser on the same side) joins the dot rule like a read; the result is FLAG at most ("only the closer look's
+  dot probe sees the other dot; no OCR read shows it"), never FAIL. W16: FLAG. Board papers are not probed.
+- **A stamp's word far after the name is cut away** (`closer.far_tail`). The EAP folder's HSC transcript: the
+  notary stamp's "MD", printed far to the right of the student's name, was read by the page OCR as part of the
+  value; the look on [the name, the name + MD] was unclear (20 of 28 views), which the Q18 change would have made a
+  FLAG. A word another candidate adds AFTER the whole reference, whose first letter lies more than 2.5 line heights
+  after the reference's last letter AND that is printed in another ink (a colour more than 40 levels away, under 0.6
+  of the name's darkness, or no ink at all), is cut from the line before the views. Both signals are needed: a far
+  word in the name's own ink, or a near word in any ink, stays in the look. The EAP stamp look is now "same" (28 of
+  28 views). Takeover fix: the WHOLE added word must lie far (its first letter); a near BEGUM whose last letters ran
+  past 2.5 line heights was cut in its middle and then read as the reference (a false "same" on a made-up line).
+- **Takeover fixes found while re-measuring.**
+  - `names.evaluate`: an added-word read kept as an unsettled difference (the Q18 change) no longer counted as "the
+    document names the person here", so a misparsed label value on two other pages of the same document (wholly
+    unlike the name) became a confirmed difference: a false FAIL at text level (corpus student S174, audit label
+    "ocr"). Such a read now drops the misparse like a matching read does; the added word itself stays FLAG.
+  - `closer.LABEL_WORDS`: the next field's labels (DATE, BIRTH, ROLL, REG, NO, SEX, ADDRESS, DISTRICT, SESSION,
+    GROUP, BOARD, YEAR, GPA, ...; no name word among them) end a single value, so a table row's next column is not
+    read as a further word. `closer.MRZ_HEAD`: a passport MRZ line's "P<" + issuing-state header, read glued to the
+    surname, is no added word (without it `identity._mrz_by_closer_look` could never settle a noisy MRZ name; a
+    made-up MRZ line with an added MD still comes out "differs").
+  - `closer.tokens` renamed `rec_tokens` (the S8 banned-helper rule of `test_contract`).
+  - `doccheck.td1_reads` (the checker's rules probe: another person's NID back whose date-of-birth check digit is
+    misread gave FLAG): the sex letter counts when ONE of the two date check digits beside it agrees (the line is
+    anchored digit by digit; a misread date digit is a substitution, not a shift); the date of birth still needs its
+    own check digit. The checked number and the sex are then two signals: FAIL.
+- **Measured** (closer-3): see section 7 ("Measured accuracy") and TARGETS.md. The checker's own cases with the final
+  code: the hunt 0 false "same" and 0 wrong dot in 186 looks (K03-K05 now unclear), the 15 controls 28 "same" of 30;
+  the wiring 25 of 25 as expected, W15 the known limit (PASS) and W16 FLAG. Re-run on the final code (closer
+  sha256 c8a809a7eb83): `closer_eval\check\hunt_fx4_results.json` (the same figures; plain OCR of the 71
+  non-dot crops read the printed variant 65 times, something else 6 times, the reference never), the wiring
+  (`wiring_results.json`, 11:26) and the rules probe 32 of 32.
+- **The four owner cases, re-run with the final code** (runs `owner_f3_r6`, `owner_f9_r6`, `owner_eap1_r6`,
+  `test1_r6`): see the fixer's report; every line compared with the by-eye truth.
+- **Checks.** `tests/test_fixes26.py` (made-up data: the words beside a value, a label, a title, a number, a far word,
+  an MRZ header; single-spelling looks on rendered lines with an added Mst / BEGUM / MD and controls; the added-word
+  rule with a look "same" / "differs" / "unclear", and a misparse beside an unsettled added word; the dot probe (FLAG,
+  never FAIL; the shape alone is not enough; board papers not probed); the far-tail cut with a stamp's ink, the
+  name's own ink and a near word; a next field's label and an MRZ header beside a single value; a made-up MRZ name
+  line with and without an added MD; another person's NID back with a misread date check digit).
+- **Takeover (28 Oct, evening): no code change.** The re-measurements and the four owner cases were finished on the
+  final code. The owner removed the folder-3 and folder-9 case folders from the Desktop at about 16:24 on 28 Oct,
+  after their r6 runs; the one real production case still to run that reads them (R121, folder 9's academic file)
+  was run from a copy taken from the owner's original download with the same sha256 as the r6 run's page texts.
+  Measured on the way: one CPU detection (CRAFT) on a 400-dpi page commits about 4.3 GB, which ONNX Runtime's
+  CPU arena keeps (limit 15).
+
 ---------------------------------------------------------------------------------------------------------
 
 ## 0. Hard requirements (apply to every module, test and self-test)
@@ -420,9 +725,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-RUNNER_VERSION = "0.2.4"
+RUNNER_VERSION = "0.2.5"
 BASE_RULES_VERSION = "2026-10-21.3"      # the bot rules in the worktree's src/verify (commit 07b1f22)
-RUNNER_RULES_VERSION = "2026-10-28.r2.4"   # + the owner's 21-27 Oct decisions (A1-A8), applied in the runner only
+RUNNER_RULES_VERSION = "2026-10-28.r2.5"   # + the owner's 21-28 Oct decisions (A1-A8, the 28 Oct rules), runner only
 RUN_SCHEMA = "runner-run/2"
 PAGE_TEXTS_SCHEMA = "runner-page-texts/1"   # gpuread.py writes it, engine.load_page_texts reads it (5.2.1)
 
@@ -1536,9 +1841,9 @@ def dates_rows(page_texts: List[str]) -> List[Finding]
    - Joint account: additionally FLAG "joint account (holders: ...) — owner decides (Q2)". The holder rule passes when any joint holder is a parent; the worst of the per-name verdicts otherwise.
 4. **`bank.dates`** (`dates_rows`). The solvency page is the first `is_solvency_page` page, wherever it sits; the statement pages are the rest. Compare `dv.document_date(solvency)` with `dv.statement_date(statement pages)`: PASS equal, FLAG different, NOTE when one or both are unread; the bot's own messages (L1445-1455).
 5. **`bank.usd`** (critique 15), on the solvency page(s) only: `C.has_any(text, R.USD_WORDS)` → PASS "solvency amount stated in USD (page N)" / FLAG "no USD equivalent found on the solvency certificate (page N)".
-6. **`bank.seal`** (critique 15), on the solvency page only: `PC.seal_present(solvency_pdf(i))` or signature wording on that page (`(?i)authori[sz]ed\s+signat|signature|seal`) → PASS "seal or signature on the solvency certificate (page N)" / FLAG "no seal or signature found on the solvency certificate (page N)".
+6. **`bank.seal`** (critique 15), on the solvency page only: `PC.seal_present(solvency_pdf(i))` or signature wording on that page (`(?i)authori[sz]ed\s+signat|signature|seal`) → PASS "seal or signature on the solvency certificate (page N)" / FLAG "no seal or signature found on the solvency certificate (page N)". **Revision 2.5:** also a handwritten signature or a round stamp's ring found on the page image (`bank.ink_marks`); the message says what was found ("handwritten signature found, no stamp, ..."); see the revision 2.5 part B changelog.
 
-The statement-header holder read is no longer a row (critique 20); it is used only as a confirming read in rule 3. The minimum balance (KLP/EAP 1.8M, Bachelor's/Master's 2.5M, FAIL only when clear), the opening balance and the one-page rule stay the bot's rows (section 5.8).
+The statement-header holder read is no longer a row (critique 20); it is used only as a confirming read in rule 3. The minimum balance (KLP/EAP 1.8M, Bachelor's/Master's 2.5M, FAIL only when clear), the opening balance and the one-page rule stay the bot's rows (section 5.8). **Revision 2.5 (owner rule 28 Oct): the opening-balance rule is dropped** — the bot's opening-balance rows become one NOTE "opening balance not judged (owner rule 28 Oct)".
 
 #### 5.9.3 tin.py (Task 4)
 
@@ -1876,14 +2181,20 @@ def main(argv: Sequence[str]) -> int
 
 ---------------------------------------------------------------------------------------------------------
 
-## 7. Strict names, confirmation and the affidavit cover — one definition
+## 7. Strict names, the closer look and the affidavit cover — one definition (revision 2.5)
+
+The owner's rules of 27-28 Oct, as the runner applies them. Revision 2.5 rewrites this section for the closer look
+(owner 28 Oct: "make sure if the reader misreads one letter of a name before giving verdict it will take a closer look
+and give correct verdict. i want the final outcome of this as industry standard"); where the changelogs above differ,
+this section wins.
 
 **Letter for letter (A1).** A written name is reduced by `strict.form`: upper case, letters and dots only; spaces and
 every other mark removed; a run of dots is one dot; a dot before the first or after the last letter is punctuation;
 leading titles LATE/MR/MRS/MS/MISS/DR are dropped (Q16). Two names are the same ONLY when their forms are equal
-(`compare(...) == "EQUAL"`). MD, MST, MOHAMMAD, initials and two-letter words are letters like any other: "MD" vs
-"MOHAMMAD", or a dropped "MD", is a difference. Only a machine read (MRZ, QR), which is surname-first and has no
-dots, is compared with `any_order=True` and without dots.
+(`compare(...) == "EQUAL"`). MD, MST, MOHAMMAD, BEGUM, initials and two-letter words are letters like any other: "MD"
+vs "MOHAMMAD", or an added or dropped "MD" / "MST" / "BEGUM", is a difference. Case and spacing never are. Only a
+machine read (MRZ, QR), which is surname-first and has no dots, is compared with `any_order=True` and without dots.
+A FAIL needs the difference CONFIRMED; a difference is never PASS.
 
 **Two kinds of check, one policy (critique 9):**
 1. **"Is this written name that person?"** — bank holder, taxpayer, trade-licence owner, employee, deceased parent,
@@ -1892,57 +2203,136 @@ dots, is compared with `any_order=True` and without dots.
 2. **"Is the person's name printed the same on every document?"** — `names.evaluate`: the letters rule (A1) per
    document against the reference, and the dot rule (A2) across the documents.
 
-**Confirmation.** A spelling is CONFIRMED when two independent reads agree on it:
-- a machine read (the MRZ, a TIN / board / birth QR) — letters only, never dots;
-- the targeted zoomed re-read (`names.make_confirmer`: 300 dpi, the word crop scaled ×2, every word's confidence ≥ 0.80);
-- the same spelling read on another page of the same document (certificate and transcript, translation and
-  original card side, solvency page and statement header);
-- for a reference, another document printing it letter for letter.
+**The closer look (`closer.py`, owner 28 Oct).** When two reads of a name or a number disagree, the system looks at
+the page image again ITSELF before any verdict. It does not read the line again; it asks which of the KNOWN spellings
+the print supports (verification of a claimed value, the way cheque and form readers verify an amount):
+`closer.look(image, box, candidates, kind)`, `candidates[0]` = the reference, the others = the OCR read(s); kind
+"name", "dots" or "digits". The answer is "same" (the print is the reference: the other read was a misread),
+"differs" (the print is another candidate: a real difference) or "unclear" (the image does not settle it).
+1. **Find the text.** The caller's box, else the page is searched: the CRAFT detector's line boxes in the four
+   quarter turns and a keyword score of every candidate per box. The best line AND every other line matching about as
+   well (within 0.5 nats per character, clean matches only, at most 3) are looked at; each line is joined with the
+   boxes beside it and widened over ink the detector missed (word gaps under 1.5 line heights, never across a table
+   border); the line under the matched cell is tried as a wrapped cell's second line.
+2. **Views.** 28 images of the line: four vertical margins x five colour channels (grey, the darkest channel, R, G,
+   B), contrast stretch, Otsu and adaptive binarisation, sharpening, bold, thin, two skews; small text enlarged 2-3x;
+   printed rules painted out.
+3. **Score.** On every view the english_g2 recogniser (the engine's CPU ONNX session; never DirectML; it must work in
+   the CPU-only app) gives per-frame probabilities, and the CTC forward log-likelihood of EACH candidate is computed
+   over the candidates' own region of the line (case-blind; a space or a label's colon free; '.' its own class for
+   dots; '<' a separator for an MRZ line).
+4. **Decide.** "same" / "differs" only when ALL hold, else "unclear":
+   - the winner leads by `MARGIN` (0.12 nats per reference character) on average, in >= 85% of the views (`MOST`),
+     with <= 10% of the views backing another candidate (`DISSENT`);
+   - the winner reads as print: >= -1.6 nats per character (`MIN_SCORE`); for "differs" >= -1.0 (`DIFFERS_MIN`: a
+     weak read of a script print is no confirmed difference);
+   - every place where the winner differs from another candidate favours it by itself (`SEG_MIN` 2.0 nats: a minimal
+     edit alignment, the winner against itself with that ONE place taken from the other spelling), and letters the
+     winner adds read as print by themselves (`ADDED_MIN` -1.6 per letter: artwork, a stamp or a Bangla line does not);
+   - the line alone and the line with the one under it support the same spelling (a wrapped cell or the next row);
+   - every place of the page the search found gives the same decision.
+   Two independent experts: the letter's shape (a small letter's height against the word's ascender and x lines: t /
+   l, i / l, n / h ...) can settle a one-letter tie the recogniser misreads in every view, with at least one view
+   backing it; the dot's shape (a small solid blob on the baseline between the letters) decides a dot when the
+   recogniser's lead is under `DOTS_ALONE` (0.6); without a measured shape the recogniser may confirm a dot but never
+   "no dot". `Look.dot` is given only with a decision.
+5. **Never a guess.** No recogniser, text not found, a failure: "unclear". By construction a REAL difference can come
+   out "differs" or "unclear", never "same" ("same" needs the reference to explain the print clearly better than the
+   other spelling in nearly every view, at every place where they differ).
 
-A difference is FAIL only when BOTH spellings are confirmed and no read of the variant's document shows the
-reference spelling.
+**What a look does to a verdict.**
+- **Names** (`names.evaluate`, `names.Confirmer.look/pair`; every look logged in run.json `names_rereads` with its
+  crop `work/look_pNN_k.png`). Every page (up to 3) of a document that reads the variant is looked at: "same" on every
+  page -> a misread, no finding (the log says "misread corrected by closer look"); "differs" on any page -> the
+  document prints the variant; anything else -> unclear. The reference's own page is looked at too. **FAIL** = the
+  variant printed (a look "differs", or two pages of the document agreeing with no look "same") AND the reference
+  supported (its own page's look "same"; when that is unclear, a machine read or another document printing it letter
+  for letter) AND no affidavit covers the two spellings. The reference's own page showing the variant -> FLAG ("the
+  passport's own read may be the misread"). Every other difference -> **FLAG "check by eye, page N"**, with what the
+  look could not tell. **No outvote:** other documents never decide which spelling a document prints (the revision
+  2.3 outvote, `_outvoted` / `ref_independently_confirmed`, is removed: it turned confirmed real differences, an added
+  MST, into FLAG). A read too unlike the name to compare (a misparsed label) first gets a look for the reference itself
+  on its page: printed clearly -> no finding. Revision 2.6: that single-spelling look also reads the words beside the
+  value; a further word of the value there (an added MST, MD, BEGUM; not a label, a connecting word, a next field's
+  label, a number or a leading title) makes it "unclear", never "same". An added word that is not an honorific, read
+  on one page, is dropped only when the look on that page shows the reference ("same"); "differs" keeps a confirmed
+  difference; "unclear" or no look is FLAG "check by eye" (Q18, revision 2.6). A word the OCR ran onto the name from
+  a stamp printed far after it in another ink is cut from the line before the look (`closer.far_tail`).
+- **The reference.** When other documents print another spelling of a parent, the look on the birth certificate's own
+  page decides ("differs" corrects the reference: NOTE `identity.reference_corrected`); its tail ("reads on with ...")
+  is looked at ("same" drops it, "differs" takes it, "unclear" keeps the FLAG). A noisy passport MRZ line 1: the
+  printed name in MRZ order is verified on the passport page.
+- **Numbers.** The TIN printed against its QR (kind "digits"): "same" PASS; "differs" or "unclear" FLAG check by eye,
+  never FAIL (the page read and the look are one kind of recogniser and can share a look-alike misread). A date of
+  birth that reads differently from the passport's: "same" PASS, otherwise FLAG.
+- Without the recogniser (a test's plain confirmer) the legacy re-read rule of revision 2 applies: the zoomed re-read
+  confirms (-> FAIL when uncovered), refutes (-> FLAG "probably OCR") or leaves unclear (-> FLAG); never PASS.
 
-**Revision 2.3: an outvoted reference.** The reference is ONE document's read; its own zoomed re-read re-reads the
-same print and can repeat a misread (owner folder 3: one letter of the mother's name, T read as L, on a bilingual
-JPG). `names._outvoted`: when two or more OTHER documents agree with each other on one spelling the reference does
-not have (letters equal; a card's MRZ line in any order), no other document prints the reference, no other
-confirmed spelling stands against them, and no read independent of the reference's own print confirms it
-(`names.ref_independently_confirmed`: a machine read of the person — a birth-certificate or board QR, the passport
-MRZ for the student —, another page of the reference's document, another document, or an account holder / taxpayer
-read of `extra_reads`), the finding is ONE FLAG `names.<person>_reference` on the reference document ("<R> on the
-birth certificate, but <V> on n other documents that agree with each other ... check by eye: if it prints <R>,
-those documents differ from it"); the agreeing documents get a NOTE (kind AGREES, not listed on the NAMES line);
-a third spelling is at most FLAG; the dot rule runs over the agreeing documents with no dot reference. One other
-document against a reference confirmed by its own re-read is still FAIL; a reference another document prints is
-never outvoted. Revision 2.4: with an outvoted reference, the "not compared" FLAG (`names.<person>_unread`, a single
-read too unlike the name) is not raised on a document whose other read shows the agreed spelling. When the re-read shows the reference instead, the difference stays FLAG ("a closer read
-shows <R> — probably OCR, check by eye, page N"). A difference OCR could explain (a dot, I/l/1, 0/O, a single
-read) that cannot be confirmed is FLAG "check by eye, page N". A difference is NEVER PASS. Test 1 is the
-reason: whole-page OCR dropped the dot of "MD." on one certificate and the old logic gave a false FAIL.
+**Measured accuracy** (`selftest/closer_eval`, the targets in `private-runner\closer_eval\TARGETS.md`; closer-2,
+sha256 02092e485e83; the real set is never used for tuning). Real set: 130 comparisons from the four owner cases and the
+corpus audit, every label checked by eye. Synthetic set: 2400 made-up names (19 Windows fonts, nine degradations).
 
-**The dot rule (A2).** Dots are judged against the passport's PRINTED name (data page), never the MRZ; for a
-parent, against the birth certificate. A dot that differs from the reference is fine when the other documents
-agree with each other; confirmed spellings with mixed dots across the other documents = FAIL on each document
-whose dots differ from the reference. The owner's cases: passport "MD." + all others "MD" → OK; passport "MD." +
-others mixed → FAIL; passport "MD" + others mixed → FAIL; passport "MD" + others "MD" → OK. Assumed by symmetry
-(Q13): passport "MD" + all others "MD." → OK. Letters stay letter for letter.
+| set, mode (closer-2, sha256 02092e485e83, MARGIN 0.12) | FALSE PASS | FALSE FAIL | review | wrong dot |
+|---|---|---|---|---|
+| real, box (130: the name's box given) | 0 of 55 | 0 of 75 | 20.0 % | 0 of 17 given |
+| real, production (130: the whole page, box=None, the runner's own candidates: how names.py, tin.py and doccheck.py call it) | 0 of 55 | 0 of 75 | 29.2 % | 0 of 15 given |
+| synthetic, box (2400) | 0.17 % (2 of 1200; Wilson 95 % bound 0.50 %) | 0.00 % (bound 0.22 %) | 8.25 % | 0.26 % (1 of 380 given) |
+| targets (TARGETS.md) | real 0; synthetic <= 0.5 % | real 0; synthetic <= 1 % | real reported; synthetic <= 5 % | real 0; synthetic <= 0.5 % |
+| before the integration (11f4ffb2313b) | real box 0, production 2; synthetic 0.42 % | real box 0, production 16; synthetic 0.08 % | 16.2 % / 20.8 % / 7.5 % | synthetic 1.28 % |
+| plain OCR, no closer look | real box 1 of 55 | real box 8 of 75 | 36.9 % | 9 of 19 |
+| **real, box (closer-3, sha256 c8a809a7eb83, revision 2.6: the final code)** | 0 of 55 | 0 of 75 | 20.0 % | 0 of 17 given |
+| real, production (closer-3) | 0 of 55 | 0 of 75 | 29.2 % | 0 of 15 given |
+| synthetic, box (closer-3; 2400) | 0.17 % (the same 2 of 1200) | 0.00 % | 8.25 % | 0.26 % (1 of 380 given) |
+
+closer-3 (revision 2.6) decides every one of the 2400 synthetic cases as closer-2 did (its changes act on a
+single-spelling look, a far word in a stamp's ink and the dot probe, none of which the synthetic set offers),
+and the real set gives the same numbers in box mode. Results: `fx3_real_box_c7`, `fx4_real_prod_c7`,
+`fx4_synth_full_c7` (the last two merged from a run cut off by the end of a session and the runs of its remaining
+ids with the same closer sha256; see TARGETS.md).
+
+Every real target is met in both modes; on the synthetic set the error and wrong-dot targets are met and the review
+target (5 %) is MISSED (8.25 %: dots 24 %, script fonts 26 %, x-height under 8 px 87 %, salt noise 18.5 %; plain
+fonts 1-7 %). MARGIN was tuned on the synthetic set only: the exact sweep on a 600-case sample gives the same errors at
+0.06, 0.12 and 0.25 and review 8.7 / 8.8 / 10.2 %, so 0.12 is kept (MARGIN is not the deciding gate). About 2-3 s a
+look on the CPU (28 views); a page-wide look 4-15 s.
+
+FALSE PASS = a real difference judged "same" (the worst error); FALSE FAIL = an identical name judged "differs";
+review = "unclear" (FLAG check by eye). **Limits.** One recogniser: a print it misreads in nearly every view (bold
+italic and ornate script board papers, dots in script faces, text under 8 px x-height) cannot be verified by it;
+those looks come out "unclear" (FLAG), never a verdict. A second engine would need the owner's decision (a download).
+
+**The dot rule (A2).** Dots are judged against the passport's PRINTED name (data page), never the MRZ; for a parent,
+against the birth certificate. When the reads disagree on a dot, each document's dots (and the reference's) come from
+a closer look of kind "dots" (an unclear look leaves the OCR dots unconfirmed). `strict.dot_rule`, the owner's cases:
+passport "MD." + all others "MD" -> OK; passport "MD." + others mixed -> FAIL; passport "MD" + others mixed -> FAIL;
+passport "MD" + others "MD" -> OK; assumed by symmetry (Q13): passport "MD" + all others "MD." -> OK. A FAIL goes to
+each document whose CONFIRMED dots differ from the reference while the others are mixed; a document following the
+reference is PASS; anything unconfirmed is FLAG at most (revision 2.5: one confirmed pattern unlike the reference
+while another document reads the reference's dots -> the confirmed one FLAG, the followers PASS). **Board papers**
+(owner 28 Oct: "board papers md. is fine, no fail for that"): education-board SSC / HSC certificates and transcripts,
+the madrasah Dakhil (= SSC) and Alim (= HSC), JSC / JDC (`names.board_paper`) are out of the dot rule: their dots
+neither count as mixed nor are compared with the passport; a NOTE "board papers' dots not judged (owner rule 28 Oct)"
+where their dots differ. Their LETTERS stay strict. University degree papers stay in the dot rule.
+**The dot probe (revision 2.6).** When every read shows the same dots, the recogniser may still have dropped a printed
+dot on one document. When the name has a place for a dot (MD, MST, an initial: a word of one or two letters, or an
+honorific of three or fewer, before the last word), each non-board document is looked at with the other dot pattern
+too (at most 12 looks a run). A pattern the look sees with both judges (the dot's shape measured, the recogniser on
+the same side) joins the rule like a read; what the rule then finds is FLAG at most, never FAIL (no OCR read shows
+that dot).
 
 **Affidavit cover.** Both spellings must be printed letter for letter, dots included, in ONE same-person group of an
-affidavit (`names.covered`). Covered → NOTE.
+affidavit (`names.covered`). Covered -> NOTE.
 - An affidavit that names a spelling only as OCR read it gives FLAG.
 - An affidavit that exists but does not cover the difference does not help: a confirmed difference is still FAIL.
-
-**Re-read.** The targeted re-read can confirm (→ FAIL when uncovered), refute (→ FLAG "probably OCR") or leave
-unclear (→ FLAG). It never makes a PASS. Every re-read is listed for by-eye review (T3). The reference shown
-INSIDE the variant's re-read (an added word: "MST <A> <B>" re-read as printed) does not refute it.
 
 **Revision 2.1: what a document's name is.** The name is the label's VALUE (`names.read_value`: the name-like
 words right after the label, up to a stop word, a number, a symbol or a closing mark; a trailing "(Late)" is a
 title). When the reference's letters are a run inside the value, the value's other words belong to the name:
 - an added honorific (MD, MST, SK, MOS and the bot's list) before the run → a difference (FLAG; FAIL when
   confirmed);
-- any other added word, before or after → a difference only when CONFIRMED (the same value on another page of
-  the document, or the zoomed re-read prints it); unconfirmed, the read counts as the name inside it (Q18);
+- any other added word, before or after → a difference; FAIL only when CONFIRMED (the same value on another page
+  of the document, or the closer look prints it); revision 2.6: unconfirmed, it is FLAG "check by eye", and it counts
+  as the name inside it only when the closer look on its page shows the reference without it (Q18);
 - a value wholly unlike the name (at least two words, two of them of 3+ letters, no word in common) → a
   difference when two pages agree on it (FAIL when the reference is confirmed); a single read →
   FLAG `names.<person>_unread` "not compared — check by eye" (a misparsed label reads like this, so never FAIL;
@@ -2381,11 +2771,13 @@ whitespace does not count, A1), Q11 (GPA consistency: removed, critique 20), Q12
 | Q14 | Keep the two NEW FLAG checks found in test 1? (a) a TIN certificate printed from a non-government web address (not `*.gov.bd`) → FLAG "verify on the NBR site"; (b) the tax circle/zone on the return/acknowledgement differs from the TIN certificate's → FLAG. | Both on, FLAG only, listed under "NEW CHECKS (owner to confirm)" in every summary where they fire. |
 | Q15 | The colour rule in bundle mode: the owner's scanner decides the colour. A bundle scanned in grey would FAIL every document. | When every unit fails the colour check, one bundle-level FLAG ("rescan in colour") instead of a FAIL per document; a single grey document inside a colour scan keeps its own row. |
 | Q16 | Leading titles (LATE, MR, MRS, MS, MISS, DR) are not part of a name, and a dot after the last letter of a name is punctuation. A1 says "no honorific dropping"; a reviewer reads that as covering MR/MRS too. | Yes for both, at the START of a name only (a bank or TIN print's "Mr." would otherwise fail every chain). MD, MST and every other word count letter for letter. |
-| Q18 | A value read ONCE that adds a word other than an honorific to the name ("<A> <B> BEGUM" on a one-page document, no second read): a difference (FLAG "check by eye") or page noise? On the corpus 124 such reads were nearly all OCR (a misread "Name" label, a table's district, "PHOTOGRAPH", Bangla read as Latin). | Page noise: the read counts as the name inside it. Two agreeing reads (two pages, or the zoomed re-read) make it a difference, FAIL when uncovered. An added honorific is always a difference. |
+| Q18 | A value read ONCE that adds a word other than an honorific to the name ("<A> <B> BEGUM" on a one-page document, no second read): a difference (FLAG "check by eye") or page noise? On the corpus 124 such reads were nearly all OCR (a misread "Name" label, a table's district, "PHOTOGRAPH", Bangla read as Latin). | Revision 2.6 (independent check: an added BEGUM or KHATUN in a script print passed): the closer look on that page decides. "same" (the reference printed without the word): page noise, the name inside it. "differs": a confirmed difference, FAIL when uncovered. "unclear" or no look: FLAG "check by eye", never PASS. Two agreeing reads (two pages) make it a difference. An added honorific is always a difference. |
 | Q19 | The birth certificate's value goes on after the words the other documents print, and no second read (another page of the certificate, the zoomed re-read) confirms the extra words (they may be OCR junk). | The other documents are compared with the confirmed part; the birth certificate's line is FLAG `names.<parent>_tail` "check by eye" (revision 2.2: never a silent PASS); a document or holder that adds those words, or other words in their place at the end (no more words than the tail), is FLAG, not FAIL: the certificate's end is not confirmed. |
 | Q21 | A word printed right after a name in another case than the name, a field label glued to a colon, or a sentence / academic / occupation word ("successfully", "Programme", "Farmer", "Freedom Fighter"). | It ends the name (never an extra name word): a correct document no longer FAILs when the re-read confirms the printed words. A real extra name word printed in the name's own case is still a difference. |
 | Q22 | Folder mode: the solvency certificate and the statement in two separate bank files. | One bank document: the bot's per-file "only one page" FLAG becomes a NOTE naming the files, and the solvency date is compared with the statement in the other file. |
 | Q20 | A name label read ONCE whose value is wholly unlike the name (no word in common; a misparsed label, another person's row on a family certificate, or a truly different name). At text level on the corpus (re-read off) 240 document reads are like this (106 on family certificates); students with any FLAG go from 198 to 200 of 204. | FLAG `names.<person>_unread` "not compared — check by eye" (A1: an unconfirmed difference is never PASS). Two pages agreeing on the value: a difference (FAIL when uncovered). |
+| Q23 | Revision 2.5: a name printed in bold italic or ornate script that the one recogniser cannot verify either way (owner folders 3 and 9: three board-paper lines that print the reference by eye). Accept FLAG "check by eye" for such prints, or add a second, stronger recogniser (a download)? | FLAG "check by eye" (never a guessed PASS or FAIL). |
+| Q24 | Revision 2.5 (part B): a solvency certificate signed by hand with no bank stamp; a trade-licence QR printed but too blurred to decode; the income tax's "notarised" PASS from the government emblem and the tax office's own seal; a TIN one or two look-alike digits off its QR that the closer look cannot settle; an NID back that disagrees with the front on one field only. | Signature alone PASS; undecodable QR keeps the bot's PASS with a note; emblem + office seal PASS; TIN FLAG (never FAIL); one field FLAG, two or more FAIL. |
 | Q17 | Birth certificate: the barcode's BRN differs from the printed BRN; the same QR key on another student's certificate (a copied QR). | BRN difference: FAIL only when the printed BRN is read alike twice, else FLAG. The key-reuse check needs other students' files, so a single-case run cannot do it (not checked). |
 
 ## 13. Known limits
@@ -2416,3 +2808,34 @@ whitespace does not count, A1), Q11 (GPA consistency: removed, critique 20), Q12
     joins the TIN part). The bot's own rules keep their limits: its academic level words read a school's name
     ("... Alim Madrasah") as HSC (a FLAG on an SSC part), and its opening-balance reader may miss a balance printed
     before its label (a NOTE). A handwritten signature is not read: `bank.seal` needs seal wording or seal colour.
+    (Revision 2.5 lifts the last three: ties are settled, Dakhil / Alim go by the examination, signatures are read.)
+12. **Revision 2.5.** The signature detector is calibrated on the owner folders' four solvency certificates (150 dpi
+    scans); a very small or very faint signature, or one written over printed text so that no single pen stroke is
+    longer than a printed word, is not seen (the page then needs a stamp or the wording). A signature written across
+    a round stamp's ring counts as the ring (a stamp). The NID back-side rule needs the smart card's MRZ: an old
+    laminated card, or an MRZ the reader garbles past its check digits, gives a NOTE. The QR ladder cannot decode a
+    QR blurred below about 3 pixels a module (owner folder 3's trade licence): the bot's "no QR code" row then stays.
+13. **Revision 2.5, the closer look.** One recogniser (english_g2) judges the print: a name it misreads in nearly
+    every view cannot be verified by it, so the look says "unclear" and the line is FLAG "check by eye" (owner folder
+    3: the HSC transcript's bold italic student name and the SSC certificate's bold italic mother's name; owner folder
+    9: the Dakhil certificate's ornate script father's name; all print the reference by eye). The page search cannot
+    tell which of two places of a page the OCR read came from: a page that prints the name in two places where one
+    cannot be settled, or the two disagree, is "unclear" (a FLAG where a single-place page would have settled). A
+    difference that reads at under -1.0 nats per character (script prints) is never confirmed by the look alone (FLAG,
+    not FAIL). A second recogniser would need a download (owner question).
+14. **Revision 2.6, what no look is asked about.** A read that already equals the reference triggers no letter look:
+    a letter the page OCR misreads INTO the reference would pass unseen (the checker's bundle W15; on the checker's 71
+    hunt crops plain OCR never read a variant as the reference, so letters are a small risk). Dots are the realistic
+    risk (the recogniser drops printed dots) and are probed (the dot probe, section 7); the probe sees a dot only
+    with both judges and gives FLAG at most. The line finder works on the darkest ink: a word printed right beside
+    the name in a lighter, coloured ink (a stamp's, a pen's) is no part of the line the look reads (made-up test: a
+    purple "MD" beside a black name gives "same"); a typed name and its typed honorific share one ink. A parent field
+    that names clearly another person on ONE read is FLAG "not compared" (a misparsed label reads the same way),
+    never FAIL; two pages agreeing make it a difference.
+15. **Revision 2.6, memory (measured, not changed).** The CPU detector (CRAFT, `craft_mlt_25k.onnx`) on a 400-dpi A4
+    page (a page-wide closer look) raises the process's committed memory from about 0.5 GB to 4.8 GB (a made-up
+    page, `fixer4\mem_detect.py`), and ONNX Runtime's CPU memory arena keeps it; with pages of several sizes the
+    runner process on the EAP folder reached about 11 GB committed. A PC with 8 GB of RAM would page heavily.
+    No decision depends on it; options for the owner's app: the session option `enable_cpu_mem_arena = False`,
+    or detecting on a page scaled to the light engine's 200 dpi and mapping the boxes back (both need the
+    measurements re-run).

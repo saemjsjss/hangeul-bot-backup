@@ -27,13 +27,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-from . import botimport, strict
+from . import botimport, closer, strict
 from .model import (FAIL, FLAG, NOTE, PASS, RANK, AffidavitInfo, BirthFacts, DocUnit, Finding, Identity,
                     MachineRead, PageRead)
 
 REREAD_MAX = 24            # targeted re-reads per run, shared by every caller of the confirmer
 REREAD_MIN_CONF = 0.80
 REREAD_CAN_FAIL = True     # A1: a confirmed difference is FAIL (no audit gate)
+LOOK_MAX = 80              # closer looks per run (owner 28 Oct), shared by every caller of the confirmer
+LOOK_DPI = 400             # the closer look's render of a vector page (a scan: its own resolution)
 SOURCE = "runner:names"
 PEOPLE = ("student", "father", "mother")
 _NEUTRAL = ("parent", "taxpayer", "proprietor", "employee", "holder")   # vocabulary persons (critique 4)
@@ -368,6 +370,9 @@ class Read:
     unit: str = ""                  # uid of the document unit
     written: str = ""               # the value as OCR printed it, dots kept, tokens joined by one space
     win_raw: Tuple[str, ...] = ()   # the window's tokens as printed (dots kept)
+    wrap: Tuple[str, ...] = ()      # family table: the name cell's possible second line (not in the name until
+    #                                 evaluate finds name-like evidence for it: _wrap_choice)
+    surname_n: int = 0              # passport data page read: how many of its last words are the surname
 
 
 def _mk(person: str, vals: Sequence[str], doc: str, src: str, page: int, tk: Sequence[str], j: int,
@@ -609,7 +614,8 @@ def extract_passport(rec: dict) -> Tuple[List[Read], Optional[dict]]:
             vals = list(giv) + list(sur)
             parts = tuple(nt(v) for v in vals if nt(v))
             reads.append(Read("student", parts, "passport", "VIZ given+surname", pi, parts, " ".join(vals),
-                              written=" ".join(vals), win_raw=tuple(v for v in vals if nt(v))))
+                              written=" ".join(vals), win_raw=tuple(v for v in vals if nt(v)),
+                              surname_n=sum(1 for v in sur if nt(v))))
         reads += _parent_reads(text, "passport", pi)
         m = passport_mrz_name(text, printed=[w for r in reads for w in r.parts])
         if m and (mrz is None or (m["ok"] and not mrz["ok"])):
@@ -736,11 +742,12 @@ def extract_family_cert(rec: dict) -> List[Read]:
             vals = vals[last + 1:]                    # words that follow names stand before this row's name
             cut = next((q for q in range(1, len(vals)) if ends_name(vals[:q], vals[q])), len(vals))
             vals = vals[:cut]                         # "<NAME> Xxxxx Father": a Title-case cell after a capitalised name
-            vals = vals + wrapped_cell_tail(tk, j, vals)   # rev 2.4: the name cell's second line
+            wrap = wrapped_cell_tail(tk, j, vals)          # rev 2.4: the name cell's possible second line
             if vals:
                 ps = tuple(nt(v) for v in vals if nt(v))
-                rows.append(_mk(who, vals, "family_cert", "table row", pi, tk, 0,
-                                win=(ps, tuple(v for v in vals if nt(v)))))
+                row = _mk(who, vals, "family_cert", "table row", pi, tk, 0, win=(ps, tuple(v for v in vals if nt(v))))
+                row.wrap = tuple(wrap)     # owner checker 28 Oct: taken in only on name-like evidence (_wrap_choice)
+                rows.append(row)
                 if j + 1 < len(tk) and _ROW_NUMBER.match(tk[j + 1]):
                     row_cells.append(j)               # "... Father 2 <next row>": a relation cell, not a label
         reads += _parent_reads(text, "family_cert", pi, skip=row_cells)
@@ -1559,9 +1566,102 @@ class Confirmer:
         self._k: Dict[int, int] = collections.Counter()
         self.log: List[Dict[str, Any]] = []
 
+        # owner 28 Oct: the closer look (closer.py) when the engine carries the real recogniser
+        self.closer = engine is not None and closer.available(engine)
+        self.looks: Dict[Tuple[int, str, Tuple[str, ...]], Optional["closer.Look"]] = {}
+        self.looks_used = 0
+        self.look_budget = LOOK_MAX
+        self._hi: "collections.OrderedDict[int, Any]" = collections.OrderedDict()
+
     def printed(self, page_index: int, variant: str) -> str:
         """The form the re-read printed for (page, variant), "" when unknown."""
         return self.memo.get((page_index, strict.form(variant)), ("", ""))[1]
+
+    # ------------------------------------------------------------------ the closer look (owner 28 Oct)
+    def image(self, i: int) -> Any:
+        """The high-resolution page image of run page i (closer.page_image), the last 4 kept."""
+        img = self._hi.get(i)
+        if img is None:
+            img = closer.page_image(self.engine, self.pages[i], LOOK_DPI)
+            self._hi[i] = img
+            while len(self._hi) > 4:
+                self._hi.popitem(last=False)
+        else:
+            self._hi.move_to_end(i)
+        return img
+
+    def look(self, i: int, candidates: Sequence[str], kind: str = "name") -> Optional["closer.Look"]:
+        """closer.look on run page i (the page searched for the candidates' line), memoised and logged; None when
+        no look can be taken (no recogniser, no page, the budget spent)."""
+        cands = [c for c in candidates if c and strict.letters(c)]
+        key = (i, kind, tuple(closer.norm(c, kind) for c in cands))
+        if key in self.looks:
+            return self.looks[key]
+        if not self.closer or not (0 <= i < len(self.pages)) or not key[2] or not key[2][0]:
+            return None
+        entry: Dict[str, Any] = {"run_page": i, "page": _p1(self.pages, i), "variant": cands[-1],
+                                 "candidates": list(cands), "kind": kind, "how": "closer look", "crop": ""}
+        if self.looks_used >= self.look_budget:
+            entry.update(result="unclear", why="closer-look budget spent")
+            self.log.append(entry)
+            self.looks[key] = None
+            return None
+        self.looks_used += 1
+        try:
+            img = self.image(i)
+            res = closer.look(img, None, cands, kind)
+        except Exception as exc:                 # a look never breaks the run: no look, no guess
+            entry.update(result="unclear", why=f"closer look failed: {type(exc).__name__}")
+            self.log.append(entry)
+            self.looks[key] = None
+            return None
+        entry.update(result=res.decision, best=res.best, margin=res.margin, variants=res.variants,
+                     agree=res.agree, dot=res.dot, why=res.note,
+                     scores={c: v for c, v in res.scores.items()},
+                     detail={k: v for k, v in res.detail.items() if k not in ("table", "winners")})
+        try:
+            entry["crop"] = self._save_look_crop(i, img, res)
+        except Exception:
+            pass
+        self.log.append(entry)
+        self.looks[key] = res
+        return res
+
+    def _save_look_crop(self, i: int, img: Any, res: "closer.Look") -> str:
+        import numpy as np
+        box = res.detail.get("box")
+        if not box:
+            return ""
+        rot = int(res.detail.get("rotation", 0)) // 90
+        a = np.ascontiguousarray(np.rot90(img, rot)) if rot else img
+        x0, y0, x1, y1 = box
+        h = max(1.0, y1 - y0)
+        H, W = a.shape[:2]
+        crop = a[int(max(0, y0 - 0.5 * h)):int(min(H, y1 + 0.5 * h)), int(max(0, x0 - h)):int(min(W, x1 + h))]
+        self._k[i] += 1
+        path = self.work_dir / f"look_p{i + 1:02d}_{self._k[i]}.png"
+        _save_png(crop, path)
+        return str(path)
+
+    def find_page(self, written: str, exclude: Iterable[int] = ()) -> Optional[int]:
+        """The first run page (not in `exclude`) whose read holds `written` letter for letter (spacing aside)."""
+        skip = set(exclude)
+        for i, pg in enumerate(self.pages):
+            if i not in skip and strict.find_run(written, pg.text or ""):
+                return i
+        return None
+
+    def pair(self, i: int, reference: "strict.Name", variant: "strict.Name", kind: str = "name") -> str:
+        """Which of two spellings run page i prints: "same" (the reference), "differs" (the variant) or "unclear".
+        The closer look when the engine carries the recogniser; else the legacy re-read of the variant
+        ("confirmed" -> "differs", "refuted" -> "same")."""
+        ref = reference if isinstance(reference, str) else " ".join(reference)
+        var = variant if isinstance(variant, str) else " ".join(variant)
+        if self.closer:
+            res = self.look(i, [ref, var], kind)
+            return res.decision if res is not None else "unclear"
+        ans = self(i, var, reference=ref)
+        return {"confirmed": "differs", "refuted": "same"}.get(ans, "unclear")
 
     def __call__(self, page_index: int, variant: str, reference: "strict.Name" = "") -> str:
         """`reference` (optional, names.evaluate): the spelling the variant differs from. A re-read that
@@ -1856,69 +1956,157 @@ def glued_dot_loss(written: str, dot_ref: Optional[str]) -> bool:
     return glued_at(written, strict.dot_pattern(dot_ref))
 
 
-def ref_independently_confirmed(person: str, ref: "_Ref", ident: Identity, reads: Sequence[Read],
-                                machine: Sequence[MachineRead],
-                                extra_reads: Sequence[Tuple[str, str, str, int]] = ()) -> bool:
-    """Revision 2.3: True when a read independent of the reference's own print shows the reference's letters: a
-    machine read of the person (a birth-certificate or board QR, the passport MRZ for the student), another page of
-    the reference's document, another document, or an account holder / taxpayer read (`extra_reads`). The
-    reference's own zoomed re-read is no such read: it re-reads the same print."""
-    target = strict.letters(ref.name)
-    if not target:
+# ============================================================================ board papers (owner 28 Oct)
+_BOARD_TEXT = re.compile(r"(?i)board\s+of\s+intermediate|intermediate\s+and\s+secondary|secondary\s+school\s+certificate|"
+                         r"higher\s+secondary\s+certificate|\bs\.?\s?s\.?\s?c\b|\bh\.?\s?s\.?\s?c\b|\bj\.?\s?s\.?\s?c\b|"
+                         r"\bj\.?\s?d\.?\s?c\b|dakhil|\balim\b|madras(?:a|ah)\s+education\s+board|junior\s+(?:school|dakhil)")
+_UNIVERSITY_TEXT = re.compile(r"(?i)universit|bachelor|master\s+of|degree|faculty|semester|\bcgpa\b|honou?rs")
+_BOARD_TITLE = re.compile(r"\b(?:HSC|SSC|JSC|JDC|DAKHIL|ALIM)\b")
+_DEGREE_TITLE = re.compile(r"(?i)degree|diploma|bachelor|master|university")
+
+
+def board_paper(unit: Optional[DocUnit], pages: Sequence[PageRead] = (), run_page: Optional[int] = None) -> bool:
+    """Owner 28 Oct ("board papers md. is fine, no fail for that"): an education board's SSC / HSC certificate or
+    transcript (the madrasah Dakhil = SSC and Alim = HSC; JSC / JDC too) is left out of the dot rule; its letters stay
+    strict. A university degree paper is not a board paper. By the academic unit's level, else its title, else the
+    page's own text (a board's name or examination, and no university word)."""
+    if unit is None or unit.key != "academic":
         return False
-    if ref.any_order:                                  # the reference IS the MRZ (a machine read)
+    lv = (unit.level or "").upper()
+    if lv in ("HSC", "SSC"):
+        return True
+    if lv in ("DEGREE", "DIPLOMA"):
+        return False
+    title = (unit.title or "").upper()
+    if _BOARD_TITLE.search(title) and not _DEGREE_TITLE.search(title):
+        return True
+    if _DEGREE_TITLE.search(title):
+        return False
+    idx = [run_page] if (run_page is not None and 0 <= run_page < len(pages)) else list(unit.pages)
+    text = "\n".join(pages[i].text for i in idx if 0 <= i < len(pages))
+    return bool(_BOARD_TEXT.search(text)) and not _UNIVERSITY_TEXT.search(text)
+
+
+BOARD_DOTS_NOTE = "board papers' dots not judged (owner rule 28 Oct)"
+
+
+# ============================================================================ the closer look, as evaluate uses it
+class _Looks:
+    """The closer look (owner 28 Oct) as names.evaluate asks it, or, with a plain test confirmer (page, variant) ->
+    "confirmed" | "refuted" | "unclear", the legacy re-read mapped onto it ("confirmed" -> the page prints the
+    variant, "refuted" -> it prints the reference)."""
+
+    def __init__(self, confirm: Callable) -> None:
+        self.c = confirm
+        self.closer = bool(getattr(confirm, "closer", False))
+
+    def var(self, page: int, reference: "strict.Name", variant: str) -> str:
+        """Which spelling the variant's own page prints: "same" (the reference) | "differs" | "unclear"."""
+        if page is None or page < 0:
+            return "unclear"
+        fn = getattr(self.c, "pair", None)
+        if callable(fn):
+            return fn(page, _as_text(reference), variant)
+        try:
+            ans = self.c(page, variant)
+        except TypeError:
+            ans = "unclear"
+        return {"confirmed": "differs", "refuted": "same"}.get(ans, "unclear")
+
+    def ref(self, page: Optional[int], reference: "strict.Name", variant: str) -> Optional[str]:
+        """Which spelling the REFERENCE's own page prints (closer mode only; None: no look possible)."""
+        if not self.closer or page is None or page < 0:
+            return None
+        return self.c.pair(page, _as_text(reference), variant)
+
+    def prints(self, page: Optional[int], reference: "strict.Name") -> str:
+        """Closer mode only: does the page print the reference itself (searched for on the page, verified against
+        the recogniser's own reading)? "same" | "differs" | "unclear" | "" (no look)."""
+        if not self.closer or page is None or page < 0:
+            return ""
+        fn = getattr(self.c, "look", None)
+        res = fn(page, [_as_text(reference)], "name") if callable(fn) else None
+        return res.decision if res is not None else "unclear"
+
+    def dots(self, page: int, candidates: Sequence[str]) -> Optional[Any]:
+        """A closer look of kind "dots" (closer mode only): the Look, or None."""
+        if not self.closer or page is None or page < 0:
+            return None
+        fn = getattr(self.c, "look", None)
+        return fn(page, list(candidates), "dots") if callable(fn) else None
+
+
+def _as_text(name: "strict.Name") -> str:
+    return name if isinstance(name, str) else " ".join(name)
+
+
+LOOK_PAGES = 3             # pages of one document a variant spelling is looked at on
+
+
+def _combined(answers: Sequence[str]) -> str:
+    """The closer looks on the pages of ONE document that read the same variant: "differs" when any page prints the
+    variant (the document prints it), "same" when every page prints the reference (a misread), else "unclear";
+    "" when no look was taken."""
+    got = [a for a in answers if a]
+    if not got:
+        return ""
+    if "differs" in got:
+        return "differs"
+    if all(a == "same" for a in got):
+        return "same"
+    return "unclear"
+
+
+def set_dots(template: str, pattern: Sequence[int]) -> str:
+    """`template` (a name as written) with its dots replaced by `pattern` (letter counts a dot follows)."""
+    want = set(pattern)
+    out, n = [], 0
+    for ch in template:
+        if ch == ".":
+            continue
+        out.append(ch)
+        if re.match(r"[A-Za-z0-9|]", ch):
+            n += 1
+            if n in want:
+                out.append(".")
+    return re.sub(r"\.(?=\S)", ". ", "".join(out)).strip()
+
+
+def _in_order_of(ref: "strict.Name", variant: str) -> str:
+    """The reference's words in the variant's order (a card's MRZ line prints the surname first): each variant word
+    takes the closest unused reference word (a description of order only; the letters stay the reference's)."""
+    rw, vw = list(strict.words(ref)), list(strict.words(variant))
+    out, rest = [], list(rw)
+    for v in vw:
+        if not rest:
+            break
+        w = min(rest, key=lambda z: edit_distance(z, v))
+        out.append(w)
+        rest.remove(w)
+    return " ".join(out + rest)
+
+
+def _ref_page(ident: Identity, person: str, ref: "_Ref") -> Optional[int]:
+    nref = getattr(ident, person, None)
+    pg = [i for i in (getattr(nref, "pages", ()) or ()) if isinstance(i, int) and i >= 0]
+    return pg[-1] if (person == "student" and pg) else (pg[0] if pg else None)
+
+
+def _machine_supports(person: str, ref: "_Ref", ident: Identity, machine: Sequence[MachineRead]) -> bool:
+    """A machine read of the person (a birth / board QR; the passport MRZ for the student) prints the reference's
+    letters (any order, dots aside): an independent read of the reference spelling."""
+    if not strict.letters(ref.name):
+        return False
+    if ref.any_order:
         return True
     for m in machine:
-        if (m.person == person and strict.letters(m.name)
-                and strict.compare(ref.name, m.name, any_order=True, dots=False) == "EQUAL"):
+        if m.person == person and strict.letters(m.name) and \
+                strict.compare(ref.name, m.name, any_order=True, dots=False) == "EQUAL":
             return True
     nref = getattr(ident, person, None)
-    if (person == "student" and nref is not None and nref.parts and str(nref.source or "").startswith("passport MRZ")
-            and strict.compare(ref.name, tuple(nref.parts), any_order=True, dots=False) == "EQUAL"):
-        return True
-    own = set(getattr(nref, "pages", ()) or ())
-    nw = len(strict.words(ref.name))
-    for r in reads:
-        if (r.person != person and r.person not in _NEUTRAL) or (r.unit == ref.unit and (r.page in own or not own)):
-            continue
-        mo = r.src in _MACHINE_ORDER
-        if _run_at(target, r.win, any_order=mo, nwords=nw) and judge_read(ref.name, r, any_order=mo).status == "MATCH":
-            return True
-    return any(p == person and uid != ref.unit and strict.letters(w) == target for p, uid, w, _ in extra_reads)
-
-
-def _outvoted(person: str, ref: "_Ref", ident: Identity, reads: Sequence[Read], machine: Sequence[MachineRead],
-              extra_reads: Sequence[Tuple[str, str, str, int]], staged: Sequence[Tuple["NameFinding", Dict[str, Any], bool]],
-              ref_seen: Iterable[str], order: Dict[str, int]) -> Optional[Dict[str, Any]]:
-    """Revision 2.3 (owner A1; folder 3): the reference read from ONE document is outvoted when two or more other
-    documents agree with each other, letter for letter, on one spelling it does not have, no other document
-    prints the reference, no other confirmed spelling stands against them, and no independent read confirms the
-    reference (ref_independently_confirmed). Returns {"letters", "written", "units"} of the agreeing spelling, or
-    None (the reference stands; a confirmed difference from it is FAIL as before)."""
-    if not staged or set(ref_seen) - {ref.unit}:
-        return None
-    if ref_independently_confirmed(person, ref, ident, reads, machine, extra_reads):
-        return None
-    by: Dict[str, Dict[str, Any]] = {}
-    for nf, g, _cov in sorted(staged, key=lambda x: bool(x[1].get("mrz"))):     # printed reads first
-        e = by.get(g["letters"])
-        if e is None and g.get("mrz"):                 # a card's MRZ line (surname first) agrees in any order
-            e = next((x for x in by.values() if same_spelling(x["written"], nf.variant, True)), None)
-        if e is None:
-            e = by.setdefault(g["letters"], {"letters": g["letters"], "written": nf.variant, "units": []})
-        if nf.unit not in e["units"]:
-            e["units"].append(nf.unit)
-    top = max(len(e["units"]) for e in by.values())
-    best = [e for e in by.values() if len(e["units"]) == top]
-    if top < 2 or len(best) != 1:
-        return None
-    best = best[0]
-    for nf, g, _cov in staged:                         # the other documents must agree with each other
-        if (not same_spelling(best["written"], nf.variant, bool(g.get("mrz"))) and nf.confirmed
-                and not nf.contradicted and nf.reread != "refuted"):
-            return None
-    best["units"].sort(key=lambda u: order.get(u, 10 ** 6))
-    return best
+    return bool(person == "student" and nref is not None and nref.parts and ident.name_trusted
+                and str(nref.source or "").startswith("passport MRZ")
+                and strict.compare(ref.name, tuple(nref.parts), any_order=True, dots=False) == "EQUAL")
 
 
 def same_spelling(written: str, variant: str, machine_order: bool = False) -> bool:
@@ -1934,18 +2122,48 @@ def _reread_text(confirm: Callable, page: int, variant: str) -> str:
         return ""
 
 
+def _wrap_choice(ref: "strict.Name", r: "Read", any_order: bool) -> "Read":
+    """Owner checker 28 Oct: a family-table row whose name cell may wrap carries the candidate second line in
+    `r.wrap`. The second line is taken into the name only on name-like evidence: with it the read IS the reference,
+    or without it the read is the reference minus its last word(s) and the second line is within OCR distance of
+    those words (the closer look then decides). An address word wrapped under a one-word name is never taken."""
+    if not r.wrap:
+        return r
+    ext = Read(r.person, tuple(r.parts) + tuple(nt(w) for w in r.wrap if nt(w)), r.doc, r.src, r.page,
+               tuple(r.win) + tuple(nt(w) for w in r.wrap if nt(w)), r.raw, r.unit,
+               (r.written + " " + " ".join(r.wrap)).strip(), tuple(r.win_raw) + tuple(w for w in r.wrap if nt(w)))
+    if judge_read(ref, ext, any_order).status == "MATCH":
+        return ext
+    if judge_read(ref, r, any_order).status == "MATCH":
+        return r
+    rw = [strict.letters(x) for x in strict.words(ref)]
+    vw = [strict.letters(x) for x in strict.words(r.written)]
+    if 0 < len(vw) < len(rw) and rw[:len(vw)] == vw:
+        dropped = "".join(rw[len(vw):])
+        got = "".join(strict.letters(w) for w in r.wrap)
+        if got and abs(len(got) - len(dropped)) <= 2 and edit_distance(got, dropped) <= max(1, len(dropped) // 3):
+            return ext
+    return r
+
+
 def evaluate(ident: Identity, units: List[DocUnit], pages: List[PageRead], aff: AffidavitInfo,
              machine: List[MachineRead], births: Dict[Tuple[int, ...], BirthFacts],
              confirm: Callable[[int, str], str],
              extra_reads: Sequence[Tuple[str, str, str, int]] = ()) -> NamesResult:
-    """The A1 letters rule and the A2 dot rule for the student, the father and the mother, document by
-    document (RUNNER_SPEC 5.9.1 steps 1-5). Bank and trade-licence units produce no finding here; their
-    `extra_reads` (person, uid, written, run page) enter the dot rule only."""
+    """The A1 letters rule and the A2 dot rule for the student, the father and the mother, document by document
+    (RUNNER_SPEC 5.9.1 steps 1-5; owner 28 Oct). Before any difference becomes a finding the closer look checks BOTH
+    sides: the variant's own page (the reference printed there: a misread, no difference) and the reference's own
+    page (the reference printed there: the reference is supported). A FAIL needs the variant supported on its page
+    (or two pages / a machine read agreeing, the look not saying "same") AND the reference supported, and no affidavit
+    covering it; anything unclear is FLAG "check by eye". No outvote: other documents never decide a spelling.
+    Board papers' dots are left out of the dot rule (owner 28 Oct). Bank and trade-licence units produce no finding
+    here; their `extra_reads` (person, uid, written, run page) enter the dot rule only."""
     confirm = confirm or _unclear
+    looks = _Looks(confirm)
     reads, _ = collect_reads(units, pages, births)
-    vocab, _ = collect_reads(units, pages, births, money=True)   # rev 2.3: reads that may print a reference
     order = {u.uid: n for n, u in enumerate(units)}
     title = {u.uid: u.title for u in units}
+    by_uid = {u.uid: u for u in units}
     per_unit: Dict[str, List[Finding]] = collections.defaultdict(list)
     summary: List[Finding] = []
     per_person: Dict[str, str] = {}
@@ -1955,6 +2173,9 @@ def evaluate(ident: Identity, units: List[DocUnit], pages: List[PageRead], aff: 
 
     def aff_state(cov: bool, noise: bool) -> str:
         return "covered" if cov else "covered-up-to-noise" if noise else "not-covered" if has_aff else "no-affidavit"
+
+    def board(uid: str, page: Optional[int] = None) -> bool:
+        return board_paper(by_uid.get(uid), pages, page)
 
     for person in PEOPLE:
         ref = _reference(ident, person)
@@ -1967,31 +2188,40 @@ def evaluate(ident: Identity, units: List[DocUnit], pages: List[PageRead], aff: 
                                    SOURCE))
             per_person[person] = FLAG
             continue
+        ref_pg = _ref_page(ident, person, ref)
+        ref_text = ref.written if (ref.written and strict.letters(ref.written)) else ref.display
         nfs: List[NameFinding] = []
         letters_ok: Dict[str, List[Tuple[str, int]]] = collections.defaultdict(list)
         compared = set()
-        staged: List[Tuple[NameFinding, Dict[str, Any], bool]] = []   # judged differences, emitted after the loop
-        unread_staged: List[Tuple[str, NameFinding, Finding]] = []    # rev 2.4: "not compared" FLAGs, after the loop
         ref_seen: Set[str] = set()              # other documents with a read of the reference's letters
         uids = sorted({r.unit for r in reads if r.person == person} |
                       {m.unit for m in machine if m.person == person}, key=lambda u: order.get(u, 10 ** 6))
+        machine_ok = _machine_supports(person, ref, ident, machine)
+        for r in reads:                         # every other document that prints the reference's letters
+            if r.person == person and r.unit != ref.unit and r.unit in order and r.src not in _MACHINE_ORDER:
+                if judge_read(ref.name, _wrap_choice(ref.name, r, ref.any_order), ref.any_order).status == "MATCH":
+                    ref_seen.add(r.unit)
         for uid in uids:
             if uid == ref.unit or uid not in order:
                 continue
-            js = [judge_read(ref.name, r, ref.any_order or r.src in _MACHINE_ORDER)
-                  for r in reads if r.person == person and r.unit == uid]
+            js = []
+            for r in reads:
+                if r.person != person or r.unit != uid:
+                    continue
+                mo = ref.any_order or r.src in _MACHINE_ORDER
+                js.append(judge_read(ref.name, _wrap_choice(ref.name, r, mo), mo))
             ms = [m for m in machine if m.person == person and m.unit == uid and strict.letters(m.name)]
             m_match = [m for m in ms if strict.compare(ref.name, m.name, any_order=True, dots=False) == "EQUAL"]
             m_diff = [m for m in ms if m not in m_match]
             match = [j for j in js if j.status == "MATCH"]
             diff = [j for j in js if j.status == "DIFF"]
-            # A1 confirmation for the two unsure shapes: a value that ADDS words other than an honorific to the
-            # name (whole-page OCR runs a misread label, a table's district or the next field's words, or Bangla
-            # text read as Latin, on before or after it: 124 such FLAGs on the corpus, nearly all of them OCR) and
-            # a value too unlike the name to line up with it (a misparsed label). Each is a difference only when
-            # two reads agree on it: another page of the document or, for added words, the zoomed re-read.
-            # Otherwise the added-words read counts as the name inside it, and the unlike value as not read (a
-            # NOTE names it). An added honorific (MD, MST) is always a difference (A1).
+            # A value that ADDS words other than an honorific (whole-page OCR runs a label, a district, the next field
+            # or Bangla text read as Latin on around a name) read on ONE page is looked at closer on that page: only
+            # a look that shows the reference ("same": the added words are not printed with the name) makes it the
+            # name inside it. "differs" keeps the difference (confirmed); "unclear" or no look keeps it unconfirmed,
+            # so it is FLAG "check by eye", never PASS (rev 2.6, checker: Q18 used to count an unclear look as the
+            # same name, and an added BEGUM or KHATUN in a script print passed). Two pages reading it: a difference.
+            # A value too unlike the name to line up with it is "not compared" (FLAG).
             keep_d: List[ReadResult] = []
             unread: List[ReadResult] = []
             for j in diff:
@@ -2000,44 +2230,56 @@ def evaluate(ident: Identity, units: List[DocUnit], pages: List[PageRead], aff: 
                     continue
                 lk = strict.letters(j.written)
                 pgs = {x.read.page for x in diff if (x.added or x.loose) and strict.letters(x.written) == lk}
-                ok = len(pgs) >= 2
-                if not ok and j.added:
-                    ans = (confirm(j.read.page, j.written, reference=ref.display) if isinstance(confirm, Confirmer)
-                           else confirm(j.read.page, j.written))
-                    ok = ans == "confirmed"
-                    if ans:
+                if j.added and len(pgs) < 2:
+                    ans = looks.var(j.read.page, j.match_written or ref_text, j.written)
+                    if ans == "same":
                         effects[(j.read.page, strict.form(j.written))] = (
-                            f"names.{person} {'difference kept' if ok else 'added words not confirmed: same name'}")
-                if ok:
+                            f"names.{person} added words not printed with the name: same name (closer look)")
+                        match.append(ReadResult(j.read, "MATCH", tuple(strict.words(j.match_written)),
+                                                j.match_written, "EQUAL"))
+                        continue
+                    effects[(j.read.page, strict.form(j.written))] = (
+                        f"names.{person} {'difference kept' if ans == 'differs' else 'added words unclear: kept (check by eye)'}")
                     keep_d.append(j)
-                elif j.added:
-                    match.append(ReadResult(j.read, "MATCH", tuple(strict.words(j.match_written)), j.match_written,
-                                            "EQUAL"))
+                elif j.added or len(pgs) >= 2:
+                    keep_d.append(j)
                 else:
                     unread.append(j)
             diff = keep_d
-            # A value too unlike the name, read once: not compared, so "check by eye" (FLAG), never PASS (A1);
-            # it is not FAIL either (a misparsed label reads like this). No FLAG when another read of this
-            # document shows the name.
-            for j in (unread[:1] if not match else []):
+            for j in (unread[:1] if not (match or diff) else []):     # another read of this document names it
+                # owner 28 Oct: before a "not compared" FLAG the closer look searches the page for the reference
+                # itself; found clearly ("same"), the label's read was a misparse and the document prints the name
+                if looks.prints(j.read.page, ref_text) == "same":
+                    effects[(j.read.page, strict.form(ref_text))] = (f"names.{person} label misread: the closer look "
+                                                                     f"finds the name on the page")
+                    ref_seen.add(uid)
+                    compared.add(uid)
+                    continue
                 why_u = (f"{_WHO[person]} name was not compared here: the label on "
                          f"{_pages_text(pages, [j.read.page])} reads {j.written}, a single read too unlike "
                          f"{ref.display} to be that name — check by eye")
-                # rev 2.4: emitted after the outvote (below): no FLAG when this document's other read shows the
-                # spelling the other documents agree on (that read is the name)
-                unread_staged.append((uid, NameFinding(person, uid, j.read.page, j.written, "UNREAD", FLAG, why_u,
-                                                       False, False, aff_state(False, False), "", (j.read.page,)),
-                                      Finding(FLAG, f"names.{person}_unread", why_u, SOURCE,
-                                              (_p1(pages, j.read.page),), {"person": person, "variant": j.written})))
+                nfs.append(NameFinding(person, uid, j.read.page, j.written, "UNREAD", FLAG, why_u, False, False,
+                                       aff_state(False, False), "", (j.read.page,)))
+                per_unit[uid].append(Finding(FLAG, f"names.{person}_unread", why_u, SOURCE,
+                                             (_p1(pages, j.read.page),), {"person": person, "variant": j.written}))
             if match:      # a card's MRZ name line (30 characters, OCR'd) only supports a printed name read;
                 # a label value too unlike the name to line up with it is a misparse when the name is printed
                 diff = [j for j in diff if j.read.src not in _MACHINE_ORDER and not j.loose]
+            elif any(j.added and not j.loose for j in diff):
+                # rev 2.6 (takeover): an added-word read the look did not settle is kept as a difference (FLAG), but
+                # it still shows the reference's letters as a run in the value: the document names the person there,
+                # so a label value too unlike the name is a misparse here too (before rev 2.6 that read became a
+                # match and dropped it; without this a misparse read on two pages became a false FAIL, corpus S174)
+                diff = [j for j in diff if not j.loose]
             if not (match or diff or ms):
                 continue
             compared.add(uid)
             contradicted = bool(match or m_match)
             if contradicted:
-                ref_seen.add(uid)                       # another document prints the reference (rev 2.3)
+                ref_seen.add(uid)
+            for j in match:
+                if j.read.src not in _MACHINE_ORDER:        # an MRZ line has no dots
+                    letters_ok[uid].append((j.written, j.read.page))
             groups: List[Dict[str, Any]] = []
             for j in diff:
                 lk = strict.letters(j.written)
@@ -2055,16 +2297,9 @@ def evaluate(ident: Identity, units: List[DocUnit], pages: List[PageRead], aff: 
                           if strict.compare(g["written"], m.name, any_order=True, dots=False) == "EQUAL"), None)
                 if g is None:
                     g = {"letters": strict.letters(m.name), "written": m.name, "pages": set(), "machine": [],
-                         "variant": strict.words(m.name)}
+                         "variant": strict.words(m.name), "reads": [], "mrz": False}
                     groups.append(g)
                 g["machine"].append(m)
-            if not groups:
-                if match or m_match:
-                    ref_seen.add(uid)
-                for j in match:
-                    if j.read.src not in _MACHINE_ORDER:        # an MRZ line has no dots
-                        letters_ok[uid].append((j.written, j.read.page))
-                continue
             for g in groups:
                 v = g["written"]
                 kind = strict.compare(ref.name, v, any_order=ref.any_order or bool(g["machine"] and not g["pages"]),
@@ -2073,16 +2308,33 @@ def evaluate(ident: Identity, units: List[DocUnit], pages: List[PageRead], aff: 
                     continue
                 vpages = sorted(g["pages"])
                 vpage = vpages[0] if vpages else g["machine"][0].page
-                conf_v = bool(g["machine"]) or (len(vpages) >= 2 and kind != "OCR")
-                reread = ""
-                if not conf_v and not contradicted and vpages:
-                    reread = (confirm(vpages[0], v, reference=ref.display) if isinstance(confirm, Confirmer)
-                              else confirm(vpages[0], v))
-                    if reread == "confirmed":
-                        conf_v = True
+                machine_v = bool(g["machine"])
+                # 1. the closer look on the variant's own page(s): do they print the reference? (a misread)
+                ref_on_var = _in_order_of(ref_text, v) if g.get("mrz") else ref_text
+                var_looks = [looks.var(p, ref_on_var, v) for p in vpages[:LOOK_PAGES if looks.closer else 1]]
+                var_look = _combined(var_looks)
+                if var_look == "same" and not machine_v and looks.closer:
+                    for p in vpages[:LOOK_PAGES]:
+                        effects[(p, strict.form(v))] = f"names.{person} misread corrected by closer look"
+                    for w, pg in g.get("reads") or ():
+                        letters_ok[uid].append((w, pg, "letters-corrected"))     # type: ignore[arg-type]
+                    ref_seen.add(uid)
+                    continue
+                # two pages of the document agreeing count as ONE confirmation only when no closer look on them
+                # shows the reference (owner 28 Oct)
+                conf_v = (machine_v or var_look == "differs"
+                          or (len(vpages) >= 2 and kind != "OCR" and "same" not in var_looks))
+                # 2. the closer look on the reference's own page (closer mode): is the reference printed there?
+                ref_look = looks.ref(ref_pg, ref_text, v) if not ref.any_order else None
+                if looks.closer:
+                    ref_ok = (ref_look == "same" or
+                              (ref_look in (None, "unclear") and (machine_ok or bool(ref_seen - {uid}))))
+                    both = conf_v and ref_ok
+                else:                                          # legacy re-read (tests): the revision 2.4 rule
+                    ref_ok = bool(ref.confirmed)
+                    both = conf_v and ref_ok and not contradicted and var_look != "same"
                 cov = covered(aff, ref.name, v)
                 noise = (not cov) and covered_by_noise(aff, ref.name, v)
-                both = conf_v and ref.confirmed and not contradicted and reread != "refuted"
                 where = _pages_text(pages, vpages or [vpage])
                 if person == "student" and ident.student.truncated and ref.any_order and _extends(ref.name, v):
                     verdict = FLAG
@@ -2102,13 +2354,20 @@ def evaluate(ident: Identity, units: List[DocUnit], pages: List[PageRead], aff: 
                                   f"{ref.source}; the affidavit covers both spellings")
                     else:
                         why = []
-                        if reread == "refuted":
+                        if looks.closer and var_look == "unclear":
+                            why.append(f"the closer look on {where} could not tell {v} from {ref.display}")
+                        elif not looks.closer and var_look == "same":
                             why.append(f"a closer read shows {ref.display} — probably OCR")
-                        elif contradicted:
+                        elif not looks.closer and contradicted:
                             why.append(f"another read of this document shows {ref.display} — probably OCR")
+                        if looks.closer and ref_look == "differs":
+                            why.append(f"the closer look on the {ref.source} shows {v} there too, so the "
+                                       f"{ref.source}'s own read may be the misread")
+                        elif looks.closer and conf_v and not ref_ok:
+                            why.append(f"the closer look on the {ref.source} could not confirm {ref.display}")
                         if noise:
                             why.append("the affidavit names it, but only as OCR read it")
-                        if conf_v and not ref.confirmed and not contradicted:
+                        if not looks.closer and conf_v and not ref.confirmed and not contradicted:
                             why.append(f"the {ref.source} reading itself is a single read")
                         if tail_hit:
                             why.append(f"the {ref.source}'s read goes on with {' '.join(ref.tail)} too, but no "
@@ -2119,76 +2378,24 @@ def evaluate(ident: Identity, units: List[DocUnit], pages: List[PageRead], aff: 
                                        f"{' '.join(ref.tail)}, which no second read shows")
                         reason = (f"{_WHO[person]} name reads {v} here but {ref.display} on the {ref.source} — "
                                   f"check by eye, {where}" + (f" ({'; '.join(why)})" if why else ""))
+                reread = var_look if looks.closer else {"differs": "confirmed", "same": "refuted"}.get(var_look,
+                                                                                                    var_look)
                 nf = NameFinding(person, uid, vpage, v, kind, verdict, reason, conf_v, contradicted,
-                                 aff_state(cov, noise), reread, tuple(vpages or [vpage]))
-                staged.append((nf, g, cov))
-        # ---- revision 2.3 (owner A1: BOTH spellings confirmed for a FAIL): the reference is one document's read.
-        # When two or more other documents agree with each other on one spelling the reference does not have, no
-        # other document prints the reference, and no read independent of the reference's own print confirms it
-        # (a QR / MRZ machine read, another page of its document, another document or account holder), the
-        # reference itself is in doubt: its own zoomed re-read re-reads the same print (owner folder 3: a one-letter
-        # misread repeated by the re-read). ONE FLAG "check by eye" on the reference document; the agreeing
-        # documents get a NOTE (their spelling is not judged against a doubtful read); any other difference is at
-        # most FLAG.
-        outvoted = _outvoted(person, ref, ident, vocab, machine, extra_reads, staged, ref_seen, order)
-        agreeing = ({nf.unit for nf, g, _ in staged if same_spelling(outvoted["written"], nf.variant, bool(g.get("mrz")))}
-                    if outvoted is not None else set())
-        for uid_u, nf_u, f_u in unread_staged:
-            if uid_u in agreeing:
-                continue
-            nfs.append(nf_u)
-            per_unit[uid_u].append(f_u)
-        for nf, g, cov in staged:
-            if outvoted is not None:
-                if same_spelling(outvoted["written"], nf.variant, bool(g.get("mrz"))):
-                    nf.kind = "AGREES"
-                    if nf.verdict != NOTE or not cov:
-                        nf.verdict = NOTE
-                        nf.reason = (f"{_WHO[person]} name is {nf.variant} here ({_pages_text(pages, nf.pages)}), "
-                                     f"as on {len(outvoted['units']) - 1} other document(s); the {ref.source} reads "
-                                     f"{ref.display}, a spelling no independent read confirms — see the "
-                                     f"{ref.source} (check by eye)")
-                    for w, pg in g.get("reads") or ():
-                        letters_ok[nf.unit].append((w, pg))
-                elif nf.verdict == FAIL:
-                    nf.verdict = FLAG
-                    nf.reason = (f"{_WHO[person]} name reads {nf.variant} here but {ref.display} on the "
-                                 f"{ref.source} — check by eye, {_pages_text(pages, nf.pages)} (the {ref.source}'s "
-                                 f"own spelling is not confirmed: other documents read {outvoted['written']})")
-            nfs.append(nf)
-            if nf.reread:
-                effects[(nf.page, strict.form(nf.variant))] = f"names.{person} {nf.verdict}"
-            per_unit[nf.unit].append(Finding(nf.verdict, f"names.{person}", nf.reason, SOURCE,
-                                             tuple(sorted({_p1(pages, i) for i in nf.pages})),
-                                             {"person": person, "variant": nf.variant, "reference": ref.display,
-                                              "reference_source": ref.source, "kind": nf.kind,
-                                              "confirmed": nf.confirmed, "reference_confirmed": ref.confirmed,
-                                              "contradicted": nf.contradicted, "reread": nf.reread,
-                                              "affidavit": nf.affidavit,
-                                              "machine": [m.source for m in g["machine"]]}))
-        if outvoted is not None:
-            rp = tuple(i for i in (getattr(getattr(ident, person, None), "pages", ()) or ()) if isinstance(i, int)
-                       and i >= 0)
-            where_r = f" ({_pages_text(pages, rp)})" if rp else ""
-            docs_txt = ", ".join(title.get(u, u) for u in outvoted["units"])
-            why_r = (f"{_WHO[person]} name reads {ref.display} on the {ref.source}{where_r}, but "
-                     f"{outvoted['written']} on {len(outvoted['units'])} other documents that agree with each other "
-                     f"({docs_txt}); no independent read confirms the {ref.source}'s spelling (its own re-read "
-                     f"re-reads the same print) — check by eye: if it prints {ref.display}, those documents differ "
-                     f"from it")
-            nfs.append(NameFinding(person, ref.unit, rp[0] if rp else -1, ref.display, "REFERENCE", FLAG, why_r,
-                                   bool(ref.confirmed), False, aff_state(False, False), "", rp))
-            if ref.unit in order:
-                per_unit[ref.unit].append(Finding(FLAG, f"names.{person}_reference", why_r, SOURCE,
-                                                  tuple(sorted({_p1(pages, i) for i in rp})),
-                                                  {"person": person, "reference": ref.display,
-                                                   "reference_source": ref.source, "others": outvoted["written"],
-                                                   "units": list(outvoted["units"]), "run_pages": list(rp)}))
-        # ---- the birth certificate's unconfirmed tail (Q19, review 2): the reference is the part another document
-        # also prints, but the certificate's read goes on and no second read (another page, the re-read) shows the
-        # further words. They may be OCR of the Bangla print, or the parent's real last name: an unconfirmed
-        # difference between the birth certificate and every document that stops before them, so "check by eye"
-        # (A1: never a silent PASS). One FLAG, on the birth certificate.
+                                 aff_state(cov, noise), reread or "", tuple(vpages or [vpage]))
+                nfs.append(nf)
+                if var_look:
+                    effects[(nf.page, strict.form(nf.variant))] = f"names.{person} {nf.verdict}"
+                per_unit[nf.unit].append(Finding(nf.verdict, f"names.{person}", nf.reason, SOURCE,
+                                                 tuple(sorted({_p1(pages, i) for i in nf.pages})),
+                                                 {"person": person, "variant": nf.variant, "reference": ref.display,
+                                                  "reference_source": ref.source, "kind": nf.kind,
+                                                  "confirmed": nf.confirmed, "reference_confirmed": bool(ref_ok),
+                                                  "contradicted": nf.contradicted, "reread": nf.reread,
+                                                  "closer_variant": var_look, "closer_reference": ref_look or "",
+                                                  "affidavit": nf.affidavit,
+                                                  "machine": [m.source for m in g["machine"]]}))
+        # ---- the birth certificate's unconfirmed tail (Q19): identity's closer look could not tell whether the
+        # further words are printed. One FLAG on the birth certificate (A1: never a silent PASS).
         if ref.tail:
             rp = tuple(i for i in (getattr(getattr(ident, person, None), "pages", ()) or ()) if isinstance(i, int)
                        and i >= 0)
@@ -2204,133 +2411,37 @@ def evaluate(ident: Identity, units: List[DocUnit], pages: List[PageRead], aff: 
                                                   tuple(sorted({_p1(pages, i) for i in rp})),
                                                   {"person": person, "reference": ref.display,
                                                    "tail": list(ref.tail), "run_pages": list(rp)}))
-        # ---- A2: the dot rule over the documents whose letters equal the reference's (revision 2.3: when the
-        # reference is outvoted, over the documents that agree with each other, with no dot reference)
-        target = outvoted["letters"] if outvoted is not None else strict.letters(ref.name)
+        # ---- A2: the dot rule over the documents whose letters equal the reference's
+        target = strict.letters(ref.name)
         for p, uid, written, page in extra_reads:
             if p == person and uid in order and uid != ref.unit and strict.letters(written) == target \
-                    and not any(nf.unit == uid and nf.kind != "AGREES" for nf in nfs):
+                    and not any(nf.unit == uid for nf in nfs):
                 letters_ok[uid].append((written, page))
                 compared.add(uid)
-        dot_ref = (ref.written if (outvoted is None and ref.written and strict.letters(ref.written) == target)
-                   else None)
-        entries = {uid: list(rs) for uid, rs in letters_ok.items() if rs}
-        every = {strict.dot_pattern(w) for rs in entries.values() for w, _ in rs}
-        # a read that ran two letters together where ANY spelling (the reference or another document) has a
-        # dot cannot show that dot either way: not on a document, and not on the passport itself
-        dot_pos = set(strict.dot_pattern(dot_ref)) if dot_ref else set()
-        for rs in entries.values():
-            for w, _ in rs:
-                dot_pos |= set(strict.dot_pattern(w))
-        glued = {uid: any(glued_at(w, dot_pos) for w, _ in rs) for uid, rs in entries.items()}
-        ref_glued = bool(dot_ref) and glued_at(dot_ref, dot_pos)
-        dot_judge = None if ref_glued else dot_ref
-        rereads_of: Dict[str, str] = {}
-        if len(every) > 1:
-            for uid, rs in entries.items():
-                pats = {strict.dot_pattern(w) for w, _ in rs}
-                if len(pats) == 1 and len({pg for _, pg in rs}) >= 2 and not glued[uid]:
-                    continue                                   # confirmed by two pages
-                if len(pats) != 1:
-                    continue                                   # the document disagrees with itself: FLAG
-                w0, pg0 = rs[0]
-                ans = confirm(pg0, w0)
-                if ans == "confirmed" and glued[uid]:
-                    ans = "unclear"                            # the re-read glues the letters the same way
-                rereads_of[uid] = ans
-                if ans == "confirmed":
-                    rs.append((w0, pg0))
-                elif ans == "refuted":
-                    seen = _reread_text(confirm, pg0, w0)
-                    rs.append(((seen if seen and strict.letters(seen) == target else dot_ref) or
-                               (w0.replace(".", " ") if "." in w0 else w0 + "."), pg0))
-        others = []
-        for uid, rs in entries.items():
-            pats = [strict.dot_pattern(w) for w, _ in rs]
-            ok = len(set(pats)) == 1 and (len({pg for _, pg in rs}) >= 2 or rereads_of.get(uid) == "confirmed")
-            ok = ok and not glued[uid]
-            others.append((uid, [w for w, _ in rs], ok))
-        out = strict.dot_rule(dot_judge, others)
-        ref_pat = strict.dot_pattern(dot_judge) if dot_judge else None
-        if ref_pat is not None and len(every) == 1 and entries:
-            pat = next(iter(every))
-            if (set(ref_pat) < set(pat) and all(out.get(uid, PASS) == PASS for uid in entries)
-                    and not any(glued.values())):
-                summary.append(Finding(NOTE, "names.assumed_dots",
-                                       f"{_WHO[person][4:]} name has a dot on every other document but not on the "
-                                       f"{'passport' if person == 'student' else ref.source} — taken as OK (A2 "
-                                       f"unstated case, Q13)", SOURCE, (),
-                                       {"person": person, "reference": dot_judge}))
-        for uid, rs in entries.items():         # glued reads that differ from the reference: never PASS (A1)
-            if out.get(uid, PASS) == PASS and glued[uid] and (
-                    ref_pat is None or {strict.dot_pattern(w) for w, _ in rs} != {ref_pat}):
-                out[uid] = FLAG
-        for uid, names_, ok in others:
-            v = out.get(uid, PASS)
-            if v == PASS:
-                continue
-            rs = entries[uid]
-            pg = [g for _, g in rs]
-            spelled = next((w for w, _ in rs if strict.dot_pattern(w) != strict.dot_pattern(dot_ref or "")),
-                           rs[0][0])
-            where = _pages_text(pages, pg)
-            if v == FAIL and dot_ref and covered(aff, dot_ref, spelled):
-                v = NOTE
-                reason = (f"the dots in {_WHO[person][4:]} name differ here ({spelled}, {where}) from the "
-                          f"passport's printed {dot_ref}; the affidavit covers both spellings")
-            elif v == FAIL:
-                reason = (f"the dots in {_WHO[person][4:]} name are mixed across the documents, and this one "
-                          f"({spelled}, {where}) differs from the {'passport' if person == 'student' else ref.source}"
-                          f"'s {dot_ref}; no affidavit covers it")
-            elif dot_ref and all(strict.dot_pattern(w) == strict.dot_pattern(dot_ref) for w, _ in rs):
-                reason = (f"the dots in {_WHO[person][4:]} name here ({spelled}, {where}) follow the "
-                          f"{'passport' if person == 'student' else ref.source}, but another document reads them "
-                          f"differently — check by eye")
-            else:
-                why = []
-                if glued.get(uid):
-                    why.append("the letters run together here, so OCR may have dropped a dot")
-                if ref_glued:
-                    why.append(f"the {'passport' if person == 'student' else ref.source}'s own read runs the "
-                               f"letters together, so its dot is not clear either")
-                if rereads_of.get(uid) == "refuted":
-                    why.append("a closer read shows another dot — probably OCR")
-                reason = (f"the dot in {_WHO[person][4:]} name differs on {where} ({spelled}) — check by eye"
-                          + (f" ({'; '.join(why)})" if why else ""))
-            nf = NameFinding(person, uid, pg[0], spelled, "DOTS", v, reason, ok, False,
-                             "covered" if v == NOTE else ("not-covered" if has_aff else "no-affidavit"),
-                             rereads_of.get(uid, ""), tuple(pg))
-            nfs.append(nf)
-            if rereads_of.get(uid):
-                effects[(pg[0], strict.form(rs[0][0]))] = f"names.{person}_dots {v}"
-            per_unit[uid].append(Finding(v, f"names.{person}_dots", reason, SOURCE,
-                                         tuple(sorted({_p1(pages, i) for i in pg})),
-                                         {"person": person, "spellings": names_, "reference": dot_ref or "",
-                                          "confirmed": ok, "reread": rereads_of.get(uid, "")}))
+        nfs += _dot_rule(person, ref, ref_pg, target, letters_ok, looks, confirm, aff, has_aff, pages, board,
+                         per_unit, summary, effects)
         # ---- the NAMES cross line for this person
         all_nf += nfs
         worst = max((nf.verdict for nf in nfs), key=lambda x: RANK.get(x, 0), default=PASS)
-        if not any(nf.verdict in (FAIL, FLAG, NOTE) for nf in nfs):
+        if not any(nf.verdict in (FAIL, FLAG) or (nf.verdict == NOTE and nf.kind != "BOARD") for nf in nfs):
             n = len(compared) + (1 if ref.unit else 0)
             summary.append(Finding(PASS, f"names.{person}",
                                    f"{_WHO[person][4:]} name is the same on {n} document{'s' if n != 1 else ''}",
-                                   SOURCE, (), {"reference": ref.display, "reference_source": ref.source}))
+                                   SOURCE, (), {"reference": ref.display, "reference_source": ref.source,
+                                                "notes": [nf.reason for nf in nfs if nf.verdict == NOTE]}))
             per_person[person] = PASS
             continue
         bits = []
         for lvl in (FAIL, FLAG, NOTE):
             for nf in nfs:
-                if nf.verdict != lvl or nf.kind == "AGREES":     # rev 2.3: agrees with the other documents
+                if nf.verdict != lvl or nf.kind == "BOARD":
                     continue
                 what = ("dots differ" if nf.kind == "DOTS" else "not compared (a single read unlike the name)"
                         if nf.kind == "UNREAD" else f"the read goes on with {nf.variant[len(ref.display) + 1:]}, "
-                        f"unconfirmed" if nf.kind == "TAIL" else
-                        f"spelling not confirmed ({len(outvoted['units'])} other documents agree on "
-                        f"{outvoted['written']})" if (nf.kind == "REFERENCE" and outvoted is not None)
-                        else "spelled differently")
+                        f"unconfirmed" if nf.kind == "TAIL" else "spelled differently")
                 where_nf = f" ({_pages_text(pages, nf.pages)})" if nf.pages else ""
                 bits.append(f"{what} on {title.get(nf.unit, nf.unit)}{where_nf} [{lvl}]")
-        run_pages = sorted({i for nf in nfs if nf.kind != "AGREES" for i in nf.pages if isinstance(i, int) and i >= 0})
+        run_pages = sorted({i for nf in nfs if nf.verdict != NOTE for i in nf.pages if isinstance(i, int) and i >= 0})
         summary.append(Finding(worst, f"names.{person}", f"{_WHO[person][4:]} name: " + "; ".join(bits), SOURCE,
                                tuple(sorted({_p1(pages, i) for i in run_pages})),
                                {"reference": ref.display, "reference_source": ref.source, "run_pages": run_pages}))
@@ -2348,6 +2459,318 @@ def evaluate(ident: Identity, units: List[DocUnit], pages: List[PageRead], aff: 
             d["effect"] = effects[k]
         rereads.append(d)
     return NamesResult(dict(per_unit), per_person, summary, rereads, all_nf)
+
+
+def _dot_rule(person: str, ref: "_Ref", ref_pg: Optional[int], target: str,
+              letters_ok: Dict[str, List[Tuple]], looks: "_Looks", confirm: Callable, aff: AffidavitInfo,
+              has_aff: bool, pages: List[PageRead], board: Callable[..., bool],
+              per_unit: Dict[str, List[Finding]], summary: List[Finding],
+              effects: Dict[Tuple[int, str], str]) -> List[NameFinding]:
+    """A2 for one person: dots judged against the passport's PRINTED name (a parent: the birth certificate). Each
+    document's dots come from the closer look of kind "dots" (owner 28 Oct) when the reads disagree on a dot; board
+    papers are left out (owner 28 Oct: their dots neither count as mixed nor are compared with the passport)."""
+    nfs: List[NameFinding] = []
+    dot_ref = ref.written if (ref.written and strict.letters(ref.written) == target) else None
+    # board papers: out of the rule; a NOTE where their dots differ from the reference's (or from each other)
+    board_rs: Dict[str, List[Tuple[str, int]]] = {}
+    entries: Dict[str, List[Tuple[str, int, bool]]] = {}
+    for uid, rs in letters_ok.items():
+        for item in rs:
+            w, pg = item[0], item[1]
+            sure = len(item) < 3                    # a read whose letters the closer look corrected: dots unknown
+            if board(uid, pg):
+                board_rs.setdefault(uid, []).append((w, pg))
+            else:
+                entries.setdefault(uid, []).append((w, pg, sure))
+    ref_pat0 = strict.dot_pattern(dot_ref) if dot_ref else None
+    for uid, rs in board_rs.items():
+        pats = {strict.dot_pattern(w) for w, _ in rs}
+        others_pats = {strict.dot_pattern(w) for e in entries.values() for w, _, s in e if s}
+        if (ref_pat0 is not None and pats != {ref_pat0}) or len(pats) > 1 or (others_pats and pats - others_pats):
+            pg = sorted({p for _, p in rs})
+            why = (f"the dots in {_WHO[person][4:]} name here ({rs[0][0]}, {_pages_text(pages, pg)}) are not judged: "
+                   f"{BOARD_DOTS_NOTE}")
+            nfs.append(NameFinding(person, uid, pg[0], rs[0][0], "BOARD", NOTE, why, False, False, "", "", tuple(pg)))
+            per_unit[uid].append(Finding(NOTE, f"names.{person}_dots", why, SOURCE,
+                                         tuple(sorted({_p1(pages, i) for i in pg})),
+                                         {"person": person, "spellings": [w for w, _ in rs], "board_paper": True}))
+    entries = {uid: rs for uid, rs in entries.items() if rs}
+    every = {strict.dot_pattern(w) for rs in entries.values() for w, _, s in rs if s}
+    if looks.closer:
+        return nfs + _dot_rule_closer(person, ref, ref_pg, target, dot_ref, entries, every, looks, aff, has_aff,
+                                      pages, per_unit, summary, effects)
+    # ---- legacy (a plain test confirmer): the revision 2.4 rule on the OCR reads
+    entries2 = {uid: [(w, pg) for w, pg, s in rs if s] for uid, rs in entries.items()}
+    entries2 = {uid: rs for uid, rs in entries2.items() if rs}
+    dot_pos = set(strict.dot_pattern(dot_ref)) if dot_ref else set()
+    for rs in entries2.values():
+        for w, _ in rs:
+            dot_pos |= set(strict.dot_pattern(w))
+    glued = {uid: any(glued_at(w, dot_pos) for w, _ in rs) for uid, rs in entries2.items()}
+    ref_glued = bool(dot_ref) and glued_at(dot_ref, dot_pos)
+    dot_judge = None if ref_glued else dot_ref
+    rereads_of: Dict[str, str] = {}
+    if len(every) > 1:
+        for uid, rs in entries2.items():
+            pats = {strict.dot_pattern(w) for w, _ in rs}
+            if len(pats) == 1 and len({pg for _, pg in rs}) >= 2 and not glued[uid]:
+                continue
+            if len(pats) != 1:
+                continue
+            w0, pg0 = rs[0]
+            ans = confirm(pg0, w0)
+            if ans == "confirmed" and glued[uid]:
+                ans = "unclear"
+            rereads_of[uid] = ans
+            if ans == "confirmed":
+                rs.append((w0, pg0))
+            elif ans == "refuted":
+                seen = _reread_text(confirm, pg0, w0)
+                rs.append(((seen if seen and strict.letters(seen) == target else dot_ref) or
+                           (w0.replace(".", " ") if "." in w0 else w0 + "."), pg0))
+    others = []
+    for uid, rs in entries2.items():
+        pats = [strict.dot_pattern(w) for w, _ in rs]
+        ok = len(set(pats)) == 1 and (len({pg for _, pg in rs}) >= 2 or rereads_of.get(uid) == "confirmed")
+        ok = ok and not glued[uid]
+        others.append((uid, [w for w, _ in rs], ok))
+    out = strict.dot_rule(dot_judge, others)
+    for uid, rs in entries2.items():
+        ref_pat = strict.dot_pattern(dot_judge) if dot_judge else None
+        if out.get(uid, PASS) == PASS and glued[uid] and (
+                ref_pat is None or {strict.dot_pattern(w) for w, _ in rs} != {ref_pat}):
+            out[uid] = FLAG
+    _assumed_note(person, ref, dot_judge, entries2, out, glued, summary)
+    for uid, names_, ok in others:
+        v = out.get(uid, PASS)
+        if v == PASS:
+            continue
+        rs = entries2[uid]
+        why = []
+        if glued.get(uid):
+            why.append("the letters run together here, so OCR may have dropped a dot")
+        if ref_glued:
+            why.append(f"the {'passport' if person == 'student' else ref.source}'s own read runs the "
+                       f"letters together, so its dot is not clear either")
+        if rereads_of.get(uid) == "refuted":
+            why.append("a closer read shows another dot — probably OCR")
+        nfs.append(_dot_finding(person, ref, uid, rs, v, ok, dot_ref, why, aff, has_aff, pages, per_unit,
+                                rereads_of.get(uid, ""), effects))
+    return nfs
+
+
+def _assumed_note(person: str, ref: "_Ref", dot_judge: Optional[str], entries: Dict[str, List[Tuple[str, int]]],
+                  out: Dict[str, str], glued: Dict[str, bool], summary: List[Finding]) -> None:
+    every = {strict.dot_pattern(w) for rs in entries.values() for w, _ in rs}
+    ref_pat = strict.dot_pattern(dot_judge) if dot_judge else None
+    if ref_pat is not None and len(every) == 1 and entries:
+        pat = next(iter(every))
+        if (set(ref_pat) < set(pat) and all(out.get(uid, PASS) == PASS for uid in entries)
+                and not any(glued.values())):
+            summary.append(Finding(NOTE, "names.assumed_dots",
+                                   f"{_WHO[person][4:]} name has a dot on every other document but not on the "
+                                   f"{'passport' if person == 'student' else ref.source} — taken as OK (A2 "
+                                   f"unstated case, Q13)", SOURCE, (),
+                                   {"person": person, "reference": dot_judge}))
+
+
+def _dot_finding(person: str, ref: "_Ref", uid: str, rs: List[Tuple[str, int]], v: str, ok: bool,
+                 dot_ref: Optional[str], why: List[str], aff: AffidavitInfo, has_aff: bool, pages: List[PageRead],
+                 per_unit: Dict[str, List[Finding]], reread: str,
+                 effects: Dict[Tuple[int, str], str]) -> NameFinding:
+    pg = [g for _, g in rs]
+    spelled = next((w for w, _ in rs if strict.dot_pattern(w) != strict.dot_pattern(dot_ref or "")), rs[0][0])
+    where = _pages_text(pages, pg)
+    whose = "passport" if person == "student" else ref.source
+    if v == FAIL and dot_ref and covered(aff, dot_ref, spelled):
+        v = NOTE
+        reason = (f"the dots in {_WHO[person][4:]} name differ here ({spelled}, {where}) from the "
+                  f"passport's printed {dot_ref}; the affidavit covers both spellings")
+    elif v == FAIL:
+        reason = (f"the dots in {_WHO[person][4:]} name are mixed across the documents, and this one "
+                  f"({spelled}, {where}) differs from the {whose}'s {dot_ref}; no affidavit covers it")
+    elif dot_ref and all(strict.dot_pattern(w) == strict.dot_pattern(dot_ref) for w, _ in rs):
+        reason = (f"the dots in {_WHO[person][4:]} name here ({spelled}, {where}) follow the {whose}, but another "
+                  f"document reads them differently — check by eye")
+    else:
+        reason = (f"the dot in {_WHO[person][4:]} name differs on {where} ({spelled}) — check by eye"
+                  + (f" ({'; '.join(why)})" if why else ""))
+    nf = NameFinding(person, uid, pg[0], spelled, "DOTS", v, reason, ok, False,
+                     "covered" if v == NOTE else ("not-covered" if has_aff else "no-affidavit"), reread, tuple(pg))
+    if reread:
+        effects[(pg[0], strict.form(rs[0][0]))] = f"names.{person}_dots {v}"
+    per_unit[uid].append(Finding(v, f"names.{person}_dots", reason, SOURCE,
+                                 tuple(sorted({_p1(pages, i) for i in pg})),
+                                 {"person": person, "spellings": [w for w, _ in rs], "reference": dot_ref or "",
+                                  "confirmed": ok, "reread": reread}))
+    return nf
+
+
+def _reference_places(res: Optional[Any]) -> Optional[str]:
+    """The REFERENCE's own page only (rev 2.5): a dots look that is unclear because the page prints the name in more
+    than one place and one place could not be settled. The spelling the settled places agree on, when they agree
+    (the same spelling and dot) and no place decided otherwise; None otherwise. Never used for a document being
+    judged: there an unsettled place may be the very place that prints the variant."""
+    if res is None or res.decision != "unclear":
+        return None
+    det = getattr(res, "detail", None) or {}
+    ds, best, dots = det.get("place_decisions"), det.get("place_best"), det.get("place_dots")
+    if not ds or not best or not dots or len(ds) != len(best) or len(ds) != len(dots):
+        return None
+    got = [(b, d) for x, b, d in zip(ds, best, dots) if x != "unclear"]
+    if not got or len(set(got)) != 1:
+        return None
+    return got[0][0]
+
+
+DOT_PROBE_MAX = 12         # rev 2.6: dot-probe looks per run (W16), never into the last LOOK_RESERVE looks
+LOOK_RESERVE = 16
+
+
+def dot_places(written: str) -> Tuple[int, ...]:
+    """Letter counts after which a printed dot may stand in a name: after a title or an initial (a word of one or two
+    letters, or an honorific of three or fewer: MD, MST, an A of A K M), never after the last word."""
+    out, n = [], 0
+    ws = strict.words(written)
+    for i, w in enumerate(ws):
+        n += len(strict.letters(w))
+        k = len(strict.letters(w))
+        if i < len(ws) - 1 and 0 < k <= 3 and (k <= 2 or is_honorific(w)):
+            out.append(n)
+    return tuple(out)
+
+
+def _dot_probe(dot_ref: Optional[str], entries: Dict[str, List[Tuple[str, int, bool]]], looks: "_Looks"
+               ) -> Dict[Tuple[int, ...], Tuple[int, str]]:
+    """W16 (rev 2.6): every read shows one dot pattern. Each document (board papers are not in `entries`) whose name
+    has a place for a dot is looked at with the other dots too, until one look sees another pattern with BOTH judges
+    agreeing: the dot's shape measured, and the recogniser's scores on the same side (a decision of its own, or "the
+    dot's shape + the recogniser"; never the shape overriding the recogniser). Returns {pattern: (run page, the form
+    logged)} of what was seen (empty: nothing, or no look possible)."""
+    if not looks.closer:
+        return {}
+    c = looks.c
+    out: Dict[Tuple[int, ...], Tuple[int, str]] = {}
+    for uid, rs in entries.items():
+        sure = [(w, pg) for w, pg, s in rs if s]
+        if not sure:
+            continue
+        w0, pg0 = sure[0]
+        places = set(dot_places(w0))
+        if not places:
+            continue
+        used = int(getattr(c, "dot_probes", 0))
+        if used >= DOT_PROBE_MAX or int(getattr(c, "looks_used", 0)) >= int(getattr(c, "look_budget", LOOK_MAX)) \
+                - LOOK_RESERVE:
+            break
+        try:
+            c.dot_probes = used + 1
+        except AttributeError:
+            pass
+        p0 = set(strict.dot_pattern(w0))
+        alts = []
+        for p in (p0 | places, p0 - places):
+            f = set_dots(w0, sorted(p))
+            if p != p0 and strict.form(f) not in [strict.form(a) for a in alts]:
+                alts.append(f)
+        if not alts:
+            continue
+        res = looks.dots(pg0, [w0] + alts)
+        if res is None or res.decision != "differs":
+            continue
+        seen = set(strict.dot_pattern(res.best))
+        det = getattr(res, "detail", None) or {}
+        differ = set()                     # where the candidates disagree; the look measures the dot at the first
+        for a in alts:
+            differ |= set(strict.dot_pattern(a)) ^ p0
+        first = min(differ) if differ else None
+        if seen == p0 or first is None or res.dot is None or res.dot != (first in seen) \
+                or det.get("by") not in (None, "", "the dot's shape + the recogniser"):
+            continue                       # one judge alone (or the shape overriding the recogniser): not enough
+        seen = tuple(sorted(seen))
+        out[tuple(seen)] = (pg0, strict.form(alts[-1]))
+        break
+    return out
+
+
+def _dot_rule_closer(person: str, ref: "_Ref", ref_pg: Optional[int], target: str, dot_ref: Optional[str],
+                     entries: Dict[str, List[Tuple[str, int, bool]]], every: Set[Tuple[int, ...]], looks: "_Looks",
+                     aff: AffidavitInfo, has_aff: bool, pages: List[PageRead], per_unit: Dict[str, List[Finding]],
+                     summary: List[Finding], effects: Dict[Tuple[int, str], str]) -> List[NameFinding]:
+    """The dot rule with the closer look: when the reads (the reference's included) show more than one dot pattern,
+    every document's dots (and the reference's) are looked at on its page with the patterns seen as candidates; a
+    decided look is the document's confirmed dots, an unclear one leaves its OCR dots unconfirmed (FLAG at most)."""
+    pats = set(every)
+    if dot_ref is not None:
+        pats.add(strict.dot_pattern(dot_ref))
+    nfs: List[NameFinding] = []
+    probed = False
+    if len(pats) <= 1:
+        # rev 2.6 (checker W16): every read shows the same dots, but the recogniser is known to drop a printed dot.
+        # When the name starts with a title or an initial, the documents are looked at for the other dots too; a
+        # dot pattern that the look sees on its own, with both judges (the recogniser and the dot's shape), joins
+        # the rule below like any read. Nothing seen: no finding (an unclear probe adds nothing). What the rule
+        # then finds is FLAG at most: no OCR read shows that dot, so one look against the reads is no confirmed
+        # FAIL (a false PASS is closed; a wrong dot seen by the probe never becomes a hard red).
+        found = _dot_probe(dot_ref, entries, looks)
+        if not found:
+            return nfs
+        probed = True
+        for pat, key in found.items():
+            pats.add(pat)
+            effects[key] = f"names.{person}_dots another dot seen by the dot probe"
+    template = dot_ref or next((w for rs in entries.values() for w, _, _ in rs), "")
+    forms = [set_dots(template, p) for p in sorted(pats)]
+    ref_judge = dot_ref
+    ref_why = ""
+    if dot_ref is not None and ref_pg is not None:
+        res = looks.dots(ref_pg, [dot_ref] + [f for f in forms if strict.form(f) != strict.form(dot_ref)])
+        settled = _reference_places(res)
+        if res is not None and res.decision != "unclear":
+            ref_judge = set_dots(dot_ref, strict.dot_pattern(res.best))
+        elif settled is not None:
+            # rev 2.5: the reference's own page prints the name in more than one place (a passport's Father field
+            # and its emergency contact): the places the look settled agree and none says otherwise
+            ref_judge = set_dots(dot_ref, strict.dot_pattern(settled))
+        elif res is not None:
+            ref_judge, ref_why = None, "the closer look could not tell the passport's dot" if person == "student" \
+                else f"the closer look could not tell the {ref.source}'s dot"
+    others = []
+    looked: Dict[str, str] = {}
+    final: Dict[str, List[Tuple[str, int]]] = {}
+    for uid, rs in entries.items():
+        sure_rs = [(w, pg) for w, pg, s in rs if s]
+        w0, pg0 = (sure_rs or [(rs[0][0], rs[0][1])])[0]
+        cands = [w0] + [f for f in forms if strict.form(f) != strict.form(w0)]
+        res = looks.dots(pg0, cands)
+        if res is not None and res.decision != "unclear":
+            seen = set_dots(w0, strict.dot_pattern(res.best))
+            looked[uid] = "confirmed" if strict.form(seen) == strict.form(w0) else "corrected"
+            final[uid] = [(seen, pg0)]
+            others.append((uid, [seen], True))
+            effects[(pg0, strict.form(cands[-1]))] = f"names.{person}_dots {looked[uid]} by closer look"
+        else:
+            looked[uid] = "unclear" if res is not None else ""
+            final[uid] = sure_rs or [(rs[0][0], rs[0][1])]
+            two = len({pg for _, pg in sure_rs}) >= 2 and len({strict.dot_pattern(w) for w, _ in sure_rs}) == 1
+            others.append((uid, [w for w, _ in final[uid]], two))
+    out = strict.dot_rule(ref_judge, others)
+    _assumed_note(person, ref, ref_judge, final, out, {}, summary)
+    for uid, names_, ok in others:
+        v = out.get(uid, PASS)
+        if v == PASS:
+            continue
+        why = []
+        if looked.get(uid) == "unclear":
+            why.append("the closer look could not tell the dot here")
+        if ref_why:
+            why.append(ref_why)
+        if probed and v == FAIL:
+            v = FLAG
+            why.append("only the closer look's dot probe sees the other dot; no OCR read shows it")
+        nfs.append(_dot_finding(person, ref, uid, final[uid], v, ok, ref_judge or dot_ref, why, aff, has_aff, pages,
+                                per_unit, looked.get(uid, ""), effects))
+    return nfs
 
 
 # ============================================================================ smaller rows

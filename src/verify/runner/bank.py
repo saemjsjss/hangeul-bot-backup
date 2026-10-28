@@ -541,7 +541,8 @@ def _usd_on(text: str, usd_words: Sequence[str]) -> bool:
 
 def check_bank_unit(unit: DocUnit, page_texts: List[str], page_index: List[int], ident: Identity,
                     covered: Callable[[str, str], bool], confirm: Callable[[int, str], str],
-                    solvency_pdf: Callable[[int], Optional[Path]]) -> BankOutcome:
+                    solvency_pdf: Callable[[int], Optional[Path]],
+                    page_image: Optional[Callable[[int], Any]] = None) -> BankOutcome:
     """The bank document's rules, in order (RUNNER_SPEC 5.9.2): bank.solvency_present, bank.holder_read,
     bank.holder_parent (every holder, every joint name), bank.dates, bank.usd, bank.seal.
     page_texts: the unit's page texts; page_index: their 0-based run pages (Finding.pages are 1-based run
@@ -641,31 +642,250 @@ def check_bank_unit(unit: DocUnit, page_texts: List[str], page_index: List[int],
         out.append(Finding(FLAG, "bank.usd", f"no USD equivalent found on the solvency certificate (page "
                                              f"{page_no(run(cert[0]))})", SOURCE, _p1(run(cert[0]))))
 
-    # 6. bank.seal - the solvency page only (critique 15): signature/seal wording, else the seal colour
-    seal_page, how, errors = None, "", []
-    for k in cert:
-        if _SIGNATURE_WORDS.search(texts[k]):
-            seal_page, how = k, "wording"
-            break
-    if seal_page is None and solvency_pdf is not None:
-        for k in cert[:SEAL_PAGES_MAX]:
-            try:
-                pdf = solvency_pdf(run(k))
-                if pdf is not None and bot.PC.seal_present(Path(pdf)):
-                    seal_page, how = k, "seal colour"
-                    break
-            except bot.dv.CODE_FAULTS:
-                raise
-            except Exception as e:                      # an unreadable cut is no seal; said in the evidence
-                errors.append(type(e).__name__)
-    if seal_page is not None:
-        out.append(Finding(PASS, "bank.seal", f"seal or signature on the solvency certificate (page "
-                                              f"{page_no(run(seal_page))})", SOURCE, _p1(run(seal_page)), {"how": how}))
-    else:
-        out.append(Finding(FLAG, "bank.seal", f"no seal or signature found on the solvency certificate (page "
-                                              f"{page_no(run(cert[0]))})", SOURCE, _p1(run(cert[0])),
-                           {"errors": errors} if errors else {}))
+    # 6. bank.seal - the solvency page only (critique 15): a stamp (the seal colour), a handwritten signature (ink
+    # strokes, rev 2.5) or signature/seal wording; the message says what was found
+    out.append(seal_row(cert, texts, run, solvency_pdf, page_image))
     return BankOutcome(out, chain_holder, chain_role, [run(k) for k in sol], False, person_reads)
+
+
+def seal_row(cert: List[int], texts: List[str], run: Callable[[Optional[int]], Optional[int]],
+             solvency_pdf: Optional[Callable[[int], Optional[Path]]],
+             page_image: Optional[Callable[[int], Any]] = None) -> Finding:
+    """bank.seal on the solvency page(s) (critique 15, rev 2.5). Looks for a stamp (page_checks.seal_present on the
+    one-page cut: a violet / red seal colour), a handwritten signature (ink_signatures on the page image) and the
+    printed wording ("signature", "seal", "authorised signatory"). A round stamp's ring seen by its shape (ink_marks)
+    is a stamp too, whatever its colour. Any of them: PASS (spec 5.9.2 "seal or signature"), the message saying what
+    was found ("handwritten signature found, no stamp"); none: FLAG. A signature without a stamp is PASS by the
+    spec's "seal or signature" (owner question listed)."""
+    bot = _bot()
+    errors: List[str] = []
+    found: Dict[str, Any] = {}
+    for k in cert[:SEAL_PAGES_MAX]:
+        stamp, sigs, rings = False, [], []
+        pdf = None
+        try:
+            pdf = solvency_pdf(run(k)) if solvency_pdf is not None else None
+            stamp = bool(pdf is not None and bot.PC.seal_present(Path(pdf)))
+        except bot.dv.CODE_FAULTS:
+            raise
+        except Exception as e:                          # an unreadable cut is no seal; said in the evidence
+            errors.append(type(e).__name__)
+        try:
+            img = page_image(run(k)) if page_image is not None else _render_first(pdf)
+            sigs, rings = ink_marks(img)
+        except bot.dv.CODE_FAULTS:
+            raise
+        except Exception as e:
+            errors.append(type(e).__name__)
+        words = bool(_SIGNATURE_WORDS.search(texts[k]))
+        if stamp or sigs or rings or words:
+            found = {"page": k, "stamp": stamp, "signatures": sigs, "rings": rings, "wording": words}
+            break
+        if not found:
+            found = {"page": cert[0], "stamp": False, "signatures": [], "rings": [], "wording": False}
+    k = found.get("page", cert[0])
+    pn = page_no(run(k))
+    ev: Dict[str, Any] = {"stamp": found.get("stamp", False), "handwritten_signatures": len(found.get("signatures")
+                                                                                            or []),
+                          "signature_boxes": list(found.get("signatures") or [])[:6],
+                          "stamp_rings": len(found.get("rings") or []),
+                          "ring_boxes": list(found.get("rings") or [])[:4],
+                          "wording": found.get("wording", False)}
+    ev["how"] = ", ".join(w for w, on in (("seal colour", ev["stamp"]), ("stamp ring", ev["stamp_rings"]),
+                                          ("ink signature", ev["handwritten_signatures"]),
+                                          ("wording", ev["wording"])) if on)
+    if errors:
+        ev["errors"] = errors
+    n_sig = ev["handwritten_signatures"]
+    sig_txt = ("handwritten signature" if n_sig == 1 else f"{n_sig} handwritten signatures") if n_sig else ""
+    stamp_txt = "stamp" if ev["stamp"] else ("round stamp (its ring's shape)" if ev["stamp_rings"] else "")
+    if stamp_txt and n_sig:
+        msg = f"{stamp_txt} and {sig_txt} found on the solvency certificate (page {pn})"
+    elif stamp_txt:
+        msg = f"{stamp_txt} found on the solvency certificate (page {pn})" + (
+            "" if ev["wording"] else "; no handwritten signature seen")
+    elif n_sig:
+        msg = f"{sig_txt} found, no stamp, on the solvency certificate (page {pn})"
+    elif ev["wording"]:
+        msg = (f"signature / seal wording on the solvency certificate (page {pn}); no stamp or handwritten "
+               "signature seen")
+    else:
+        return Finding(FLAG, "bank.seal", f"no seal or signature found on the solvency certificate (page {pn}) — "
+                                          "neither a stamp nor a handwritten signature", SOURCE, _p1(run(k)), ev)
+    return Finding(PASS, "bank.seal", msg, SOURCE, _p1(run(k)), ev)
+
+
+# --- handwritten signatures (rev 2.5) --------------------------------------------------------------------------
+# Owner folder 9: a solvency certificate signed by hand by two bank officers, with no stamp and no printed
+# "signature" word, got a false "no seal or signature" FLAG (the seal check looks for a stamp's colour only).
+# A handwritten signature is ink drawn in thin, curving, connected strokes: once the page's long straight lines are
+# taken out and the strokes are joined, it is a blob far taller than the printed words around it, with little ink
+# for its box (low fill), lying below the letterhead. Printed words, logos and filled blocks are not.
+SIG_DPI = 150
+SIG_MIN_H = 1.9                # x the page's median printed word height (joined strokes)
+SIG_MIN_W = 2.5
+SIG_FILL = (0.03, 0.26)        # ink pixels / box area: signatures 0.11-0.24 (owner folders), a logo or a filled block more
+SIG_ASPECT = (0.9, 7.0)        # width / height
+SIG_TOP = 0.25                 # the letterhead (logos) is above this share of the page
+SIG_MAX_W = 0.45               # x page width
+SIG_MIN_WORDS = 20             # printed words needed to measure the page's word height
+SIG_MAX_FOUND = 4              # more blobs than this: a noisy scan, not signatures
+
+
+def ink_signatures(img) -> List[Dict[str, Any]]:
+    """Handwritten-signature-like ink blobs on one page image (RGB or BGR uint8, about 150 dpi): [{"box": page
+    fractions, "fill", "height_x": its height / the printed word height, "stroke_x": its longest single pen stroke's
+    height / the word height}]. Long straight lines (table rules, underlines, the signature line itself) are taken
+    out first; blobs of one signature cut apart by a removed line are joined again (_merge_boxes)."""
+    return ink_marks(img)[0]
+
+
+def ink_marks(img) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """(handwritten signatures, round stamps' rings) on one page image (see ink_signatures). A ring is a stamp seen by
+    its shape, whatever its ink colour (a black seal on a copy, which the seal-colour test cannot see)."""
+    hw, rows = _sig_scan(img)
+    out = [r for r in rows if not r["why"]]
+    rings = [r for r in rows if r["why"] == "a stamp's ring"]
+    if len(out) > SIG_MAX_FOUND:             # a noisy scan (a photo, a texture): nothing is trusted
+        return [], []
+    out = _merge_boxes(out, hw)
+    for r in out + rings:
+        r.pop("why", None)
+        r.pop("px", None)
+    return out, rings[:SIG_MAX_FOUND]
+
+
+# The longest connected pen stroke (the blob's largest piece of undilated ink), measured on the owner folders' four
+# solvency certificates at 150 dpi: the six signatures 1.5-4.5 word heights tall, 3.6-7.8 wide, their own fill
+# 0.13-0.24; printed words and name stamps (bold, larger fonts) 0.5-1.5 tall but at most 2.4 wide, or a fill of 0.37+.
+SIG_STROKE_H = 1.4             # x the word height (a printed word, ascender to descender, is ~1)
+SIG_STROKE_W = 2.5
+SIG_STROKE_FILL = 0.27         # that stroke's own ink / its box: a pen line is 0.05-0.25, a bold printed word more
+SIG_RING_HOLE = 0.35           # a round stamp's ring: its inner hole / its box (a signature's loops are small)
+SIG_MERGE_GAP = 1.0            # x the word height: boxes this close are one signature
+
+
+def _sig_scan(img) -> Tuple[float, List[Dict[str, Any]]]:
+    """(the printed word height in pixels, every large joined-ink blob below the letterhead with its measures and
+    "why" it is not a signature ("" when it is one)). Debug and calibration use the rejected rows too."""
+    import cv2
+    import numpy as np
+    if img is None or getattr(img, "ndim", 0) < 2:
+        return 0.0, []
+    grey = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) if img.ndim == 3 else img
+    H, W = grey.shape[:2]
+    thr, _ = cv2.threshold(grey, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    ink0 = (grey < min(float(thr), 170.0)).astype(np.uint8)
+    hk = cv2.getStructuringElement(cv2.MORPH_RECT, (max(15, W // 25), 1))
+    vk = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(15, H // 25)))
+    lines = cv2.morphologyEx(ink0, cv2.MORPH_OPEN, hk) | cv2.morphologyEx(ink0, cv2.MORPH_OPEN, vk)
+    ink = ink0 & (1 - lines)
+    # a pen stroke crossing a removed line (the signature line) is mended for the stroke measure: the line's pixels
+    # right beside the stroke come back, the rest of the line does not
+    mended = ink | (lines & cv2.dilate(ink, np.ones((3, 3), np.uint8), iterations=2))
+    joined = cv2.dilate(ink, np.ones((3, 3), np.uint8), iterations=2)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(joined, 8)
+    lab0 = None                                      # the page's own ink, lines kept: for a stamp's ring
+    # printed words: 0.6-3% of the page's height (about 10-50 px on an A4 page at 150 dpi)
+    hs = [int(st[i, 3]) for i in range(1, n) if max(6.0, H * 0.006) <= st[i, 3] <= H * 0.03 and st[i, 4] >= 30]
+    if len(hs) < SIG_MIN_WORDS:              # no printed text to measure against: nothing is judged
+        return 0.0, []
+    hw = float(np.median(hs))
+    rows: List[Dict[str, Any]] = []
+    for i in range(1, n):
+        x, y, w, h = (int(v) for v in st[i, :4])
+        if h < 1.5 * hw or (y + h / 2) / H < SIG_TOP:
+            continue
+        why = ""
+        if h < SIG_MIN_H * hw or w < SIG_MIN_W * hw:
+            why = "small"
+        elif w > SIG_MAX_W * W or h > 0.2 * H:
+            why = "large"
+        elif not (SIG_ASPECT[0] <= w / max(h, 1) <= SIG_ASPECT[1]):
+            why = "aspect"
+        mine = (lab[y:y + h, x:x + w] == i)
+        fill = float((ink[y:y + h, x:x + w] * mine).sum()) / float(w * h)
+        if not why and not (SIG_FILL[0] <= fill <= SIG_FILL[1]):
+            why = "fill"
+        # the longest single pen stroke: the largest connected piece of the blob's own (undilated, mended) ink
+        part = mended[y:y + h, x:x + w] * mine
+        m, plab, pst, _ = cv2.connectedComponentsWithStats(part.astype(np.uint8), 8)
+        sx = sw = 0.0
+        sfill, hole = 1.0, 0.0
+        if m > 1:
+            j = 1 + int(np.argmax(pst[1:, 4]))
+            px0, py0, pw, ph = (int(v) for v in pst[j, :4])
+            sx, sfill = ph / hw, float(pst[j, 4]) / max(float(pw * ph), 1.0)
+            sw = pw / hw
+            if not why and sx >= SIG_STROKE_H:
+                # a stamp's ring (its top and bottom arcs can go with the removed lines): the page's own ink piece
+                # under the stroke, lines kept; round with one large inner hole = a ring, not a signature
+                if lab0 is None:
+                    _, lab0, st0, _ = cv2.connectedComponentsWithStats(ink0, 8)
+                ys, xs = np.nonzero(plab == j)
+                ids = lab0[ys + y, xs + x]
+                ids = ids[ids > 0]
+                if ids.size:
+                    k0 = int(np.bincount(ids).argmax())
+                    qx, qy, qw, qh = (int(v) for v in st0[k0, :4])
+                    if 0.75 <= qw / max(qh, 1) <= 1.35 and qh >= SIG_MIN_H * hw:
+                        ring = (lab0[qy:qy + qh, qx:qx + qw] == k0).astype(np.uint8)
+                        cnts, hier = cv2.findContours(ring, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+                        if hier is not None:
+                            holes = [cv2.contourArea(c) for c, hh in zip(cnts, hier[0]) if hh[3] >= 0]
+                            hole = max(holes) / float(qw * qh) if holes else 0.0
+        if not why and (sx < SIG_STROKE_H or sw < SIG_STROKE_W):
+            why = "no long stroke"
+        elif not why and sfill > SIG_STROKE_FILL:
+            why = "stroke too solid"
+        elif not why and hole >= SIG_RING_HOLE:
+            why = "a stamp's ring"
+        rows.append({"box": [round(x / W, 3), round(y / H, 3), round((x + w) / W, 3), round((y + h) / H, 3)],
+                     "fill": round(fill, 3), "height_x": round(h / hw, 1), "stroke_x": round(sx, 1),
+                     "stroke_w": round(sw, 1), "stroke_fill": round(sfill, 2), "ring_hole": round(hole, 2), "why": why,
+                     "px": (x, y, w, h, W, H)})
+    return hw, rows
+
+
+def _merge_boxes(rows: List[Dict[str, Any]], hw: float) -> List[Dict[str, Any]]:
+    """Signature blobs closer than SIG_MERGE_GAP word heights are one signature (a pen stroke cut by the removed
+    signature line, or a flourish apart from the name)."""
+    items = [dict(r) for r in rows]
+    gap = SIG_MERGE_GAP * hw
+    changed = True
+    while changed:
+        changed = False
+        for a in range(len(items)):
+            for b in range(a + 1, len(items)):
+                ax, ay, aw, ah, W, H = items[a]["px"]
+                bx, by, bw, bh, _, _ = items[b]["px"]
+                dx = max(0, max(ax, bx) - min(ax + aw, bx + bw))
+                dy = max(0, max(ay, by) - min(ay + ah, by + bh))
+                if dx <= gap and dy <= gap:
+                    x0, y0 = min(ax, bx), min(ay, by)
+                    x1, y1 = max(ax + aw, bx + bw), max(ay + ah, by + bh)
+                    keep = items[a] if items[a]["height_x"] >= items[b]["height_x"] else items[b]
+                    keep = dict(keep, px=(x0, y0, x1 - x0, y1 - y0, W, H),
+                                box=[round(x0 / W, 3), round(y0 / H, 3), round(x1 / W, 3), round(y1 / H, 3)],
+                                height_x=round((y1 - y0) / hw, 1))
+                    items = [it for k, it in enumerate(items) if k not in (a, b)] + [keep]
+                    changed = True
+                    break
+            if changed:
+                break
+    return sorted(items, key=lambda r: (r["box"][1], r["box"][0]))
+
+
+def _render_first(pdf: Optional[Path], dpi: int = SIG_DPI):
+    """Page 1 of a one-page PDF (the solvency cut) as an RGB array, or None."""
+    if pdf is None:
+        return None
+    import numpy as np
+    import pymupdf
+    with pymupdf.open(str(pdf)) as doc:
+        pix = doc[0].get_pixmap(dpi=dpi)
+        a = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+        return a[:, :, :3].copy()
 
 
 def dates_rows(page_texts: List[str], page_index: Optional[Sequence[int]] = None) -> List[Finding]:

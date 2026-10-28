@@ -23,7 +23,7 @@ No personal data: the module holds cue words only.
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from . import botimport, strict
 from .model import PageRead, PageType
@@ -265,10 +265,244 @@ def academic_kind(pt: PageType) -> str:
 
 
 def type_pages(pages: Sequence[PageRead]) -> List[PageType]:
-    """One PageType per run page (index = PageRead.index)."""
+    """One PageType per run page (index = PageRead.index). Rev 2.5: a page whose two best types score the same is
+    settled by its own title, else by its neighbours (break_ties)."""
     out = []
     for p in pages:
         pt = page_features(p.text, p.image_only)
         pt.index = p.index
         out.append(pt)
+    break_ties(out, [p.text for p in pages], [p.file for p in pages])
     return out
+
+
+# ------------------------------------------------------------------------- rev 2.5: pages scanned sideways
+# Board certificates are printed landscape and often scanned on their side (the EAP folder's academic p2 and p5,
+# owner folder 3 p2 and p5). The reader then returns plenty of characters, but junk ("uollejalle Aue Inoylim" is
+# "without any alteration" upside down), so the bot's own rotation retry (only for pages that read almost nothing)
+# never runs, the page types "other" and its names are lost. A page typed "other" whose words are almost never
+# common English / document words is read again turned 90, 270 and 180 degrees; a turned reading that types as a
+# document and reads clearly better replaces it (PageRead.turned, sideways).
+COMMON_WORDS = frozenset("""
+the of and to in is that this for on by with as at from be are was were has have his her he she it its an a or not
+no all any one two three four five six seven eight nine ten first second third year years date day month name names
+father mother son daughter husband wife they them their we you your which who whom whose certify certificate
+certified issued issue under above below following said same such been being will shall may government people
+republic bangladesh board education secondary higher school examination exam college university roll registration
+number serial passed duly group science arts commerce grade point average gpa result results held published
+publication record records recorded birth registrar office district division union parishad bank account balance
+statement savings branch amount total taka tk usd only lac lakh thousand hundred tax taxes income return national
+revenue taxpayer identification circle zone assessment assessee trade license licence business owner proprietor
+address present permanent village post police station upazila notary public advocate attested true copy translation
+translated english bengali bangla court judge mobile phone email website road holding ward city corporation
+municipality fee vat passport nationality citizen card id identity signature seal stamp authorized officer controller
+examinations alteration erasure without valid validity verify verification online system generated please note
+""".split())
+JUNK_WORD_RATIO = 0.10           # common words among a page's words below this: junk (real pages 0.18-0.67, sideways 0.03-0.06)
+JUNK_MIN_WORDS = 8               # fewer words: an empty or near-empty page (the bot's own rotation retry covers it)
+TURN_ANGLES = (90, 270, 180)     # clockwise degrees tried, in this order
+TURN_MIN_RATIO = 0.20            # a turned reading must read at least this well ...
+TURN_GAIN = 0.15                 # ... and this much better than the first reading
+TURN_GOOD = 0.30                 # a turned reading this good ends the search (the 180 degree read is skipped)
+
+
+def word_quality(text: str) -> Tuple[float, int]:
+    """(share of the page's words, 2+ letters, that are common English / document words; number of words)."""
+    toks = re.findall(r"[A-Za-z]{2,}", text or "")
+    if not toks:
+        return 0.0, 0
+    return sum(1 for w in toks if w.lower() in COMMON_WORDS) / len(toks), len(toks)
+
+
+def looks_junk(page: PageRead, pt: Optional[PageType] = None) -> bool:
+    """A page worth reading again turned: OCR'd (never a text layer), typed "other", with words, almost none of them
+    common words."""
+    if page.kind == "layer" or page.image_only and (page.chars or 0) < PHOTO_IMAGE_CHARS:
+        return False
+    pt = pt or page_features(page.text, page.image_only)
+    if pt.best != "other":
+        return False
+    q, n = word_quality(page.text)
+    return n >= JUNK_MIN_WORDS and q < JUNK_WORD_RATIO
+
+
+def best_turn(text: str, read_turned: Callable[[int], str], image_only: bool = False,
+              angles: Sequence[int] = TURN_ANGLES) -> Optional[Dict[str, Any]]:
+    """Read the page turned (read_turned(angle) -> text, `angles` in order) and keep the best turned reading that
+    types as a document (best type not "other") and reads clearly better than `text` (TURN_MIN_RATIO, TURN_GAIN).
+    Returns {"angle", "text", "quality", "type", "score", "tried": {angle: (quality, type)}} or None."""
+    q0, _ = word_quality(text)
+    best: Optional[Dict[str, Any]] = None
+    tried: Dict[int, Any] = {}
+    for angle in angles:
+        t = read_turned(angle) or ""
+        q, _n = word_quality(t)
+        pt = page_features(t, image_only)
+        tried[angle] = [round(q, 3), pt.best, round(pt.score, 2)]
+        if pt.best != "other" and q >= TURN_MIN_RATIO and q >= q0 + TURN_GAIN:
+            cand = {"angle": angle, "text": t, "quality": round(q, 3), "type": pt.best, "score": float(pt.score)}
+            if best is None or (cand["score"], cand["quality"]) > (best["score"], best["quality"]):
+                best = cand
+        if best is not None and best["quality"] >= TURN_GOOD:
+            break
+    if best is not None:
+        best["tried"] = tried
+        best["first_quality"] = round(q0, 3)
+    return best
+
+
+SIDEWAYS_RATIO = 0.5            # engine.text_line_ratio at or below: the lines run down the page (sideways: 0.02-0.04)
+UPRIGHT_RATIO = 1.5             # at or above: they run across it (upright text pages 1.57 and up; Bangla or
+                                # handwriting reads as junk the right way up: only an upside-down read is worth trying)
+
+
+def angles_for(ratio: Optional[float]) -> Tuple[int, ...]:
+    """The turns worth reading for a junk page whose text lines run as `ratio` says (None: not measured)."""
+    if ratio is None:
+        return TURN_ANGLES
+    if ratio <= SIDEWAYS_RATIO:
+        return (90, 270)
+    if ratio >= UPRIGHT_RATIO:
+        return (180,)
+    return TURN_ANGLES
+
+
+def turn_junk_pages(pages: List[PageRead], read_turned: Callable[[PageRead, int], str],
+                    line_ratio: Optional[Callable[[PageRead], float]] = None) -> List[Dict[str, Any]]:
+    """Every junk page (looks_junk) is read turned (best_turn); a better turned reading replaces the page's text in
+    place (PageRead.text / chars, sideways=True, turned=angle). line_ratio(page) (engine.line_ratio: which way the
+    text lines run, no reading) narrows the turns tried (angles_for): a junk page whose lines run across it (a Bangla
+    page, CHECK_0001 p14) is read once (upside down), not three times. Returns one record per page tried: {"page" (run
+    index), "file", "file_page", "angle" (0 when nothing better), "first_quality", "quality", "type", "lines"}."""
+    out: List[Dict[str, Any]] = []
+    for p in pages:
+        if not looks_junk(p):
+            continue
+        ratio = None
+        if line_ratio is not None:
+            try:
+                ratio = float(line_ratio(p))
+            except (OSError, ValueError, RuntimeError):     # a page that will not render: every turn is tried
+                ratio = None
+        res = best_turn(p.text, lambda a, _p=p: read_turned(_p, a), p.image_only, angles_for(ratio))
+        rec: Dict[str, Any] = {"page": p.index, "file": p.file, "file_page": p.file_page,
+                               "first_quality": round(word_quality(p.text)[0], 3)}
+        if ratio is not None:
+            rec["lines"] = round(ratio, 3)
+        if res is None:
+            rec["angle"] = 0
+        else:
+            p.text, p.chars, p.sideways, p.turned = res["text"], len(res["text"]), True, int(res["angle"])
+            rec.update(angle=int(res["angle"]), quality=res["quality"], type=res["type"], tried=res["tried"])
+        out.append(rec)
+    return out
+
+
+def turned_note(records: Sequence[Dict[str, Any]], mode: str) -> str:
+    """The NOTE naming every page read turned: "pages scanned sideways or upside down were turned to be read:
+    <file> p2, p5 (...)" (folder) / "pages 2, 5" (bundle)."""
+    done = [r for r in records if r.get("angle")]
+    if not done:
+        return ""
+    by: Dict[str, List[int]] = {}
+    for r in done:
+        by.setdefault(r["file"] if mode == "folder" else "", []).append(int(r["file_page"]) + 1)
+    where = "; ".join((f"{f} p" if f else ("page " if len(ps) == 1 else "pages ")) + ", ".join(str(x) for x in ps)
+                      for f, ps in by.items())
+    return (f"scanned sideways or upside down, turned to be read: {where} — the student should upload "
+            f"{'it' if len(done) == 1 else 'them'} the right way up")
+
+
+# ------------------------------------------------------------------------- rev 2.5: ties between two page types
+# Owner folder 9: the INCOME TAX CERTIFICATE page right after the TIN certificate scored 7.0 for both (it prints
+# the TIN) and the stable sort gave it to the TIN, so the TIN unit took the income tax's first page and its blank
+# back. A tie is settled (1) by a TITLE the page prints in its head for one of the tied types, else (2) by the
+# neighbours: a page that opens with a letterhead starts a document, so it goes with the type of the page after it;
+# any other page continues the page before it. The winner's score gets TIE_BONUS, so the split's alignment follows the
+# settle even across a blank back page between it and the next document.
+TIE_EPS = 1e-6
+TIE_BONUS = 3.0                  # > the alignment's cost of a blank page between (reenter 2.5): the settle holds
+TIE_HEAD = 400                   # characters of the page's head where its title is looked for
+# Only ties INSIDE the financial papers are settled (the TIN, the trade licence / employment certificate and the income
+# tax print each other's numbers and names); any other tie stays as typed (an academic page inside the bank block
+# keeps its "reads partly like it" HINT).
+TITLE_CUES: Dict[str, "re.Pattern"] = {
+    "income_tax": re.compile(r"income\s*tax\s*certificate|return\s+of\s+income|acknowledg\w*\s+(?:receipt|slip)", re.I),
+    "tin_certificate": re.compile(r"identification\s+number\s*\(?\s*tin\s*\)?\s*certificat|\bt\s?i\s?n\s+certificat|"
+                                  r"e-?tin\s+certificat", re.I),
+    "trade_license": re.compile(r"trade\s*(?:and\s+business\s+)?licen[cs]e", re.I),
+    "employment_certificate": re.compile(r"employment\s+certificate|salary\s+certificate|experience\s+certificate",
+                                         re.I),
+}
+TIE_FAMILY = frozenset(TITLE_CUES)
+_LETTERHEAD_HEAD = re.compile(r"government\s+of\s+the\s+people|republic\s+of\s+bangladesh|national\s+board\s+of\s+revenue",
+                              re.I)
+
+
+def tied_types(pt: PageType) -> List[str]:
+    """The fine types that share the page's best score (two or more), photo aside; [] when there is no tie."""
+    sc = {k: v for k, v in (pt.scores or {}).items() if k != "photo"}
+    if not sc:
+        return []
+    top = max(sc.values())
+    if top < proto().OTHER_BELOW:
+        return []
+    tied = [k for k, v in sc.items() if abs(v - top) <= TIE_EPS]
+    return tied if len(tied) >= 2 and set(tied) <= TIE_FAMILY else []
+
+
+def _neighbour(types: Sequence[PageType], files: Sequence[str], i: int, step: int) -> str:
+    """The best type of the nearest page before (step -1) or after (step +1) that is not empty, in the same file
+    ("" at the file's edge)."""
+    j = i + step
+    while 0 <= j < len(types) and files[j] == files[i]:
+        if types[j].best not in ("photo", "other"):
+            return types[j].best
+        j += step
+    return ""
+
+
+def break_ties(types: List[PageType], texts: Sequence[str], files: Optional[Sequence[str]] = None) -> None:
+    """Rev 2.5: settle every page whose best types tie (in place): its title, else its neighbours (see above). The
+    pages are decided in order on the types as typed (a settled page does not move its neighbour's decision)."""
+    files = list(files) if files is not None else [""] * len(types)
+    plan: List[Tuple[int, str, str]] = []
+    for i, pt in enumerate(types):
+        tied = tied_types(pt)
+        if not tied:
+            continue
+        head = (texts[i] or "")[:TIE_HEAD]
+        firsts = []
+        for k in tied:
+            rx = TITLE_CUES.get(k)
+            m = rx.search(head) if rx is not None else None
+            if m:
+                firsts.append((m.start(), k))
+        win, how = "", ""
+        if firsts:
+            firsts.sort()
+            if len(firsts) == 1 or firsts[0][0] < firsts[1][0]:
+                win, how = firsts[0][1], "title"
+        if not win:
+            prv, nxt = _neighbour(types, files, i, -1), _neighbour(types, files, i, +1)
+            starts = bool(_LETTERHEAD_HEAD.search((texts[i] or "")[:200]))
+            if starts and nxt in tied:
+                win, how = nxt, "a letterhead starts it; the next page's type"
+            elif prv in tied:
+                win, how = prv, "the page before's type"
+            elif nxt in tied:
+                win, how = nxt, "the next page's type"
+        if win:
+            plan.append((i, win, how))
+    for i, win, how in plan:
+        pt = types[i]
+        pt.scores = dict(pt.scores)
+        pt.scores[win] = float(pt.scores[win]) + TIE_BONUS
+        pt.best, pt.score = win, float(pt.scores[win])
+        pt.tie = f"{' / '.join(tied_types_of(pt, win))} -> {win} ({how})"
+
+
+def tied_types_of(pt: PageType, win: str) -> List[str]:
+    """The types the settled page had tied with (for the evidence line)."""
+    base = pt.scores[win] - TIE_BONUS
+    return sorted(k for k, v in pt.scores.items() if k != "photo" and abs(v - base) <= TIE_EPS) + [win]

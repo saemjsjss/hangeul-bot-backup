@@ -555,10 +555,13 @@ def write_excel(r: RunResult, path: Path, extra: Optional[Mapping[str, Any]] = N
             ranked = sorted(t.scores.items(), key=lambda kv: -kv[1])
             if len(ranked) > 1:
                 second = f"{ranked[1][0]}: {ranked[1][1]:.1f}"
+            if getattr(t, "tie", ""):                  # rev 2.5: a tie settled by the page's title or neighbours
+                second += f" | tie: {t.tie}"
+        side = f"turned {p.turned}" if getattr(p, "turned", 0) else p.sideways   # rev 2.5: read turned
         nts = [f"{n.kind}: {n.message}" for n in r.notices if n.pages[0] <= p.index + 1 <= n.pages[1]]
         fails, flags = on_page.get(p.index, ([], []))
         rows.append([p.index + 1, p.file, p.file_page + 1, p.kind, p.engine, p.chars, round(p.seconds, 2),
-                     p.sideways, t.best if t else "", round(t.score, 2) if t else "", second,
+                     side, t.best if t else "", round(t.score, 2) if t else "", second,
                      t.translation if t else "", (t.level or "") if t else "", t.kind if t else "",
                      u.uid if u else "", title_of(u) if u else "", u.role if u else "", u.role_how if u else "",
                      u.misplaced if u else "", "\n".join(nts), d.verdict if d else "", "\n".join(fails),

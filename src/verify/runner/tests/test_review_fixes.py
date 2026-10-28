@@ -79,7 +79,10 @@ class TestStrictNames(unittest.TestCase):
         c = base_case()
         u = c.add("academic", [academic(mother="DEMO SAMPLE BEGUMX")], "ACADEMIC")
         self.assertEqual(rules(run(c, ident_of(), FakeConfirm("confirmed")), u.uid), [("names.mother", FAIL)])
-        self.assertEqual(rules(run(c, ident_of(), FakeConfirm("unclear")), u.uid), [])   # page noise, not a name
+        # rev 2.6 (checker): an unclear look never makes an added word the same name (FLAG, check by eye); only a
+        # look that shows the reference does ("refuted": page noise, not a name)
+        self.assertEqual(rules(run(c, ident_of(), FakeConfirm("unclear")), u.uid), [("names.mother", FLAG)])
+        self.assertEqual(rules(run(c, ident_of(), FakeConfirm("refuted")), u.uid), [])
         c = base_case()                                  # an added honorific is always a difference (A1)
         u = c.add("academic", [academic(mother="MST DEMO SAMPLE")], "ACADEMIC")
         self.assertEqual(rules(run(c, ident_of(), FakeConfirm("unclear")), u.uid), [("names.mother", FLAG)])
@@ -109,8 +112,8 @@ class TestStrictNames(unittest.TestCase):
     def test_4_the_passports_own_glued_read_is_no_dot_reference(self):
         c = Case()
         c.add("passport", ["PASSPORT Surname SAMPLE"], "PASSPORT")
-        d1 = c.add("academic", [academic(student="M.EXAMPLE SAMPLE")] * 2, "ACADEMIC HSC")
-        d2 = c.add("academic", [academic(student="MEXAMPLE SAMPLE")] * 2, "ACADEMIC SSC")
+        d1 = c.add("academic", [academic(student="M.EXAMPLE SAMPLE")] * 2, "ACADEMIC DEGREE")    # owner 28 Oct: not
+        d2 = c.add("academic", [academic(student="MEXAMPLE SAMPLE")] * 2, "ACADEMIC DIPLOMA")    # board papers
         res = run(c, ident_of(student_written="MEXAMPLE SAMPLE", student_parts=("SAMPLE", "MEXAMPLE")),
                   FakeConfirm("unclear"))
         self.assertEqual(rules(res, d1.uid), [])
@@ -130,6 +133,8 @@ class TestStrictNames(unittest.TestCase):
         res = N().evaluate(ident_of(student_written="EXAMPLE SAMPLE", student_parts=("SAMPLE", "EXAMPLE")),
                            c.units, c.pages, AffidavitInfo(), [], {}, conf)
         self.assertEqual([(f.verdict, f.evidence.get("reread")) for f in res.per_unit[u.uid]], [(FAIL, "confirmed")])
+        # owner 28 Oct: the closer look's own words in the evidence (the legacy re-read here: "differs")
+        self.assertEqual(res.per_unit[u.uid][0].evidence.get("closer_variant"), "differs")
 
     def test_6_name_of_the_deceased_is_read(self):
         for label in ("Name of the Deceased:", "Name of Deceased:", "Name of the Deceased Person:"):
@@ -152,8 +157,8 @@ class TestStrictNames(unittest.TestCase):
     def test_9_language_candidate_enters_the_dot_rule(self):
         c = Case()
         c.add("passport", ["PASSPORT Surname SAMPLE"], "PASSPORT")
-        d1 = c.add("academic", [academic(student="MD EXAMPLE SAMPLE")] * 2, "ACADEMIC HSC")
-        d2 = c.add("academic", [academic(student="MD. EXAMPLE SAMPLE")] * 2, "ACADEMIC SSC")
+        d1 = c.add("academic", [academic(student="MD EXAMPLE SAMPLE")] * 2, "ACADEMIC DEGREE")
+        d2 = c.add("academic", [academic(student="MD. EXAMPLE SAMPLE")] * 2, "ACADEMIC DIPLOMA")
         lang = c.add("language_cert", ["IELTS"], "IELTS")
         idn = ident_of(student_written="MD. EXAMPLE SAMPLE")
         res = run(c, idn, FakeConfirm("unclear"), extra=[("student", lang.uid, "MD EXAMPLE SAMPLE", lang.pages[0])])

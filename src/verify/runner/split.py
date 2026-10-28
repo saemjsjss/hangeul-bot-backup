@@ -67,6 +67,8 @@ OPTIONAL_SLOTS = ["student_nid", "language_cert", "affidavit", "eca", "personal_
                   "id_card_cv"]                         # never reported missing; income tax is optional outside MASTER
 HINT_MIN = 5.0          # cue score for "page N reads partly like the missing document"
 PRESENT_ONLY_KEYS = frozenset({"id_card_cv"})   # never read (owner, 21 Oct): no split.name_vs_content either (rev 2.4)
+_PRESENT_ONLY_NAME = re.compile(r"(?i)(?<![a-z])id[\s_.-]*card(?![a-z])|(?<![a-z])cv(?![a-z])|(?<![a-z])r[eé]sum[eé](?![a-z])|"
+                                r"(?<![a-z])curriculum(?![a-z])")
 
 
 def slots_for(program: str) -> List[str]:
@@ -462,10 +464,21 @@ def split_academic(feats, a: int, b: int) -> List[Tuple[int, int, str]]:
         if (f.kind == "certificate" and seen_transcript and sets and sets[-1][3]
                 and (f.level is None or f.level[1] == lvl)):
             new = True
+        ahead = None
+        if (pending or new) and sets and f.level is None and lvl is not None:
+            # rev 2.5: an e-Apostille, then a page that names no level (a certificate read sideways or without its
+            # level line): when the next page that names a level names ANOTHER level than the set's, this page starts
+            # that level's unit, with the apostille before it (EAP folder: the SSC certificate read without its level
+            # made HSC p1-5, or a "?" unit, instead of HSC p1-3, SSC p4-6)
+            la = next((feats[j].level for j in range(i + 1, b + 1)
+                       if feats[j].kind != "apostille" and feats[j].level), None)
+            if la is not None and la[1] != lvl:
+                ahead, new = la, True
         if new:
-            sets.append([i, i, f.level[0] if f.level else "?", f.kind == "certificate"])
+            first_level = f.level or ahead
+            sets.append([i, i, first_level[0] if first_level else "?", f.kind == "certificate"])
             seen_transcript = False
-            lvl = f.level[1] if f.level else lvl
+            lvl = first_level[1] if first_level else lvl
             if pending:
                 place(sets[-1])
                 if sets[-1][2] in PT.LEVEL_RANK:
@@ -826,6 +839,40 @@ def _absorb_sandwiched(out: List[Doc], types: Sequence[PageType]) -> List[Doc]:
     return res
 
 
+def _absorb_weak_into_named(out: List[Doc], types: Sequence[PageType], want: Optional[str]) -> List[Doc]:
+    """Revision 2.5, inside ONE folder file only: a document of the file whose every page reads at most partly like
+    any document (_weak_page) and that lies right before or after the document the file's NAME names is part of that
+    document, not a document of its own (EAP folder: the ECA file's second page, an academy's certificate reading 4.0
+    like an employment certificate, became an EMPLOYMENT CERTIFICATE unit judged by the financial chain). Never into a
+    bank document (its page count is a rule), never an NID-block page, never when the name names nothing."""
+    if not want or want in _BLANK_NOT_TO or want in _NID_BLOCK:
+        return out
+    res = list(out)
+    changed = True
+    while changed:
+        changed = False
+        for k, d in enumerate(res):
+            if d.label == want or d.label in _NID_BLOCK:
+                continue
+            if not all(_weak_page(types[i]) for i in range(d.start, d.end + 1)):
+                continue
+            nb = [x for x in (k - 1, k + 1) if 0 <= x < len(res) and res[x].label == want]
+            if not nb:
+                continue
+            t = res[nb[0]]
+            j = replace(t, start=min(t.start, d.start), end=max(t.end, d.end), sub=[],
+                        attached=list(t.attached))
+            if want == "academic":
+                j.sub = split_academic(types, j.start, j.end)
+            elif want == "financial":
+                j.sub = split_financial(types, j.start, j.end)
+            lo, hi = min(k, nb[0]), max(k, nb[0])
+            res[lo:hi + 1] = [j]
+            changed = True
+            break
+    return res
+
+
 def file_documents(types: Sequence[PageType], a: int, b: int, key: str = "", fname: str = "") -> Optional[List[Doc]]:
     """Revision 2.3 (the owner's folders combine documents: "FINANCIAL DOCUMENTS", "ACADEMIC DOCUMENTS ATTESTED"):
     the documents a folder file holds, by the bundle split's own rules run on the file's pages alone (run pages
@@ -862,9 +909,10 @@ def file_documents(types: Sequence[PageType], a: int, b: int, key: str = "", fna
             continue
         out.append(d)
     out = _absorb_sandwiched(out, types)
+    want = KEY_LABEL.get(key)
+    out = _absorb_weak_into_named(out, types, want)
     if sum(_n_documents(d) for d in out) < 2:
         return None
-    want = KEY_LABEL.get(key)
     for d in out:
         d.part, d.file, d.file_start, d.file_key = True, fname, a, key
         d.misplaced = False                           # folder mode: no ORDER / NOT JUDGED for a part
@@ -885,7 +933,12 @@ def segment_folder(src: Source, pages: List[PageRead], types: List[PageType]) ->
             continue
         a, b = min(idx), max(idx)
         key = sf.key_by_name or ""
-        if idx == list(range(a, b + 1)):
+        # rev 2.5: the present-only ID card / CV is never read, so never cut into checked documents (a CV's personal
+        # table reads like an NID, its education list like an academic certificate); "11 ID CARD.pdf" has no key by
+        # name (the bot's patterns know "cv", not "id card"), so its name and its pages are asked too
+        present_only = key in PRESENT_ONLY_KEYS or (not key and (
+            bool(_PRESENT_ONLY_NAME.search(sf.name)) or _majority_label(types, a, b) in PRESENT_ONLY_KEYS))
+        if idx == list(range(a, b + 1)) and not present_only:
             parts = file_documents(types, a, b, key, sf.name)
             if parts:
                 docs.extend(parts)
@@ -893,7 +946,7 @@ def segment_folder(src: Source, pages: List[PageRead], types: List[PageType]) ->
         guess = _majority_label(types, a, b)
         if not key and guess == "photo":       # a file with little text is not the photo unless its name says so
             guess = None
-        label = KEY_LABEL.get(key) or guess or "unrecognised"
+        label = KEY_LABEL.get(key) or ("id_card_cv" if present_only else None) or guess or "unrecognised"
         d = Doc(label, a, b, key=key, file=sf.name)
         if label == "academic":
             d.sub = split_academic(types, a, b)

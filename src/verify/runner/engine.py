@@ -43,6 +43,9 @@ PAGE_DPI = 200                # dv.read_pages render
 IMAGE_ONLY_COVER = 0.5        # PageRead.image_only: one embedded image covering >= 50% of the page
 IMAGE_MEMO = 12               # page_image_of keeps the last 12 renders
 RUNNER_PAGE_KEY = "RUNNER-PAGE"   # case-cache key of a page read alone (partial page texts)
+TURN_KEY = "RUNNER-TURN"          # case-cache key of a page read turned (rev 2.5, pagetype.turn_junk_pages)
+LINE_DPI = 100                    # render for text_line_ratio (rev 2.5)
+LINE_SMEAR = 11                   # px at 1000 px a page: 15 also joined two close lines (a synthetic letter read 0.6)
 _CASE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 
 
@@ -269,6 +272,34 @@ def load_page_texts(path: Path, src: Source) -> PageTexts:
     complete = all((f.name, i) in pages for f in src.files for i in range(f.n_pages))
     return PageTexts(pages=pages, complete=complete, engine=str(data.get("engine", "")), path=r,
                      declared_complete=bool(data.get("complete")))
+
+
+def text_line_ratio(img) -> float:
+    """Rev 2.5: which way a page's text lines run, without reading it. The ink (long rules and borders out) is smeared
+    LINE_SMEAR px along the rows and, apart, along the columns (the page scaled to 1000 px: it joins the letters and
+    words of a line, not two lines); the bars a smear makes (3+ times longer than thick) are summed. Returns (row bars
+    + 1) / (column bars + 1). The owner folders' 99 pages: text upright 1.57 and up (NID backs lowest), the four
+    sideways certificates 0.02-0.04, photos 1.0-1.3, a blank page 1.0."""
+    import cv2
+    import numpy as np
+    if img is None or getattr(img, "ndim", 0) < 2:
+        return 1.0
+    g = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) if img.ndim == 3 else img
+    s = 1000.0 / max(g.shape[:2])
+    g = cv2.resize(g, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+    _, bw = cv2.threshold(g, 0, 1, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    H, W = bw.shape
+    rules = (cv2.morphologyEx(bw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(2, W // 8), 1)))
+             | cv2.morphologyEx(bw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(2, H // 8)))))
+    bw = bw & (1 - rules)
+    total = []
+    for kernel, along in (((LINE_SMEAR, 1), 2), ((1, LINE_SMEAR), 3)):
+        sm = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, kernel))
+        n, _, st, _ = cv2.connectedComponentsWithStats(sm.astype(np.uint8), 8)
+        across = 5 - along                        # 2 (width) <-> 3 (height)
+        total.append(sum(int(st[i, along]) for i in range(1, n)
+                         if st[i, along] >= 3 * st[i, across] and st[i, along] >= 25))
+    return (total[0] + 1.0) / (total[1] + 1.0)
 
 
 # --------------------------------------------------------------------------------- the engine
@@ -528,6 +559,36 @@ class Engine:
         else:
             self._images.move_to_end(key)
         return img
+
+    # ------------------------------------------------------------------ a page read turned (rev 2.5)
+    def read_turned(self, page: PageRead, angle: int) -> str:
+        """The page rendered at the read resolution (PAGE_DPI), turned `angle` degrees clockwise (90, 180, 270) and
+        read by the light reader (CPU), as dv._ocr_image reads a page (words joined by spaces). Kept in the case cache
+        (RUNNER-TURN:<name>:<size>:<mtime>:<page>:<angle>), so a re-run reads nothing again."""
+        import cv2
+        codes = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
+        if angle not in codes:
+            raise ValueError("a page is turned by 90, 180 or 270 degrees")
+        path = self._path_of(page)
+        key = None
+        if self.handle is not None:
+            st = Path(path).stat()
+            key = f"{TURN_KEY}:{Path(path).name}:{st.st_size}:{int(st.st_mtime)}:{page.file_page + 1}:{angle}"
+            hit = self.handle.cache.get(key)
+            if isinstance(hit, dict) and isinstance(hit.get("text"), str):
+                self._cache_hits += 1
+                return hit["text"]
+        img = self.page_image_of(page, PAGE_DPI)
+        text = " ".join(str(t) for t in self.reader.readtext(cv2.rotate(img, codes[angle]), detail=0))
+        if key is not None:
+            self.handle.cache[key] = {"text": text}
+            self.handle.dirty = True
+        return text
+
+    def line_ratio(self, page: PageRead) -> float:
+        """text_line_ratio() of the page rendered at LINE_DPI: > 1 its text lines run across the page (upright or
+        upside down), < 1 down it (scanned sideways). Milliseconds; no reading."""
+        return text_line_ratio(self.page_image_of(page, LINE_DPI))
 
     # ------------------------------------------------------------------ OCR of pictures
     def read_text(self, img) -> str:
