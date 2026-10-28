@@ -39,8 +39,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
-from . import strict
-from .botimport import PRIVATE
+from . import hooks, safety, strict
 from .model import FAIL, FLAG, NOTE, PASS, BirthFacts, DocUnit, Finding, Identity, MachineRead, PageRead
 
 date = dt.date
@@ -849,6 +848,7 @@ def decode_qr_image(img, budget_s: float = QR_BUDGET_S, use_zbar: bool = True) -
         if s:
             return s, f"region:{tag}:{dec}", True
         if time.time() - t0 > budget_s:
+            hooks.emit("budget", where="birth.qr", page=None)      # record only (APP_SPEC rev 1 section 10 item 7)
             break
     for (x0, y0, x1, y1) in _qr_boxes(img):
         for tag, v in _variants(img[y0:y1, x0:x1]):
@@ -856,6 +856,7 @@ def decode_qr_image(img, budget_s: float = QR_BUDGET_S, use_zbar: bool = True) -
             if s:
                 return s, f"box:{tag}:{dec}", True
             if time.time() - t0 > budget_s:
+                hooks.emit("budget", where="birth.qr", page=None)
                 break
     s, dec = _try_qr(_gray(img), use_zbar)
     if s:
@@ -1100,6 +1101,7 @@ def code128_votes(gray, max_lines: int = 40, budget_s: float = 3.0) -> Dict[str,
                 votes[hits[0]] = votes.get(hits[0], 0) + 1
                 break
         if time.time() - t0 > budget_s:
+            hooks.emit("budget", where="birth.code128", page=None)  # record only (APP_SPEC rev 1 section 10 item 7)
             break
     return votes
 
@@ -1711,14 +1713,20 @@ def _line_reader(eng) -> Callable[[Any], str]:
 
 
 def _safe_dir(work_dir: Optional[Path]) -> Optional[Path]:
-    """work_dir when it lies under private-runner (S3), else None (nothing is written then)."""
+    """work_dir when it lies under private-runner (S3), else None (nothing is written then). APP_SPEC rev 1
+    section 4.3: the guard decides (safety.assert_writable: the same answer under private-runner in DEV; DATA and
+    the report folder in APP)."""
     if work_dir is None:
         return None
     try:
         p = Path(work_dir).resolve()
     except OSError:
         return None
-    return p if p.is_relative_to(PRIVATE) else None
+    try:
+        safety.assert_writable(p)
+        return p
+    except safety.SafetyError:
+        return None
 
 
 def _save_png(path: Optional[Path], img) -> None:

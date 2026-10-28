@@ -30,6 +30,7 @@ from typing import List, Optional, Sequence
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
 from . import pipeline  # noqa: E402
+from . import places, safety  # noqa: E402
 from . import report as REPORT  # noqa: E402
 from .botimport import DEFAULT_CACHE_ROOT, PRIVATE  # noqa: E402
 from .model import PROGRAMS, STOP  # noqa: E402
@@ -93,12 +94,18 @@ def check_args(a: argparse.Namespace) -> argparse.Namespace:
     if not a.input.exists():
         raise BadArgs("the input does not exist")
     a.out = Path(a.out)
-    out = a.out.resolve()
-    if not _under(out, PRIVATE) or out == PRIVATE.resolve():
-        raise BadArgs(f"--out must be a folder under {PRIVATE}")
-    inp = a.input.resolve()
-    if out == inp or (a.input.is_dir() and _under(out, inp)):
-        raise BadArgs("--out must not lie inside the input")
+    if places.current().mode == places.APP:              # APP_SPEC rev 1 section 4.2: the report folder's rules
+        try:
+            safety.check_out_dir(a.out, a.input)
+        except safety.SafetyError as e:
+            raise BadArgs(str(e)) from None
+    else:
+        out = a.out.resolve()
+        if not _under(out, PRIVATE) or out == PRIVATE.resolve():
+            raise BadArgs(f"--out must be a folder under {PRIVATE}")
+        inp = a.input.resolve()
+        if out == inp or (a.input.is_dir() and _under(out, inp)):
+            raise BadArgs("--out must not lie inside the input")
     a.cache_root = Path(a.cache_root)
     if not _under(a.cache_root, PRIVATE):
         raise BadArgs(f"--cache-root must be under {PRIVATE}")

@@ -9,6 +9,21 @@ How the work runs:
   loses at most the step in hand; this file says where to pick up.
 - No student data appears in this file, in commits or in tests.
 
+OWNER, 29 Oct ~01:40: "just give me the exe file after installing which will use only gpu and give best verdict".
+Answers: NVIDIA PCs including the owner's own (wait politely while the bot uses the card); the GPU engine is the
+torch cu128 + EasyOCR already in lab\onnx\.venv (copied, no download; installer about 3 GB); Inno Setup 6.7.4
+downloaded with approval, signature checked, installed per-user at C:\Hangeul\DOCCHECK\tools\InnoSetup6.
+So the GPU app jumps ahead: G1 app code (workflow wf_5e582c30-c9f: design APP_SPEC rev 2, builders, integrator,
+review) -> G2 freeze + parity of verdict lines with the r8 runs + Setup.exe + install cycle -> G3 independent check
+and hand-over. Steps 2-4 below (the GPU review fixes, the stronger readers, the 16-student sample) follow after.
+
+G1 status, 29 Oct (integrator): the app code (src\verify\runner\app, 20 modules) and packaging are integrated, NOT
+frozen. Green: runner suite 910 (874 + 36 seam tests), app tests 514, packaging tests 193 (3 optional ISCC skipped),
+pii_scan clean (also over packaging), the 7 bot modules equal 07b1f22. One smoke of worker.run_job from source on the
+card (made-up pages, one gpu_guard slot): exit 0 in 56 s, first-read CER 0.0, 0 calls on the processor; the DEV runner
+gave the same verdicts and result code on the same page texts. Cross-task fixes and accepted deviations: APP_SPEC
+R2.10. Next (G2): build env, stage, freeze, check (needs Q-O1 for cardrun), then P1, P4, P5, 8 c, installer, P3.
+
 | # | Step | Status |
 |---|------|--------|
 | 0 | Rev 2.6: the closer look, the owner's 28 Oct rules, 4 owner cases re-run | done, 74325b6 |

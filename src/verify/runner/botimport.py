@@ -6,9 +6,13 @@ import types
 from pathlib import Path
 from types import SimpleNamespace
 
-WORKTREE = Path(r"C:\Hangeul\JARVIS\prototype\page-types")
-PRIVATE = Path(r"C:\Hangeul\DOCCHECK\lab\private-runner")
-DEFAULT_CACHE_ROOT = PRIVATE / "runner-data"
+from . import places
+
+# APP_SPEC rev 1 section 4.3: the names are kept (other modules import them); the values come from places. DEV: the
+# worktree, the private root and its runner-data, exactly as before. APP: the bundle, DATA and DATA\cache.
+WORKTREE = places.current().code_root
+PRIVATE = places.current().write_root
+DEFAULT_CACHE_ROOT = places.current().cache_root
 _loaded = None
 
 
@@ -22,11 +26,12 @@ def load(cache_root: Path = DEFAULT_CACHE_ROOT) -> SimpleNamespace:
         if _loaded.cache_root != cache_root:
             raise RuntimeError("bot code already loaded with another cache root")
         return _loaded
-    if not cache_root.is_relative_to(PRIVATE):
+    code_root = Path(WORKTREE).resolve()          # APP: sys._MEIPASS, where frozen modules have their __file__
+    if not cache_root.is_relative_to(Path(PRIVATE).resolve()):
         raise RuntimeError(f"cache root must be under {PRIVATE}")
     sys.dont_write_bytecode = True
     import src
-    if not Path(src.__file__).resolve().is_relative_to(WORKTREE):
+    if not Path(src.__file__).resolve().is_relative_to(code_root):
         raise RuntimeError(f"src is imported from {src.__file__}, not from the worktree")
     old = sys.modules.get("src.config")
     if old is not None and not getattr(old, "_RUNNER_STUB", False):
@@ -59,7 +64,7 @@ def load(cache_root: Path = DEFAULT_CACHE_ROOT) -> SimpleNamespace:
         if not Path(p).resolve().is_relative_to(cache_root):
             raise RuntimeError(f"bot path outside the cache root: {p}")
     for m in (C, dv, FC, PC, P, R, TC, OV):
-        if not Path(m.__file__).resolve().is_relative_to(WORKTREE / "src"):
+        if not Path(m.__file__).resolve().is_relative_to(code_root / "src"):
             raise RuntimeError(f"{m.__name__} not imported from the worktree: {m.__file__}")
     _loaded = SimpleNamespace(dv=dv, PC=PC, TC=TC, R=R, C=C, FC=FC, OV=OV, P=P, cache_root=cache_root)
     return _loaded

@@ -26,16 +26,20 @@ import time
 from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
-from . import botimport, safety
+from . import botimport, hooks, places, safety
 from .ingest import IMAGE_SUFFIXES, InputError, file_sha256
 from .ingest import file_label as ingest_file_label
 from .model import PAGE_TEXTS_SCHEMA, PageRead, Source
 
-ONNX_LAB = Path(r"C:\Hangeul\DOCCHECK\lab\onnx")
-MODELS = ONNX_LAB / "models"
-GLUE_DATA = ONNX_LAB / "pkg" / "glue_data.json"
+# APP_SPEC rev 1 section 4.3 / rev 2 R2.1.6: DEV, the lab's ONNX models and glue data (as before); APP, the bundle's
+# EasyOCR weights and glue data (the app's reader comes from READER_FACTORY, never from ONNX Runtime).
+MODELS = places.current().models_dir
+GLUE_DATA = places.current().glue_data
+# R2.1.6: when set, make_reader() returns READER_FACTORY(threads) and imports nothing else (the app sets its card
+# reader here, so Engine() and closer._reader() use it and onnxruntime is never imported). None in DEV.
+READER_FACTORY: Optional[Callable[[int], Any]] = None
 PROVIDERS = ["CPUExecutionProvider"]
 DET_ARENA = False             # rev 2.7: the detector's session has ORT's CPU memory arena off (make_reader)
 REC_ARENA = False             # rev 2.7 (step 1b): the recogniser's too
@@ -76,7 +80,9 @@ def make_reader(threads: int = 0):
     are bit-identical). Step 1b: the RECOGNISER's session has the arena off too (REC_ARENA): its inputs are single
     text lines, but the closer look enlarges a line up to 6000 pixels wide and the arena then kept a few hundred MB
     for the rest of the run (the EAP folder: 65 MB more at the run's peak); the readtext results of real pages are
-    identical with it off (step 1b, 19 reads of 10 pages at 200 and 300 dpi), and the run takes no longer."""
+    identical with it off (step 1b, 19 reads of 10 pages at 200 and 300 dpi), and the run takes no longer.
+    R2.1.6: with READER_FACTORY set (the app's card reader), its reader is returned and nothing else is imported."""
+    if READER_FACTORY is not None: return READER_FACTORY(threads)  # noqa: E701
     import onnxruntime as ort
     import glue_numpy
     det = ort.InferenceSession(str(MODELS / "craft_mlt_25k.onnx"), session_options(threads, DET_ARENA),
@@ -144,6 +150,8 @@ class PageLog:
         import hashlib
         key = (arr.shape, hashlib.sha1(memoryview(arr.copy(order="C"))).hexdigest())
         hit = key in self.memo
+        if not hit:
+            hooks.emit("ocr", phase="start")             # the app's progress and cancel point (no-op in DEV)
         t = time.perf_counter()
         if not hit:
             mine: List[bool] = []
@@ -151,8 +159,10 @@ class PageLog:
         text, nturn = self.memo[key]
         if turned is not None:
             turned.extend([True] * nturn)
-        self.calls.append({"h": arr.shape[0], "w": arr.shape[1], "s": round(time.perf_counter() - t, 3),
+        secs = round(time.perf_counter() - t, 3)
+        self.calls.append({"h": arr.shape[0], "w": arr.shape[1], "s": secs,
                            "chars": len(text), "turned": nturn, "memo": hit})
+        hooks.emit("ocr", phase="end", seconds=secs, memo=hit)
         return text
 
     def mark(self) -> int:
@@ -261,7 +271,9 @@ class PageTexts:
 def load_page_texts(path: Path, src: Source) -> PageTexts:
     """Reads a runner-page-texts/1 file (section 5.2.1). Raises InputError (exit 2) when the path is not
     under private-runner, the schema or mode is wrong, a file entry is not in `src`, an entry is repeated,
-    a file's sha256 or page count differs from the input file's, or a page entry is malformed."""
+    a file's sha256 or page count differs from the input file's, or a page entry is malformed.
+    R2.1.6: "under private-runner" is places' write_root through safety.PRIVATE (APP: DATA, so the app's
+    <DATA>\\cache\\pagetexts\\<case_id>.json is accepted)."""
     p = Path(path)
     try:
         r = safety._private(p, "--page-texts")
@@ -407,6 +419,7 @@ class Engine:
                 hit = given.get(name, i)
                 if hit is not None:
                     served[i] = hit
+        hooks.emit("file", name=name, pages=n, ocr=sum(1 for i in range(n) if kinds[i] == "ocr" and i not in served))
         texts: List[str] = [""] * n
         secs: List[float] = [0.0] * n
         side: set = set()
@@ -439,6 +452,7 @@ class Engine:
 
     def _read_image(self, path: Path, name: str, index: int, given: Optional[PageTexts]) -> PageRead:
         hit = given.get(name, 0) if given is not None else None
+        hooks.emit("file", name=name, pages=1, ocr=0 if hit is not None else 1)
         if hit is not None:
             text, _kind, sw, s = hit
             return PageRead(index=index, file=name, file_page=0, text=text, kind="image", chars=len(text),

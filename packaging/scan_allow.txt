@@ -1,0 +1,9 @@
+# scan_allow.txt - the only allowed hits of the forbidden strings (APP_SPEC r1 8 b, r2 R2.6 8 b).
+# Read by packaging\stage.py (the fast scan of the stage) and packaging\tests\scan_bundle.py (the dist).
+# One line per allowed hit:   module or file | string | reason
+#   module or file : a module name (dotted) for compiled code, or a path relative to the stage / app folder with "/"
+#   string         : the exact text that may appear there (case-insensitive); nothing else in that module may hit
+#   reason         : why it is needed
+# For our own code there is exactly ONE line. Third-party hits found by scan_bundle.py are reviewed and added below
+# it, each with its reason, before a build passes.
+src.verify.runner.app.cardgate | c:\hangeul\bot\data\verification\auto_verify.lock | the default lock path, used only when its folder exists (R2.2)

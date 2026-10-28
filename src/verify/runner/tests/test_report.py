@@ -26,6 +26,7 @@ HEAD1 = re.compile(r"^\S+ \| (KLP|EAP|BACHELOR|MASTER) \| (bundle|folder) \| \d+
                    r"(PASS|FLAG|FAIL|STOP|NOT JUDGED)$")
 HEADLINE = re.compile(r"^(STOP|FAIL|FLAG|PASS) — .+$")
 READING = re.compile(r"^READING: GPU pre-read \d+ pages, CPU light engine \d+, text layer \d+( — .+)?$")
+RESULT_CODE = re.compile(r"^RESULT CODE: [0-9A-F]{4}-[0-9A-F]{4} \(check date \d{4}-\d{2}-\d{2}\)$")
 ORDER_LINE = re.compile(r"^ORDER: fix pages? \d+(-\d+)? — .+$")
 
 
@@ -147,8 +148,10 @@ class TestSummary(unittest.TestCase):
         self.assertTrue(lines[0].endswith("RESULT: FAIL"))
         self.assertRegex(lines[1], HEADLINE)
         self.assertEqual(lines[1], "FAIL — 1 FAIL, 5 FLAG, 1 MISSING, 1 ORDER")
-        self.assertRegex(lines[2], READING)
-        self.assertEqual(lines[2], "READING: GPU pre-read 6 pages, CPU light engine 0, text layer 1 — a made-up note")
+        self.assertRegex(lines[2], RESULT_CODE)                          # APP_SPEC rev 1 section 1.3: line 3
+        self.assertTrue(lines[2].endswith("(check date 2026-10-27)"))
+        self.assertRegex(lines[3], READING)
+        self.assertEqual(lines[3], "READING: GPU pre-read 6 pages, CPU light engine 0, text layer 1 — a made-up note")
         self.assertNotIn("ORDER: OK — the pages fit the fixed order", lines)     # an ORDER notice exists
         orders = [s for s in lines if s.startswith("ORDER:")]
         self.assertEqual(orders, ["ORDER: fix page 3 — the e-Apostille for HSC is on page 3 — put it first"])
@@ -195,7 +198,8 @@ class TestSummary(unittest.TestCase):
         self.assertIn("NEW CHECKS (owner to confirm): tin.web_address on TIN CERTIFICATE (TIN CERTIFICATE.pdf)",
                       lines)
         self.assertFalse(any(s.startswith("ORDER: OK") for s in lines))      # no fixed order in a folder
-        self.assertRegex(lines[2], r"^READING: GPU pre-read 0 pages, CPU light engine 7, text layer 0")
+        self.assertRegex(lines[2], RESULT_CODE)
+        self.assertRegex(lines[3], r"^READING: GPU pre-read 0 pages, CPU light engine 7, text layer 0")
 
     def test_stop_has_no_document_lines(self):
         r = fixture(stop=True)

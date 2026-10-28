@@ -1,5 +1,919 @@
 # APP_SPEC — the installable Windows app of the document checker
 
+This file holds two revisions. **Revision 2 (29 Oct 2026, "the GPU build")** comes first and overrides revision 1
+wherever they differ. **Revision 1 (27 Oct 2026)** follows unchanged: everything in it that revision 2 does not
+replace still holds (the window, the protocol, the places seam, the result code, the messages, the data folders, the
+scrub, the tests). Revision 2 cites revision 1 as "rev 1 §n". No personal data: every name, number, date and code is a
+placeholder; cases are named by case id only.
+
+# REVISION 2 — the GPU build (29 Oct 2026)
+
+Status: design. Builds on RUNNER_SPEC revision 2.7 (runner 0.2.7, rules bot 2026-10-21.3 + runner 2026-10-28.r2.6,
+closer-4), branch prototype/page-types at 344b342. Nothing of revision 1 was built (there is no `places.py` and no
+`app\` yet), so its tasks are folded into R2.7.
+
+The owner (29 Oct): "just give me the exe file after installing which will use only gpu and give best verdict".
+The owner's answers the same night:
+- It runs on PCs with an NVIDIA card, INCLUDING the owner's own PC (RTX 5060, 8 GB), which also runs the live Telegram
+  bot. There the app WAITS POLITELY while the bot's document check uses the card (it starts every 15 minutes; its
+  lock file is `C:\Hangeul\BOT\data\verification\auto_verify.lock`), so the bot never runs out of card memory.
+- The GPU engine is the one already on this PC, copied into the app with no download:
+  `C:\Hangeul\DOCCHECK\lab\onnx\.venv` (Python 3.12.10, torch 2.11.0+cu128, torchvision 0.26.0+cu128, easyocr 1.7.2,
+  pymupdf, numpy, opencv-python-headless, pillow, scipy, scikit-image) and the weights in
+  `%USERPROFILE%\.EasyOCR\model`. The installer may be about 3 GB.
+- Inno Setup 6.7.4 is installed (signature checked) at `C:\Hangeul\DOCCHECK\tools\InnoSetup6\ISCC.exe`. No other
+  download is approved.
+- "Best verdict" = the checker as it is now (runner rev 2.7). Every tested verdict came from: the first read of each
+  page by the bot's EasyOCR on the card (`gpuread.py`), then the runner with its light reader (ONNX, CPU) for
+  everything after. The torch-on-card closer look gave the same decisions as the ONNX CPU one on 550 looks
+  (`private-runner\gpu_sessions\parity`).
+
+**Facts read for this design (29 Oct; read-only, no student text):**
+- The bot venv and `lab\onnx\.venv` hold the same torch 2.11.0+cu128, torchvision 0.26.0+cu128, easyocr 1.7.2, numpy
+  2.5.2, opencv-python-headless 5.0.0.93, pymupdf 1.28.2 and pillow 12.3.0. They differ only in imageio (2.37.4 /
+  2.38.1), python-bidi, shapely and tifffile; none of these takes part in an English read except imageio, which
+  decodes JPEG/PNG files through the same Pillow.
+- torch's compiled CUDA targets: `sm_75 sm_80 sm_86 sm_90 sm_100 sm_120` (no PTX); CUDA 12.8; cuDNN 9.19.0. Its
+  defaults: `cudnn.allow_tf32` True, `cuda.matmul.allow_tf32` False, `cudnn.deterministic` False, `cudnn.benchmark`
+  False.
+- `torch\lib` holds 4.04 GB of DLLs. Hard imports (pefile): `torch_cuda.dll` → cublas64_12, cublasLt64_12, cudnn64_9,
+  cufft64_11, cusolver64_11, cusparse64_12 (→ nvJitLink_120_0), c10_cuda, torch_cpu; `torch_cpu.dll` → cudart64_12,
+  cupti64_2025.1.1, libiomp5md, uv, c10, msvcp140, vcruntime140, vcruntime140_1; `torch_python.dll` → shm. cuDNN loads
+  its sub-libraries (graph, ops, cnn, adv, heuristic, engines_*) at run time. The weights: `craft_mlt_25k.pth`
+  83,152,330 B, `english_g2.pth` 15,143,997 B.
+- The r8 page texts (`runs\owner_f3_r8`, `owner_f9_r8`, `owner_eap1_r8`, `test1_r8`) are complete; none was read
+  smaller and none was skipped: 101 pages (93 OCR, 4 text layer, 4 picture files).
+- easyocr 1.7.2 imports `skimage.io` (file paths), `scipy.ndimage`, `bidi`, `yaml`, `torchvision.models`; only
+  `easyocr.DBNet`, `easyocr.detection_db` and `easyocr.export` import onnx, pyclipper, shapely or `cpp_extension`.
+- Inno Setup 6.7.4: one Setup.exe may hold up to 4,200,000,000 bytes of compressed data; above that DiskSpanning is
+  required. `lzma2/ultra64` needs about 742 MB to compress per block thread and 64 MB to decompress.
+- **Caution:** `torch.backends.cudnn.version()` starts CUDA on the card (seen once while reading these facts: a short
+  CUDA start, no computation). Build and test scripts never call it; the cuDNN version is read from the version
+  resource of `cudnn64_9.dll`.
+
+## R2.0 Decisions
+
+| # | Decision | Why |
+|---|---|---|
+| G1 | The deliverable is ONE `Setup.exe` (Inno Setup 6.7.4, per user, LZMA2). Rev 1's trial zip is dropped. | The owner asked for "the exe file after installing". A 4.6 GB folder zips badly for Explorer (zip64). The MANIFEST chain (dist → installer → installed files) still proves "what was tested is what gets installed". |
+| G2 | One worker process per check (rev 1 §2) runs three phases in order: (0) the card start; (1) the FIRST READ of every page = `gpuread.read_all` in-process with the bot's EasyOCR reader on the card, under the process conditions gpuread had; (2) the runner (`pipeline.run`) with the light reader's two networks as torch modules on the card (`TorchSession`, strict fp32). | This is the tested path, with no bot venv and no second card process (R2.1). |
+| G3 | Not bundled: onnxruntime (and `DirectML.dll`) and the two ONNX models. Bundled: torch with its CUDA DLLs, torchvision, easyocr, and the two EasyOCR `.pth` weights. | GPU only; ONNX Runtime would only serve a CPU engine. |
+| G4 | No CPU OCR engine. With no usable card the app shows a plain message and checks nothing: Check is disabled, and the worker refuses with exit 6. One narrow exception, counted and reported: ONE model call that does not fit the 3 GB cap, even after the card cache is emptied and the bot's turn waited for, runs with the SAME weights on the processor (torch fp32). | Without it, one large page (a phone photo, a page larger than A4) could fail a whole check on the card's cap. DEV read such calls on the CPU. Q4 lets the owner turn this into a stop. |
+| G5 | The card-memory cap is 3.0 GB on EVERY card, bigger cards too. A check starts only with ≥ 4.0 GB free (NVML). Cards reporting under 5800 MB in total (smaller than "6 GB") are refused. | The cap decides which pages the bot's reader reads again smaller after running out of memory (gpuread's 2000 / 1600 px ladder). With a bigger cap, a bigger card could read a page at full size that this PC reads smaller, and a verdict could then differ from the tested one. These are gpu_guard's and gpuread's numbers. |
+| G6 | The card gate (`app\cardgate.py`) waits while a lock file exists. The path is a setting: by default the bot's lock, when its folder exists; a lock older than 4 h counts as stale, as in gpu_guard. It checks before every model call (at most every 0.25 s), pauses with the card cache emptied, and resumes by itself. Waiting never fails a check, and Cancel works during a wait. | The owner: wait politely. Checking between calls limits the overlap with a starting bot check to one model call (at most about 1.5 s). |
+| G7 | The requirements are read with NVML through ctypes (`%SystemRoot%\System32\nvml.dll`), without torch: in the window at start and before every Check, and again in the worker. torch confirms them after its import. | Plain messages at once, before any heavy import. |
+| G8 | Phase 1 runs with torch's defaults exactly as gpuread ran: cuDNN TF32 allowed, not deterministic, benchmark off; no `PYTORCH_CUDA_ALLOC_CONF`, no `CUBLAS_WORKSPACE_CONFIG`. Phase 2 then sets strict fp32 (`cudnn.deterministic` True, `benchmark` False, both TF32 switches off), as gpu_worker did. | Phase 1's texts must equal the r8 page texts, which gpuread made under torch's defaults. Phase 2's numbers must match the ONNX CPU ones (measured within 1e-6). |
+| G9 | `gpuread.py` is bundled with no source change. The stage swaps its seven DEV path literals (R2.4.4), checked by AST. | The first read then has one source, in DEV and in the app. |
+| G10 | The build environment lives only under `C:\Hangeul\DOCCHECK\lab\app-build`: a `--without-pip` venv of the system Python 3.12.10 with one `.pth` that points read-only at the site-packages of `lab\onnx\.venv` and `.venv-pkg-numpy`. Outputs go to `app-build\builds\<build-id>`. Nothing is installed anywhere. | Hard rule. |
+| G11 | App version 1.0.0, flavour "GPU (CUDA 12.8)". Build id as in rev 1: `YYYYMMDD.N-<git short>[-dirty]`. | The first release. |
+| G12 | "Best verdict" is the pass condition of test P1 (R2.6). On this PC, on the four r8 cases, the app's page texts must equal the r8 page texts and its verdict lines must equal the r8 lines. | The owner's definition. |
+
+**What revision 2 changes in revision 1** (everything not listed still holds):
+
+| Rev 1 | Rev 2 |
+|---|---|
+| D1, §1.1, §1.5, §1.6 (trial zip first, its README, its test on this PC) | Replaced by the installer (R2.5), README_INSTALL.txt and tests P1-P3 (R2.6). |
+| D5 (CPU only, ONNX Runtime), D8 (A or B), §7.2 (installer B) | G2-G5. Installer A is chosen and Inno Setup is installed; B is dropped. |
+| §1.2 self-test part `ocr` | Part `card` (R2.3.4). Part `runtime` also checks where the CUDA DLLs come from. 9 parts as before. |
+| §1.4 fresh-PC failures | Rows added (R2.3.5). The "Low RAM" target becomes ≤ 4.5 GB (R2.6 P5). ARM64 Windows is now refused (no CUDA). |
+| §2 process model, protocol, job.json, exit codes | Unchanged, plus the `card` and `gpu_wait` events, the `gpu` block in job.json and exit code 6 (R2.3.3). `--cli` now runs the worker's job in-process (R2.3.3). |
+| §3 window, §3.3 messages | Unchanged, plus the card messages, the waiting banner, the card line and the lock setting (R2.3). |
+| §4 places seam | Unchanged, plus R2.1.6 (`READER_FACTORY`, APP `models_dir`). |
+| §5 bundle, §5 "Excluded" | Replaced by R2.4.1-R2.4.2. torch, torchvision, easyocr, scipy, skimage and `gpuread` are now IN. The "hardening" excludes (http, `urllib.request`, ssl ...) are dropped: easyocr and torch import `urllib.request`; the network guard still refuses every connection. |
+| §6.1 stage, §6.2 spec, §6.4 commands | Amended by R2.4.3-R2.4.6. The build root moves to `app-build\builds\<id>`. |
+| §8 b, c, g, h | Amended (R2.6). 8 d → P1, 8 e → P3, 8 f → P5; P4 is new. |
+| §9 tasks | Replaced by R2.7. |
+| §10 items 7-8 (wall-clock budgets, clock reads) | Still open, as cross-PC risks (R2.8). |
+| §11 Q1 | Answered (A, installed). Q2 and Q3 keep their recommended defaults. |
+
+---------------------------------------------------------------------------------------------------------
+
+## R2.1 The engine in the app
+
+### R2.1.1 One worker, three phases
+
+`app\worker.py:run_job(job, listener)` runs after rev 1's boot (§6.2) and input pre-checks (§3.3):
+
+```
+safety.prepare(out, cache_root, input)            APP guard armed BEFORE any card work; its input snapshot is kept
+info = gpuinfo.probe(); gpuinfo.problems(info, version.ARCH_FLAGS)  -> any problem: error event, exit 6 (R2.3)
+gate = cardgate.CardGate(job.gpu.lock_paths, hooks.emit, free_mb=lambda: gpuinfo.free_mb(info.index))
+stage "card":      gate.wait_turn("start"); gate.wait_memory(NEED_FREE_MB); card = gpuengine.start_card(info, gate)
+src = ingest.open_input(input); bot = botimport.load(cache_root)
+stage "firstread": fr = gpuengine.first_read(card, bot, src, gate, store=<cache_root>\pagetexts\<case_id>.json)
+reader = gpuengine.light_reader(card, gate, places.current().glue_data, places.current().models_dir)  (strict fp32)
+engine.READER_FACTORY = lambda threads=0: reader
+r = pipeline.run(input, program, out, today=..., cache_root=..., page_texts=store,
+                 reading_note=gpuengine.reading_note(fr))
+the input snapshot compared again (INPUT_CHANGED); resultcode, summary.pdf, checkfacts (+ "gpu" block) -> done
+```
+
+The worker emits the stage events `card` and `firstread` itself (`hooks.emit("stage", ...)`). `pipeline.run` arms the
+same guard a second time with the same arguments (R2.1.6). When the process ends, the card is freed completely; rev 1
+§2 already starts one fresh worker per check.
+
+### R2.1.2 Phase 1: the first read (the same code, under the same conditions as gpuread)
+
+| | gpuread (made the r8 page texts) | the app, phase 1 |
+|---|---|---|
+| Code | `gpuread.read_all` → the bot's `dv.read_pages` / `dv.read_document` / `dv._ocr_image` (worktree, 07b1f22) | The same functions, bundled (G9) |
+| Reader | `dv._ocr_reader()` = `easyocr.Reader(["en"], gpu=True, verbose=False)` | `easyocr.Reader(["en"], gpu=True, verbose=False, model_storage_directory=<bundle>\engine\easyocr\model, user_network_directory=<bundle>\engine\easyocr\user_network, download_enabled=False)`, set as `bot.dv._reader` inside a `GatedReader`. Same weights (easyocr checks their MD5), same networks, same defaults; only the folders differ and downloading is off. |
+| torch | 2.11.0+cu128 (bot venv) | 2.11.0+cu128 (copied from `lab\onnx\.venv`) |
+| torch flags | torch's defaults | torch's defaults: asserted by `start_card`, never set |
+| Environment | the user's (no `PYTORCH_*` or `CUBLAS_*`) | `gpuinfo.card_env`: removes `PYTORCH_*`, `TORCH_*`, `CUBLAS_*`, `CUDNN_*`, `CUDA_*` (`CUDA_PATH*` too: the CUDA DLLs come from the app folder) and `NVIDIA_TF32_OVERRIDE`; sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` and `CUDA_VISIBLE_DEVICES=<NVML index>`; sets nothing else |
+| Cap | `torch.cuda.set_per_process_memory_fraction(3 GiB / total × 0.999, 0)` before the reader is made | The same |
+| Out of card memory | `read_with_retries`: full size → 2000 px → 1600 px → the page is left to the runner | The same, plus GatedReader's one wait-and-retry at full size (below) |
+| Between pages | `slot.checkpoint()` | `gate.wait_turn("page")`, plus a check before every model call |
+| Output | `runner-page-texts/1` under private-runner | The same schema at `<DATA>\cache\pagetexts\<case_id>.json` (engine label `APP_ENGINE_LABEL`), rewritten atomically after every page |
+
+`gpuengine.first_read(card, bot, src, gate, store, emit=hooks.emit) -> dict`:
+- `done = gpuread.load_done(store, src)`: pages read by an earlier check of the same input (same file names, sha256
+  values and page counts) are reused. When `gpuread.pending_pages(src, done) == 0`, no reader is loaded:
+  `read_all(src, None, never, done, save)` only rebuilds the file.
+- `checkpoint = lambda: gate.wait_turn("page")`. `save(d)` sets `d["engine"] = APP_ENGINE_LABEL`, writes
+  `<store>.tmp` and then `os.replace`, and emits
+  `hooks.emit("page", done=<pages read>, of=<pages to read>, seconds=<last page>, where="card")`. `free = card.free`
+  (gc + `torch.cuda.empty_cache()`, as gpuread's `run_session`).
+- In a `finally`, always: `bot.dv._reader = None`, the reader deleted, `card.free()`. `Engine()` later sets
+  `dv._reader` to the light reader. `gpuread._read_pdf` puts back the original `dv._ocr_image` itself.
+- Returns `{"pages": gpuread.counts(result), "seconds_total", "model_load_s", "downscaled", "skipped", "oom_retries",
+  "peak_alloc_gb", "peak_reserved_gb"}`: counts only, no text.
+- A page left out (`skipped`) is read in phase 2 by the runner's `Engine._read_missing` with the light reader, just as
+  DEV read it with its CPU light reader. A `hooks.Cancelled` leaves the partial file saved (`read_all` saves, then
+  re-raises), and the next check resumes from it.
+
+**`GatedReader(inner, gate, card, ascii_dir)`**, phase 1 only. `readtext(image, *a, **kw)`:
+1. `gate.wait_turn("read")`;
+2. `image = ascii_path(image, ascii_dir)`;
+3. `inner.readtext(image, *a, **kw)`;
+4. on a card OOM (`gpuread.is_oom`), ONCE: `card.pause()`, `gate.wait_turn("oom")`, the same call again at full size.
+   A second OOM is raised, and gpuread's ladder or the bot's own handling acts as in DEV.
+
+Every other attribute comes from `inner` (`__getattr__`). Why the single retry: an OOM caused by another program (the
+bot starting) must not make a page be read smaller, while an OOM that the page itself causes repeats and reaches the
+ladder exactly as in DEV. The retry also covers the bot's `_ocr_image`, whose rotation tries swallow exceptions
+(WORKPLAN step 2 a).
+
+**`ascii_path(image, ascii_dir)`.** EasyOCR (`utils.reformat_input`) and `glue_numpy.reformat_input` read a file path
+with `cv2.imread`, which fails on Windows for a path holding any non-ASCII letter. Such a path is copied byte for byte
+to `<DATA>\tmp\<job>\ascii\img-<nnnn><ext>` and passed RELATIVE to the working folder. Boot sets the working folder to
+DATA, so the relative path is ASCII even when DATA is not; `os.path.relpath` is asserted ASCII. Same bytes, same
+decode. The copies are removed at job end and by rev 1's start-up housekeeping. Arrays and ASCII paths pass unchanged.
+
+### R2.1.3 Phase 2: the light reader on the card
+
+- `gpuengine.strict_fp32(torch) -> dict`: gpu_worker's `strict_fp32`, the four flags set and read back, with no
+  environment change (G8).
+- `gpuengine.load_models(torch, easyocr, model_dir) -> (det_cpu, rec_cpu, facts)`: `gpu_worker.export_modules` and
+  `load_models` VERBATIM. That is export_onnx.py's `MeanPool`, `DetectorOut` and `RecognizerOut`;
+  `easyocr.Reader(["en"], gpu=False, quantize=False, verbose=False, model_storage_directory=model_dir,
+  download_enabled=False)`; the recogniser's `AdaptiveAvgPool` swapped for `MeanPool`; every tensor float32.
+  `test_gpuengine` compares these definitions node for node with `lab\onnx\scripts\export_onnx.py` (read-only;
+  skipped when that file is absent), as gpu_sessions' test does.
+- `TorchSession(kind, cpu_module, card, gate)` with `kind` "det" or "rec":
+  `self.cuda_module = copy.deepcopy(cpu_module).to("cuda")`, and the CPU module is kept for the processor exception
+  (G4, about 100 MB of RAM). `run(output_names, feeds) -> [np.ndarray]`:
+  1. `x = feeds["image"]` must be float32, rank 4, 3 channels (det) or 1 channel at height 64 (rec), with no empty
+     axis; otherwise `ValueError` (what ONNX Runtime would refuse). A read-only or non-contiguous array is copied
+     first.
+  2. `gate.wait_turn(kind)`.
+  3. On the card: `with torch.inference_mode(): y = cuda_module(torch.from_numpy(x).to("cuda"))`, then
+     `out = y.contiguous().cpu().numpy()` (gpu_worker's `Nets`).
+  4. On an OOM: `card.pause()`, `gate.wait_turn("oom")`, once more on the card. A second OOM runs THIS call on
+     `cpu_module` (torch CPU, fp32) and counts it (`calls_cpu`, reason "oom").
+  5. Any other CUDA error is raised; the worker maps it to CARD_FAILED.
+  6. The output must be float32 with the input's batch size: det rank 4 with 2 score maps, rec rank 3 with 97
+     classes. Otherwise `RuntimeError`.
+  `stats()` gives calls and seconds on the card and on the processor, and the OOM retries.
+- `light_reader(card, gate, glue_data, model_dir)` calls `strict_fp32`, then `load_models`, then returns
+  `CardLightReader(TorchSession("det", ...), TorchSession("rec", ...), glue_data)`. `CardLightReader` is a subclass of
+  `glue_numpy.LightReader` whose `readtext` applies `ascii_path` first.
+- The engine wraps the reader in `CountingReader`, and `closer.page_image` binds it (`closer.bind`). So the closer
+  look's detector (`reader.detect`) and recogniser (`reader.rec.run`) run on the card through the same objects, and so
+  do the bot's `dv._ocr_image` / `dv.read_document` in phase 2 (crop re-reads, turned pages, skipped pages), exactly
+  where DEV's runner used its CPU light reader.
+- Large calls: rev 2.7's page search sends at most 2048 px to the detector. A whole 200-dpi page read again (for
+  example `read_turned`) reaches about 2340 px (canvas 2560). gpu_sessions fitted a 2560 × 1824 detection under the
+  cap only with `max_split_size_mb:256`, which the app does not set (G8). So the largest detections may run out of
+  memory and go to the processor: slower, and fp32 like ONNX on the CPU. Test P1 counts them.
+- `reading_note(fr) -> str` (≤ 200 characters, no personal data): `"app GPU build: first read on the graphics card
+  (bot EasyOCR, 3.0 GB cap); light reader on the card"`, plus `"; <k> page(s) left to the light reader (too large
+  for the cap)"` when the first read skipped pages. The runner's READING line keeps its wording ("CPU light engine
+  <n>" counts the pages the first read left to the light reader).
+
+### R2.1.4 No usable card
+
+- **Window:** probe at start and before every Check. A hard problem (R2.3.1) shows its message in the banner; Check
+  stays disabled; Self-test stays available. Too little FREE memory is only a yellow note, because a check waits for
+  memory (R2.2).
+- **Worker** (`--worker`, `--cli`): an error event with the code and exit 6. Nothing is read, and nothing is written
+  except the worker log.
+- **Self-test:** part `card` FAILs with the code and message; the other parts still run.
+- This build has no CPU check. Rev 1's CPU design would be a separate flavour, and it is not made now.
+
+### R2.1.5 What happens to card memory, in one place
+
+| Situation | Behaviour |
+|---|---|
+| The bot's lock is present before the check | Wait before CUDA starts, so no context is made while the bot works (`wait_turn("start")`). |
+| The lock appears during a check | The current model call finishes; then `card.pause()` (synchronize, gc, `empty_cache`) and wait. During the wait the process holds its CUDA context and the weights (target: torch reserved ≤ 256 MB, test P4). |
+| Free memory below 4.0 GB at the start | Wait up to 15 min with the "memory" banner; then LOW_CARD_MEMORY (exit 6). |
+| An OOM in phase 1 | GatedReader: pause, wait for the bot if its lock is there, one retry at full size; then gpuread's ladder (2000 / 1600 px); then the page is left to phase 2. |
+| An OOM in phase 2 | TorchSession: pause, wait, one retry on the card; then that one call runs on the processor (G4). |
+| Any other CUDA error | CARD_FAILED (exit 6). "no kernel image is available" maps to CARD_NOT_SUPPORTED, and "driver version is insufficient" to DRIVER_TOO_OLD (`gpuengine.card_error_code(e)`, which walks `__cause__` and `__context__`). |
+
+### R2.1.6 Runner changes (Task A; DEV behaviour unchanged)
+
+All of rev 1 §4.3, plus:
+
+| File | Name | Change |
+|---|---|---|
+| `engine.py` | `READER_FACTORY = None`, `make_reader(threads)` | First line: `if READER_FACTORY is not None: return READER_FACTORY(threads)`. Then `Engine()` and `closer._reader()` get the app's card reader, and onnxruntime is never imported. |
+| `places.py` | APP `models_dir`, `glue_data` | `<bundle>\engine\easyocr\model` (the `.pth` weights) and `<bundle>\engine\glue_data.json`. DEV is unchanged (`...\lab\onnx\models`, `...\lab\onnx\pkg\glue_data.json`). |
+| `safety.py` | `prepare` (APP) | May be called twice in one process with the same arguments; the second call arms the same policy (tested). |
+| `engine.py` | `load_page_texts` | Accepts a file under places' `write_root` (DEV: PRIVATE as today; APP: DATA), through rev 1's PRIVATE rebinding (tested in APP). |
+| `tests\test_reader_factory.py` (new) | | With a fake factory: `Engine()` uses it, `closer._reader()` uses it, and `onnxruntime` is not in `sys.modules`. Without one, DEV is unchanged. |
+
+**Not changed:** `gpuread.py` (bundled as it is, R2.4.4), `closer.py`, `glue_numpy.py`, the 7 bot modules (byte-identical
+to 07b1f22), `run_case.py`.
+
+### R2.1.7 The RUNNER_SPEC safety rules S1-S11 in the app
+
+| Rule | In the app (APP mode; DEV is unchanged) |
+|---|---|
+| S1, S3 | Writes go only under DATA and the chosen report folder (rev 1 §4.2). The input file or folder is forbidden even inside those roots. |
+| S2 | Nothing under `C:\Hangeul\BOT` is opened. The ONLY touch is `os.stat` of the lock-path setting, which is never opened, listed or written. |
+| S4 | No network (the guard). `download_enabled=False` on every EasyOCR reader. |
+| S5 | One process uses the card, through the app's card gate (cap 3 GB, waits for the lock, checks between calls). Never DirectML. The worker's guard refuses every process start. The window starts only its own workers and self-test children. |
+| S6 | The bot modules are staged from the worktree; the build checks them against 07b1f22. |
+| S7, S8 | Unchanged (the runner's own code). |
+| S9 | No personal data in code, tests, logs, checkfacts or SELFTEST.txt. Page texts live only in DATA (cache, pruned after 30 days; deleted on uninstall if the user says yes). |
+| S10 | Builders do not commit. |
+| S11 | There is no dev lock in the app. In DEV, the harness `cardrun.py` holds gpu_guard's dev lock during frozen-app runs (R2.6, Q-O1). |
+
+---------------------------------------------------------------------------------------------------------
+
+## R2.2 The card gate (`src\verify\runner\app\cardgate.py`)
+
+Standard library only. It imports neither torch nor `hooks` (`emit` is passed in).
+
+```python
+BOT_LOCK_DEFAULT = r"C:\Hangeul\BOT\data\verification\auto_verify.lock"   # the one C:\Hangeul string in the bundle
+LOCK_STALE_S = 4 * 3600      # = gpu_guard.BOT_LOCK_STALE_S: an older lock is a leftover of a crashed check
+CHECK_EVERY_S = 0.25         # while the card works, the lock files are stat'ed at most this often
+POLL_S = 2.0                 # while waiting
+MEMORY_WAIT_S = 15 * 60      # the longest wait for free card memory
+
+def default_lock_setting() -> Optional[str]
+    # BOT_LOCK_DEFAULT when its FOLDER exists (os.path.isdir: stat only), else None. The window calls it once, at the
+    # first start, and stores the answer in settings.json "gpu_lock_path"; the user may change it or turn it off.
+def lock_active(path: str, now: float) -> bool
+    # os.stat only (never open, list or write): the file exists and now - st_mtime < LOCK_STALE_S
+def lock_kind(path: str) -> str            # "bot" when it is BOT_LOCK_DEFAULT (normcase), else "other"
+class CardMemoryShort(Exception):          # .free_mb, .need_mb
+class CardGate:
+    def __init__(self, lock_paths: Sequence[str], emit: Callable[..., None], *,
+                 free_mb: Callable[[], Optional[int]] = lambda: None,
+                 clock=time.monotonic, wall=time.time, sleep=time.sleep)
+    on_pause: Callable[[], int]            # set by gpuengine.start_card: card.pause (returns torch reserved MB); default 0
+    def wait_turn(self, where: str) -> None
+    def wait_memory(self, need_mb: int, limit_s: float = MEMORY_WAIT_S) -> int
+    def stats(self) -> Dict[str, Any]      # waits, waited_s, by why and where, last free_mb; no paths
+```
+
+**`wait_turn(where)`**, where `where` is "start", "page", "read", "det", "rec" or "oom":
+1. If the last check was less than `CHECK_EVERY_S` ago and found no lock, return at once.
+2. Otherwise stat every lock path. With none active, return.
+3. With one active: `reserved = on_pause()`, then `emit("gpu_wait", state="start", why="lock", lock=<kind>,
+   where=where, reserved_mb=reserved)`.
+4. Every `POLL_S`: `emit("gpu_wait", state="tick", why="lock", lock=<kind>, waited_s=...)`. A `Cancelled` raised by the
+   listener passes through; the gate never catches it.
+5. When no lock is active: `emit("gpu_wait", state="end", why="lock", waited_s=...)`, then return.
+
+There is no time limit: the bot's check ends by itself, and a lock older than 4 h is stale.
+
+**`wait_memory(need_mb)`**: `free_mb()` is None (unknown) or at least `need_mb` → return. Otherwise `gpu_wait`
+start / tick / end with `why="memory"`, `free_mb` and `need_mb`, re-reading every 5 s. A lock that appears meanwhile
+is waited for too. After `limit_s` it raises `CardMemoryShort`.
+
+**Settings and job:** settings.json `"gpu_lock_path"` (a string or null). The Options row reads "Graphics card: wait
+while this file exists [path] [Change…] [Off]"; under the default it adds "(the Telegram bot's document check)".
+job.json `"gpu": {"lock_paths": [...]}` lists the setting plus any test-only `--gpu-lock-extra PATH`, which is never
+stored. With the default setting the REAL bot lock is always watched, also during tests.
+
+---------------------------------------------------------------------------------------------------------
+
+## R2.3 Requirements, messages, events, self-test
+
+### R2.3.1 `src\verify\runner\app\gpuinfo.py` (NVML through ctypes; never imports torch)
+
+```python
+NVML_DLL = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "nvml.dll")   # full path only
+CUDA_DRIVER_MIN = 12080    # the driver must support CUDA 12.8 (torch 2.11.0+cu128)
+MIN_TOTAL_MB = 5800        # a "6 GB" card reports about 6144 MiB
+NEED_FREE_MB = 4096        # cap 3.0 GB + CUDA context + headroom (gpuread NEED_FREE_GB 4.0)
+NO_CARD_ENV = "HDC_TEST_NO_CARD"   # unit tests: probe() returns "no NVML" without loading the DLL
+@dataclass(frozen=True)
+class CardInfo:
+    nvml: bool; error: str          # error: a short scrubbed reason when nvml is False
+    count: int; index: int          # index 0 = the first NVIDIA card in PCI bus order (NVML's order)
+    name: str; driver: str          # "NVIDIA GeForce RTX 0000", "000.00"
+    cuda_driver: int                # nvmlSystemGetCudaDriverVersion_v2, e.g. 12090
+    cc: Tuple[int, int]             # nvmlDeviceGetCudaComputeCapability
+    total_mb: int; free_mb: int     # nvmlDeviceGetMemoryInfo
+def probe(loader=None) -> CardInfo            # nvmlInit_v2 ... nvmlShutdown; never raises
+def free_mb(index: int = 0, loader=None) -> Optional[int]
+def arch_ok(cc, arch_flags) -> bool           # "sm_<maj><min>" in arch_flags, or a "compute_<xy>" entry with xy <= cc
+@dataclass(frozen=True)
+class Problem: code: str; values: Dict[str, str]     # card name, driver, GB numbers only
+def problems(info, arch_flags) -> List[Problem]      # in this order; the window shows the first
+def card_env(environ: Mapping[str, str], index: int) -> Dict[str, str]   # R2.1.2
+def selftest_line(info) -> str
+```
+
+The NVML functions used: `nvmlInit_v2`, `nvmlShutdown`, `nvmlSystemGetDriverVersion`,
+`nvmlSystemGetCudaDriverVersion_v2`, `nvmlDeviceGetCount_v2`, `nvmlDeviceGetHandleByIndex_v2`, `nvmlDeviceGetName`,
+`nvmlDeviceGetCudaComputeCapability`, `nvmlDeviceGetMemoryInfo`.
+
+| Order | Code | When |
+|---|---|---|
+| 1 | NO_NVIDIA_CARD | `nvml.dll` is missing, `nvmlInit_v2` fails, or the device count is 0 |
+| 2 | DRIVER_TOO_OLD | `cuda_driver < CUDA_DRIVER_MIN` |
+| 3 | CARD_NOT_SUPPORTED | `not arch_ok(cc, BUILD.json arch_flags)`; the value "old" when cc < 7.5, "new" when cc > 12.0 |
+| 4 | CARD_TOO_SMALL | `total_mb < MIN_TOTAL_MB` |
+| (waited for) | LOW_CARD_MEMORY | `free_mb < NEED_FREE_MB` after `MEMORY_WAIT_S` (R2.2) |
+| (during a check) | CARD_FAILED | a CUDA error that is not an OOM (R2.1.5), or `torch.cuda.is_available()` False after NVML found a card |
+
+After importing torch, `gpuengine.start_card` confirms: `get_device_capability(0)` must appear in `get_arch_list()`,
+and the device name and total must agree with NVML's index (a mismatch is logged, not fatal).
+
+### R2.3.2 Messages (`app\messages.py`; rev 1 §3.3 style; values only, never paths)
+
+| Code | Title | What the window says |
+|---|---|---|
+| NO_NVIDIA_CARD | No NVIDIA graphics card | "This checker reads documents on an NVIDIA graphics card, and none was found on this PC (or its driver is not installed). Use a PC with an NVIDIA GeForce RTX card (RTX 20 series or newer, 6 GB or more) and its driver. Nothing was checked." |
+| DRIVER_TOO_OLD | Graphics driver too old | "The NVIDIA driver on this PC (version <driver>) is too old for the checker. Install NVIDIA driver 570 or newer (it supports CUDA 12.8) from NVIDIA's website or the NVIDIA App, restart the PC and check again. Nothing was checked." |
+| CARD_NOT_SUPPORTED | Graphics card not supported | old: "This PC's graphics card (<name>) is too old for the checker's reading engine. It needs a GeForce RTX 20 series card or newer. Nothing was checked." new: "This PC's graphics card (<name>) is newer than this version of the checker supports. A newer version of the checker is needed. Nothing was checked." |
+| CARD_TOO_SMALL | Graphics card memory too small | "This PC's graphics card (<name>) has <total> GB of memory; the checker needs a card with at least 6 GB. Nothing was checked." |
+| LOW_CARD_MEMORY | Graphics card busy | "Only <free> GB of the graphics card's memory is free; the checker needs 4.0 GB. Close programs that use the graphics card (games, video or photo editors, other AI tools) and check again." |
+| CARD_FAILED | Graphics card error | "The graphics card stopped working during the check (step '<stage>'). Your files were not changed. Restart the PC and check again; if it happens again, update the NVIDIA driver, run the Self-test and send SELFTEST.txt." |
+| (status) waiting, lock "bot" | Waiting for the graphics card | "Waiting for the graphics card: the Telegram bot is checking documents (waited <m> min). The check goes on by itself when the bot is done. [Cancel]" |
+| (status) waiting, lock "other" | Waiting for the graphics card | "Waiting for the graphics card: another program's lock file is present (waited <m> min). The check goes on by itself. [Cancel]" |
+| (status) waiting, memory | Waiting for the graphics card | "Waiting for the graphics card: <free> GB free, 4.0 GB needed (waited <m> min, at most 15). Close programs that use the graphics card. [Cancel]" |
+
+The footer gets a card line: "Graphics card: <name> (<total> GB) · driver <driver>". The progress text reads "Reading
+page k of N on the graphics card — about X s left" (initially 3.0 s per page, then this PC's average, kept as
+`seconds_per_page_gpu` in settings.json).
+
+### R2.3.3 Protocol, job.json, exit codes, flags (additions to rev 1 §2)
+
+```
+{"v":1,"ev":"card","state":"found","name":"<card>","cc":"12.0","driver":"000.00","total_mb":8151,"free_mb":6120}
+{"v":1,"ev":"gpu_wait","state":"start","why":"lock","lock":"bot","where":"page","reserved_mb":180}
+{"v":1,"ev":"gpu_wait","state":"tick","why":"lock","lock":"bot","waited_s":42.0}
+{"v":1,"ev":"gpu_wait","state":"end","why":"lock","waited_s":180.5}
+{"v":1,"ev":"gpu_wait","state":"start","why":"memory","free_mb":2900,"need_mb":4096}
+{"v":1,"ev":"card","state":"ready","torch":"2.11.0+cu128","cuda":"12.8","seconds":14.2}
+{"v":1,"ev":"page","done":3,"of":14,"seconds":1.2,"where":"card"}                        (phase 1)
+{"v":1,"ev":"stage","key":"firstread","state":"start"}                                   (also "card")
+{"v":1,"ev":"done", ..., "gpu":{"card":"<card>","peak_alloc_gb":2.41,"peak_reserved_gb":2.80,
+                                "cpu_calls":0,"waits":1,"waited_s":180.5}}
+{"v":1,"ev":"error","code":"DRIVER_TOO_OLD","values":{"driver":"000.00"},"text":"<scrubbed>"}
+```
+
+- **job.json** adds `"gpu": {"lock_paths": ["<abs>", ...], "index": 0, "cap_gb": 3.0, "need_free_mb": 4096}`.
+- **Worker exit code 6**: a card problem (the six codes of R2.3.1), sent with an error event first. The other codes are
+  as in rev 1.
+- **The window's controller** treats `gpu_wait` as the state "waiting": the banner of R2.3.2, the progress bar paused,
+  Cancel working (rev 1's cancel path; the gate's tick lets the hook raise within 2 s).
+- **Flags** (`app\entry.py`):
+  - `--cli <input> --program P --out DIR [--today D]` now runs `worker.run_job` IN THIS PROCESS (no window; events
+    printed as JSON lines; the worker's exit codes). It is the same code path as a real check, and the tests use it.
+  - `--data-dir DIR` sets `HDC_DATA_DIR` (tests).
+  - `--gpu-lock-extra PATH` adds a watched lock (tests; never stored).
+  - Rev 1's runner CLI is not in the app: there is no CPU engine.
+- **Boot** (rev 1 §6.2) for the roles `--worker`, `--cli` and `--selftest-part card`, before any numpy or torch
+  import: `os.environ.update(gpuinfo.card_env(os.environ, index))` (the window's `spawn` gives the child the same
+  environment) and `OPENBLAS_NUM_THREADS=1` unless set (as `runner.__main__` does). If `PYTORCH_NO_CUDA_MEMORY_CACHING`
+  or `PYTORCH_NO_HIP_MEMORY_CACHING` is still present, `start_card` refuses with CARD_FAILED, because the cap would not
+  hold.
+
+### R2.3.4 Self-test changes (rev 1 §1.2)
+
+Nine parts as before: `integrity`, `runtime`, `core`, `pdf`, **`card`** (replaces `ocr`), `qr`, `excel`, `tk`, `guard`.
+
+- **`card`** runs in its own child (`--selftest-part card`) with a timeout of 900 s, because it may wait for the bot.
+  Steps:
+  1. `gpuinfo.probe` and `problems`; a gate with the settings' lock path; `start_card`.
+  2. `first_read` on the shipped `selftest_pages.pdf` (2 made-up pages; page 2 turned 90°) into a store in the
+     scratch folder.
+  3. `dv.read_document` of `selftest_page1.jpg` (made at build time), read from the non-ASCII scratch folder
+     (`ascii_path`).
+  4. `light_reader`; one `readtext` of page 1 through it; one recogniser call checked for shape `[1, T, 97]` float32.
+
+  OK when:
+  - no problem was found and the reader is on `cuda`;
+  - CER ≤ 2% on page 1, page 2, the JPG and the light reader's page 1, and page 2 is reported sideways;
+  - the strict flags read back as set;
+  - peak reserved ≤ 3.0 GB, and no call ran on the processor.
+- **`runtime`** additionally imports torch (no CUDA work) and reports, by `GetModuleFileNameW`, that
+  `torch_cuda.dll`, `torch_cpu.dll`, `cudnn64_9.dll`, `cublas64_12.dll` and `cudart64_12.dll` were loaded from the app
+  folder, and that `nvml.dll` came from Windows, with its file version. A CUDA DLL loaded from anywhere else (a CUDA
+  toolkit on PATH) is a FAIL.
+- **READ CODE** is now per card model. `build_read.json` holds the build PC's code and card name. The same card model
+  should give the same code; another model may differ by a few characters (cuDNN picks other kernels, and Turing has
+  no TF32).
+
+New SELFTEST.txt lines (placeholders):
+
+```
+Graphics card: NVIDIA GeForce RTX 0000 | 8.0 GB total, 6.0 GB free | driver 000.00 (CUDA 12.9) | compute 12.0 (this build: 7.5-12.0)
+Reading engine: torch 2.11.0+cu128, CUDA 12.8, cuDNN 9.19.0 | cap 3.0 GB | first read: bot EasyOCR (torch defaults) | light reader: strict fp32
+Waits for: the Telegram bot's lock file (not present now) | waited 0 s during this test
+Reading: start 14.2 s (torch 6.1, CUDA 2.3, readers 1.8) | page 1 (upright) 0.9 s | page 2 (sideways, 4 passes) 3.1 s | photo 0.8 s
+Card memory: peak 2.41 GB allocated, 2.80 GB reserved (cap 3.0 GB) | calls on the processor: 0
+  card       OK    reader on cuda:0; CER 0.4% / 0.9% / 0.6% / 0.4%; READ CODE 51C2-0A7E (build PC, same card model: 51C2-0A7E)
+```
+
+New WARNINGS: free card memory under 5 GB ("a check may wait"); a laptop card under 8 GB ("large pages may be read on
+the processor").
+
+### R2.3.5 Fresh-PC failures (rows added to rev 1 §1.4)
+
+| Risk | Handling | Self-test shows |
+|---|---|---|
+| No NVIDIA card or no driver | NO_NVIDIA_CARD at start; Check disabled. The installer warns too (R2.5). | The card line and part `card`. |
+| Driver too old for CUDA 12.8 | DRIVER_TOO_OLD, judged by NVML's CUDA version, not by a driver number. | Driver and CUDA version. |
+| Card older than Turing (GTX 10 and older) or newer than sm_120 | CARD_NOT_SUPPORTED, from NVML before torch; torch's "no kernel image" maps to the same code. | Compute capability and the build's range. |
+| A system CUDA toolkit or another cuDNN on PATH | torch loads every DLL of its own `torch\lib` by full path; `card_env` removes `CUDA_PATH*`. | Part `runtime` lists where each CUDA DLL came from. |
+| ARM64 Windows | Refused by the installer (`ArchitecturesAllowed=x64os`): no CUDA there. | — |
+| WDDM TDR (a model call over about 2 s on a weak laptop card) | The driver resets the card and the check ends with CARD_FAILED; the message says to retry or update the driver. | Seconds per page. |
+| Antivirus scanning 4.6 GB of DLLs | The first start can take minutes; a quarantined DLL is MISSING_PART (rev 1). | Part `integrity`. |
+
+---------------------------------------------------------------------------------------------------------
+
+## R2.4 Bundle and build
+
+### R2.4.1 What is copied (sizes on disk)
+
+| Part | Source | MB |
+|---|---|---|
+| torch 2.11.0+cu128 DLLs: every `torch\lib\*.dll`, about 40 files (torch_cuda 774, cublasLt64_12 643, cudnn engines 459 + 27, cusparse 362, cufft 263, cudnn_adv 257, torch_cpu 254, cusolver 215, cusolverMg 150, cublas 108, cudnn_ops 101, nvrtc 83 + 83 + 6, nvJitLink 74, curand 69, cudnn_heuristic 56, nvperf_host 21, torch_python 18, cupti, libiomp5md, c10, cudart, shm, uv ...) | `lab\onnx\.venv\Lib\site-packages\torch\lib` | ~4,040 |
+| torch's Python package and `_C` (hooks-contrib collects them, sources kept: `pyz+py`) | same venv | ~150 |
+| torchvision 0.26.0+cu128 (easyocr imports `torchvision.models` and `transforms`) | same venv | ~29 |
+| easyocr 1.7.2 (`en` characters only, via `hooksconfig`) | same venv | ~3 |
+| The weights `craft_mlt_25k.pth`, `english_g2.pth` → `engine\easyocr\model\`; an empty `engine\easyocr\user_network\.keep` | `%USERPROFILE%\.EasyOCR\model` | 98.3 |
+| `glue_numpy.py`, `easyocr_vendor.py`, `engine\glue_data.json` | `lab\onnx\pkg` | <1 |
+| OpenCV 5.0.0.93 headless (without `opencv_videoio_ffmpeg`) | same venv | ~86 |
+| scipy 1.18.1 (what `scipy.ndimage` needs), scikit-image 0.26.0 (`skimage.io` and its lazy-loader `.pyi` stubs), imageio 2.38.1, lazy_loader, tifffile, python-bidi, PyYAML | same venv | ~60-110 |
+| numpy 2.5.2, PyMuPDF 1.28.2, Pillow 12.3.0 | same venv (same versions as `.venv-pkg-numpy`) | ~78 |
+| sympy, mpmath, networkx, jinja2, filelock, fsspec, typing_extensions (only those PyInstaller's analysis of torch pulls in) | same venv | 0-80 |
+| Python 3.12.10, Tk 8.6, the VC++ DLLs of rev 1 §5 | rev 1 | ~27 |
+| Our code (staged and scrubbed), the vendored pyzbar / openpyxl / et_xmlfile, the self-test files, BUILD.json, MANIFEST.json | rev 1 | ~5 |
+| **Total** | about 3,000-4,000 files | **≈ 4.5-4.7 GB** |
+
+**No CUDA DLL is trimmed in this build.** `torch_cuda.dll` imports cufft, cusolver and cusparse (and so nvJitLink)
+whether or not they are used, and cuDNN loads its sub-libraries at run time, so a missing one fails on another PC at
+first use. Possible later trims, about 410 MB (curand, the nvrtc trio, cusolverMg, nvperf_host), need a recorded
+DLL-load trace on at least two card generations.
+
+### R2.4.2 What is left out
+
+- onnxruntime with `DirectML.dll` (73 MB; both lab venvs hold `onnxruntime-directml`), onnx, onnxscript, tensorboard
+  and `torch.utils.tensorboard`, triton.
+- `easyocr.DBNet`, `easyocr.detection_db`, `easyocr.export`, `easyocr.cli`, `easyocr.scripts`.
+- PySide6 and shiboken6 (from `.venv-pkg-numpy`), PyQt5 and PyQt6, matplotlib, pandas, IPython, pytest, pip, venv,
+  ensurepip, idlelib, lib2to3, pydoc_data.
+- `torch\lib\*.lib` (45 MB), `torch\include` (64 MB), `torch\share`, every `tests` / `test` folder, headers (`*.h`,
+  `*.hpp`, `*.cuh`), static libraries, `opencv_videoio_ffmpeg*` (31 MB).
+- DEV and test code: `src.verify.runner.devplaces`, `.tests`, `.selftest`, `src.verify.runner.app.tests`; `run_case.py`
+  is outside `src`.
+- The ONNX models (`craft_mlt_25k.onnx`, `english_g2.onnx`).
+
+### R2.4.3 The build environment (G10)
+
+```
+C:\Users\User\AppData\Local\Programs\Python\Python312\python.exe -m venv --without-pip ^
+    C:\Hangeul\DOCCHECK\lab\app-build\.venv-build
+C:\Hangeul\DOCCHECK\lab\app-build\.venv-build\Lib\site-packages\hdc_build.pth   (exactly these two lines, in this order)
+    C:\Hangeul\DOCCHECK\lab\onnx\.venv\Lib\site-packages
+    C:\Hangeul\DOCCHECK\lab\onnx\.venv-pkg-numpy\Lib\site-packages
+```
+
+- The base interpreter is the one both venvs were made from (their `pyvenv.cfg` `home`, Python 3.12.10).
+- The first line wins for numpy, cv2, pymupdf and PIL (the same versions in both). The second supplies PyInstaller
+  6.22.3, pyinstaller-hooks-contrib 2026.9, altgraph, pefile and pywin32-ctypes (their entry points are found through
+  `importlib.metadata` on `sys.path`). `onnxruntime-directml` and PySide6 are visible but excluded by the spec, and
+  their absence is checked.
+- Every command runs `-I -B` with `PYTHONDONTWRITEBYTECODE=1` and
+  `PYINSTALLER_CONFIG_DIR=C:\Hangeul\DOCCHECK\lab\app-build\pyi-config` (PyInstaller's binary cache would otherwise go
+  to `%LOCALAPPDATA%\pyinstaller`). Nothing is written into either lab venv.
+- Outputs: `C:\Hangeul\DOCCHECK\lab\app-build\builds\<build-id>\{stage, work, dist, installer, reports}`. Rev 1's
+  `%LOCALAPPDATA%\HDCBuild` is not used. The scan (rev 1 §8 b) proves that no code object kept the build path. If one
+  did, the build root has to move back outside `C:\Hangeul` (Q-O2).
+- `packaging\make_build_env.py create | check | remove`:
+  - `check` runs `.venv-build\Scripts\python.exe -I -B -c` to import PyInstaller, torch, torchvision, easyocr,
+    numpy, cv2, pymupdf, PIL, `scipy.ndimage` and `skimage.io`, and prints their versions and
+    `torch._C._cuda_getArchFlags()`. It never touches `torch.cuda.*` or `torch.backends.cudnn.version()`. The result
+    goes to `app-build\build_env.json`.
+  - `remove` deletes `.venv-build` only.
+- Disk: about 15 GB per build under app-build (dist 4.6 GB, work and the PyInstaller cache up to 4.6 GB, Setup.exe
+  about 3 GB), plus 4.6 GB for the install test. 408 GB was free on 29 Oct.
+
+### R2.4.4 Stage (rev 1 §6.1, with these changes)
+
+1. **The copy list is generated:** every `src\verify\runner\*.py` except `devplaces.py` (so `closer.py` and
+   `gpuread.py` are included, and so is any module added later); every `src\verify\runner\app\*.py`; the bot files of
+   rev 1 §5; the glue; the vendored packages (checked against VENDOR.json). Never `tests\`, `selftest\` or
+   `app\tests\`. The list is written to `reports\STAGE_LIST.txt`.
+2. **Weights:**
+   - The two `.pth` files are copied to `stage\engine\easyocr\model\`.
+   - Each MD5 must equal easyocr 1.7.2's own `md5sum` in `easyocr\config.py`: `detection_models["craft"]` and
+     `recognition_models["gen2"]["english_g2"]`, read as text without importing.
+   - Sizes and sha256 values are pinned in BUILD.json.
+   - `stage\engine\easyocr\user_network\.keep` (empty) is added: EasyOCR runs `mkdir` on that folder and puts it on
+     `sys.path`, so the folder must exist and lie under `_MEIPASS`.
+   - No ONNX model is copied.
+3. **Constant swaps** (rev 1 step 4, extended; each old literal must occur exactly once; then the AST check of rev 1
+   step 5):
+   - `prototype_page_types.py`: `DOCS_ROOT`, `TEXT_DIR`, as in rev 1.
+   - `gpuread.py`, the seven literals that hold a DEV path:
+     - `WORKTREE = Path(r"C:\Hangeul\JARVIS\prototype\page-types")` → `Path("no-worktree")`
+     - `PRIVATE = Path(r"C:\Hangeul\DOCCHECK\lab\private-runner")` → `Path("no-dev-root")` (`GPU_DATA` follows)
+     - `GUARD = Path(r"C:\Hangeul\DOCCHECK\lab\onnx\scripts\gpu_guard.py")` → `Path("no-dev-guard.py")`
+     - in `check_out`, "the page-texts file must be under C:\\Hangeul\\DOCCHECK\\lab\\private-runner" → "... must be
+       under the dev root"
+     - in `write_json`, "writes go only under private-runner" → "writes go only under the dev root"
+     - the two argparse help texts "(under private-runner)" → "(under the dev root)".
+
+     The app never reaches any of these. It calls only `read_all`, `load_done`, `pending_pages`, `counts` and
+     `is_oom`; test 8 g imports the module.
+4. **BUILD.json** adds:
+   - `flavour` "gpu-cu128"; the `torch`, `torchvision` and `easyocr` versions; `cuda` "12.8"; `cudnn` (the file
+     version of `cudnn64_9.dll`); `arch_flags`;
+   - `cuda_driver_min` 12080, `cap_gb` 3.0, `need_free_mb` 4096, `min_total_mb` 5800;
+   - `models` {file: size, md5, sha256};
+   - `baseline` "r8 (runner 0.2.7, 344b342)"; `spec` "RUNNER_SPEC r2.7 / APP_SPEC r2".
+
+   Versions are read from the build env's `*.dist-info` and from `torch._C._cuda_getArchFlags()` in a child run
+   with `-I -B`.
+5. **The fast scan** (rev 1 step 6) uses `packaging\scan_allow.txt` (R2.6).
+6. `stage\selftest\selftest_page1.jpg` is made by `make_selftest_pages.py` (page 1 at 200 dpi, JPEG quality 85).
+
+### R2.4.5 The spec file and hooks (`packaging\hdc.spec`, changes to rev 1 §6.2)
+
+```python
+SKIP = ("src.verify.runner.devplaces", "src.verify.runner.tests", "src.verify.runner.selftest",
+        "src.verify.runner.app.tests")                     # gpuread is NOT skipped any more
+hidden = collect_submodules("src.verify.runner", filter=lambda m: not m.startswith(SKIP))
+hidden += ["src.verify.runner.__main__", "glue_numpy", "easyocr_vendor", "pyzbar.pyzbar", "easyocr.easyocr"]
+EXCLUDES = ["onnxruntime", "onnx", "onnxscript", "tensorboard", "torch.utils.tensorboard", "triton",
+            "easyocr.DBNet", "easyocr.detection_db", "easyocr.export", "easyocr.cli", "easyocr.scripts",
+            "PySide6", "shiboken6", "PyQt5", "PyQt6", "matplotlib", "pandas", "IPython", "pytest",
+            "pip", "venv", "ensurepip", "idlelib", "lib2to3", "pydoc_data"]
+datas += [(str(STAGE / "engine/easyocr/model"), "engine/easyocr/model"),
+          (str(STAGE / "engine/easyocr/user_network"), "engine/easyocr/user_network"),
+          (str(STAGE / "engine/glue_data.json"), "engine")]       # no engine/models/*.onnx any more
+a = Analysis(..., hooksconfig={"easyocr": {"lang_codes": ["en"]}}, excludes=EXCLUDES, ...)
+DROP_WORDS = ("directml", "onnxruntime", "opencv_videoio_ffmpeg")
+DROP_DATA = lambda dest: dest.endswith((".lib", ".h", ".hpp", ".cuh")) or "/include/" in dest or "/share/cmake/" in dest
+# after Analysis: drop those; then assert (the build stops otherwise):
+#   no binary base name twice (case-insensitive; a 774 MB DLL collected twice would double the size);
+#   {basename of every torch\lib\*.dll in the build env} == {the collected torch/lib DLLs};
+#   no onnxruntime module or DLL, no PySide6.
+```
+
+- **Hooks:** pyinstaller-hooks-contrib 2026.9's hook-torch (dynamic libs kept under `torch\lib`, sources kept),
+  hook-torchvision, hook-easyocr (with the `lang_codes` config), and the skimage, scipy, imageio and cv2 hooks. There
+  is no own runtime hook: the environment is set by boot before torch is imported (R2.3.3). torch's own
+  `_load_dll_libraries` finds `_internal\torch\lib`.
+- UPX off and `strip=False` (rev 1). `optimize=0`. Windowed exe, version resource as rev 1 with "GPU" in
+  FileDescription.
+
+### R2.4.6 Commands (replace rev 1 §6.4; all absolute; one heavy step at a time)
+
+```
+set BPY=C:\Hangeul\DOCCHECK\lab\app-build\.venv-build\Scripts\python.exe
+set RPY=C:\Hangeul\DOCCHECK\lab\private-runner\.venv-runner\Scripts\python.exe
+set PKG=C:\Hangeul\JARVIS\prototype\page-types\packaging
+set PYTHONDONTWRITEBYTECODE=1
+set PYINSTALLER_CONFIG_DIR=C:\Hangeul\DOCCHECK\lab\app-build\pyi-config
+C:\Users\User\AppData\Local\Programs\Python\Python312\python.exe -I -B %PKG%\make_build_env.py create
+%BPY% -I -B %PKG%\make_build_env.py check
+%BPY% -I -B %PKG%\build.py stage                    -> app-build\builds\<id>\stage (prints <id>)
+%BPY% -I -B %PKG%\build.py freeze --build-id <id>   -> PyInstaller at BELOW_NORMAL priority (about 15-25 min)
+%BPY% -I -B %PKG%\build.py check  --build-id <id>   -> import smoke, MANIFEST.json, scan_bundle, dll_check,
+                                                       frozen --selftest (through cardrun, R2.6)
+%RPY% -I -B %PKG%\tests\parity.py     --build-id <id>          (P1; gives THIS_PC_CODE)
+%RPY% -I -B %PKG%\tests\politeness.py --build-id <id>          (P4)
+%RPY% -I -B %PKG%\tests\timing.py     --build-id <id>          (P5)
+%BPY% -I -B %PKG%\build.py installer --build-id <id> --check-date <D> --this-pc-code <XXXX-XXXX>
+                                                    -> ISCC at BELOW_NORMAL (about 30-60 min)
+%RPY% -I -B %PKG%\tests\install_cycle.py --build-id <id>       (P3)
+```
+
+### R2.4.7 VC++ runtimes and driver DLLs
+
+As rev 1 §5: `vcruntime140.dll`, `vcruntime140_1.dll`, `msvcp140.dll` and `msvcp140_1.dll` (≥ 14.40) at the top of
+`_internal`, and `pyzbar\msvcr120.dll`, preloaded by `boot.preload_runtime()` before numpy or torch. They also cover
+torch_cpu's imports; `libiomp5md.dll` ships in `torch\lib`. No VC_redist runs. `nvcuda.dll` (loaded by cudart) and
+`nvml.dll` (ctypes) come from the NVIDIA driver and are never bundled: `dll_baseline.txt` lists them as
+"driver-provided, loaded at run time".
+
+---------------------------------------------------------------------------------------------------------
+
+## R2.5 Installer (Inno Setup 6.7.4, per user)
+
+`packaging\installer\build_installer.py` runs `C:\Hangeul\DOCCHECK\tools\InnoSetup6\ISCC.exe /Qp
+/DAppFolder="<dist>\Hangeul Document Checker" /DAppVersion=1.0.0 /DFileVersion=1.0.0.<N> /DBuildId=<id>
+/O"<builds>\<id>\installer" <PKG>\installer\hdc.iss` at BELOW_NORMAL priority, with a 3 h timeout. Only after
+`build.py check` has passed.
+
+`packaging\installer\hdc.iss` (the file is the source; this listing follows it). Corrected at integration (29 Oct)
+after ISCC 6.7.4 compiled it: Inno reads a `;` only at the START of a line as a comment (a comment after a directive
+would become part of its value), so comments stand on their own lines; and there is no `VersionInfoComments`
+directive, so the build id goes into `VersionInfoProductTextVersion` (Explorer: Details > Product version). The
+slice size below is 2 000 000 000 bytes, written as one number in the file.
+
+```
+[Setup]
+AppId={{<one fixed GUID, chosen once by Task G and never changed: 767599DF-1DFD-490C-A03A-32EE783D7301>}
+AppName=Hangeul Document Checker
+AppVersion={#AppVersion}
+AppVerName=Hangeul Document Checker {#AppVersion} (GPU, build {#BuildId})
+AppPublisher=Hangeul
+; per user, no admin right
+PrivilegesRequired=lowest
+; = %LOCALAPPDATA%\Programs\Hangeul Document Checker
+DefaultDirName={autopf}\Hangeul Document Checker
+DisableProgramGroupPage=yes
+ArchitecturesAllowed=x64os
+ArchitecturesInstallIn64BitMode=x64os
+MinVersion=10.0.17763
+Compression=lzma2/ultra64
+SolidCompression=yes
+LZMAUseSeparateProcess=yes
+; about 4 threads and 3 GB while compressing
+LZMANumBlockThreads=2
+#ifdef Span
+DiskSpanning=yes
+DiskSliceSize=<2 000 000 000>
+#else
+DiskSpanning=no
+#endif
+; rev 1's single-instance mutex: no install or uninstall while it runs
+AppMutex=HangeulDocumentChecker
+WizardStyle=modern
+SetupLogging=yes
+UninstallDisplayName=Hangeul Document Checker (GPU)
+UninstallDisplayIcon={app}\Hangeul Document Checker.exe
+OutputBaseFilename=Hangeul Document Checker Setup {#AppVersion} GPU
+VersionInfoVersion={#FileVersion}
+VersionInfoProductVersion={#AppVersion}
+VersionInfoProductName=Hangeul Document Checker
+VersionInfoCompany=Hangeul
+VersionInfoDescription=Hangeul Document Checker Setup (GPU)
+VersionInfoProductTextVersion={#AppVersion} (GPU, build {#BuildId})
+[InstallDelete]
+; an upgrade leaves exactly the new build's files
+Type: filesandordirs; Name: "{app}\_internal"
+[Files]
+Source: "{#AppFolder}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+[Tasks]
+Name: desktopicon; Description: "Create a desktop shortcut"
+[Icons]
+Name: "{autoprograms}\Hangeul Document Checker"; Filename: "{app}\Hangeul Document Checker.exe"
+Name: "{autodesktop}\Hangeul Document Checker"; Filename: "{app}\Hangeul Document Checker.exe"; Tasks: desktopicon
+[Run]
+Filename: "{app}\Hangeul Document Checker.exe"; Description: "Open the checker now"; Flags: postinstall nowait skipifsilent
+[Code]
+InitializeSetup: when {sys}\nvml.dll is missing: "This PC has no NVIDIA graphics driver. The checker needs an NVIDIA
+  graphics card (GeForce RTX 20 series or newer) to check documents. Install anyway?" (Yes / No, default No);
+  a silent install only logs it and goes on.
+CurUninstallStepChanged(usPostUninstall): "Also delete the app's saved data (saved page texts, recent checks,
+  settings)? Your reports in Documents are kept." (default Yes, Q3; a silent uninstall takes Yes) ->
+  DelTree(ExpandConstant('{localappdata}\Hangeul Document Checker'), True, True, True)
+```
+
+- **Size.** Uncompressed about 4.6 GB. Setup.exe is expected at about 2.5-3.1 GB, measured by the integrator. That is a
+  single file as long as the compressed data stays under Inno's 4,200,000,000-byte limit, which is also under FAT32's
+  4 GiB file limit for USB sticks.
+  - If ISCC refuses on that limit, `build_installer.py` compiles again with `/DSpan=1`. The result is then
+    `... Setup 1.0.0 GPU.exe` plus `...-1.bin`, `...-2.bin`, which must stay in one folder, and README_INSTALL.txt
+    says so.
+  - The target PC needs about 5 GB of free disk.
+- **Version stamp.** One version, 1.0.0 with build `<id>`, appears in: Setup.exe's version resource and
+  `AppVerName`; Settings → Apps (DisplayVersion); the app exe's version resource; BUILD.json; the window footer;
+  SELFTEST.txt; summary.pdf; checkfacts.json; log.txt. All come from BUILD.json through `app\version.py`. Test P3
+  checks that the installed BUILD.json `build_id` equals the Setup's `/DBuildId`.
+- **Outputs** in `builds\<id>\installer\`: Setup.exe, `setup.sha256`, `installer.json` (bytes, seconds, ratio,
+  spanning yes/no) and README_INSTALL.txt, filled from `packaging\installer\README_INSTALL.txt`:
+
+```
+HANGEUL DOCUMENT CHECKER {APP_VERSION} (GPU) - INSTALL (build {BUILD_ID})
+
+NEEDS: Windows 10 (1809 or newer) or 11, 64-bit; an NVIDIA graphics card, GeForce RTX 20 series or newer, with 6 GB
+or more; NVIDIA driver 570 or newer; about 5 GB of free disk. No internet and no admin rights are needed.
+
+1. COPY "Hangeul Document Checker Setup {APP_VERSION} GPU.exe" (about {SETUP_GB} GB) to the PC, for example with a
+   USB stick. If there are also files ending in "-1.bin", "-2.bin", copy them into the same folder.
+2. RUN it. If Windows says "Windows protected your PC": click "More info", then "Run anyway".
+   Your antivirus may take a few minutes to scan it.
+3. OPEN "Hangeul Document Checker" from the Start menu. If it says the graphics card or driver is not suitable,
+   do what the message says (usually: update the NVIDIA driver) and open it again.
+4. SELF-TEST: click "Self-test" and wait about 2 minutes. It saves SELFTEST.txt in Documents\Hangeul Document Checks.
+5. CHECK ONE CASE AND COMPARE: click "Choose PDF..." and pick CHECK_0001.pdf, program KLP. Open "Options", choose
+   "Check date: fixed" and type {CHECK_DATE}. Click "Check" and look at "Result code".
+   The office PC's code is {THIS_PC_CODE}. The same code means the same verdicts. Another graphics card model can
+   read a few characters differently: if the code differs, send checkfacts.json too.
+6. SEND BACK SELFTEST.txt and the code. Never send summary.txt, report.xlsx or run.json: they hold student data.
+
+ON THE OFFICE PC (where the Telegram bot runs): while the bot is checking documents, the checker shows "Waiting for
+the graphics card" and goes on by itself when the bot is done.
+
+TO REMOVE: Settings > Apps > Hangeul Document Checker > Uninstall. It asks whether to delete the saved page texts and
+settings too (Yes is the default). Your reports in Documents\Hangeul Document Checks stay.
+```
+
+---------------------------------------------------------------------------------------------------------
+
+## R2.6 Tests that prove "best verdict"
+
+Private outputs go under `C:\Hangeul\DOCCHECK\lab\private-runner\apptest\<build-id>\` as in rev 1 §8. Harnesses print
+case ids, counts, rule ids, page numbers and codes; never text, names or paths.
+
+**Card runs on THIS PC (DEV rule, needs the orchestrator's OK: Q-O1).** Every frozen-app run that uses the card goes
+through `packaging\tests\cardrun.py`:
+1. It loads gpu_guard by path and waits for its conditions: the bot's check not running, the dev lock free, at least
+   4.0 GB free.
+2. It holds `gpu_guard.gpu_slot(what, need_free_gb=4.0, wait_s=1800, max_s=<the run's timeout>)` for the whole run and
+   calls `slot.checkpoint()` every 30 s from a watcher thread to refresh the dev lock. A SlotInterrupted there (the bot
+   started) is recorded and does not stop the run: the app's gate pauses by itself.
+3. One run at a time; it ends only its own child, and the lock is released in `finally`.
+
+The app's own gate enforces the bot lock and the 3 GB cap inside the run. gpu_guard's 90 s slot cannot hold a whole
+check (2-4 min), which is why this needs approval.
+
+| Test | What | Pass |
+|---|---|---|
+| **P0 Unit** (builders) | Each task's unit tests on fakes, with `HDC_TEST_NO_CARD=1`: no card, no torch CUDA, no PyInstaller. | Green. |
+| **P1 Parity with r8** (`parity.py`) | Frozen app, `--cli` with a fresh `--data-dir` per case, on the four r8 cases: owner folder 3, owner folder 9, the EAP folder (`runs\owner_*_r8`) and CHECK_0001 = test 1 (`runs\test1_r8`). The input, program and `today` are read from each r8 `run.json`. One extra `--auto` run of CHECK_0001 covers the window → worker path. | (a) Page texts: the app's `pagetexts\<case_id>.json` equals the r8 `page_texts.json` in file names, sha256, page counts, and every page's text, kind and sideways flag. Differing pages are listed by number with character counts. (b) summary.txt lines equal, except the READING line, the new RESULT CODE line and the output-path line. (c) In run.json: equal `overall`; `docs[*]` unit pages, verdict and `findings[*].(verdict, rule, pages)`; the cross findings; `missing_lines`; `notices`. (d) Every closer look's decision, best candidate and dot equal to r8's look log. (e) The result code printed per case: CHECK_0001's is THIS_PC_CODE; `--auto` gives the same. **The build passes only when (b)-(d) hold for all four cases.** A page-text difference with equal verdicts is explained in the report before hand-over. Also reported: calls on the processor and waits. |
+| **P2 Self-test** | `--selftest` of the frozen dist (`build.py check`, via cardrun) and of the installed app (P3). | 9 of 9 OK. READ CODE recorded with the card name. |
+| **P3 Install cycle** (`install_cycle.py`) | Runs only when neither the HKCU key `{AppId}_is1` nor `%LOCALAPPDATA%\Hangeul Document Checker` exists (never touches an install or data of the owner; otherwise it reports SKIPPED). Steps: `Setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR="%LOCALAPPDATA%\Temp\HDC install test" /TASKS="" /LOG=<reports>\install.log`; checks; installs again over it (upgrade path, `[InstallDelete]`); checks; `unins000.exe /VERYSILENT /SUPPRESSMSGBOXES`. | After each install: every file matches MANIFEST.json (size and sha256, none extra); the HKCU uninstall key with DisplayVersion 1.0.0; the Start-menu `.lnk` points at the exe; BUILD.json `build_id` = the Setup's; the installed `--selftest` (via cardrun) exits 0. After the uninstall: the folder, the key, the shortcut and the DATA folder made by the test are gone. |
+| **P4 Politeness** (`politeness.py`) | Frozen `--cli` on CHECK_0001 via cardrun, with `--gpu-lock-extra <apptest>\fakelock\auto_verify.lock`. Scenarios: (1) lock there before the start; (2) lock made after the 3rd phase-1 page event; (3) lock made after the `names` stage starts (phase 2); (4) Cancel (stdin `cancel` under `--worker`) during a wait; (5) a stale lock (mtime set 5 h back); (6) none (the reference). | (1) `gpu_wait` start with `where` "start" within 3 s and no `card ready` event for 60 s; after removal the check finishes. (2) and (3): `gpu_wait` start within 3 s, `reserved_mb` ≤ 256, no page or stage event during 60 s, resumed within 10 s of removal. (4) a `cancelled` event and exit 4 within 10 s; the worker process is gone; the saved page texts make the next run skip the pages already read. (5) no wait. (1), (2), (3) and (5) give the same result code as (6) and P1. When the REAL bot lock was active during a scenario, its timing checks are reported as "bot active" and not failed. |
+| **P5 Timing and memory** (`timing.py`) | The four cases (fresh DATA), then CHECK_0001 again with saved page texts. | Reported: worker start (torch import, CUDA, readers), phase-1 seconds per page against the r8 `page_texts.json` seconds, phase-2 seconds, calls on the card and on the processor, peak working set and commit of the worker, peak card allocated and reserved, waits. Targets: worker peak commit ≤ 4.5 GB; card peak reserved ≤ 3.0 GB; each case's total ≤ r8's `run_case.log` total + 60 s; the re-check loads no first-read model. |
+| **8 b Static scan** (amended) | As rev 1, over the 4.6 GB dist (the raw files, base_library.zip, the CArchive, the PYZ). | Zero hits of the forbidden strings except the lines of `packaging\scan_allow.txt` (`module or file \| string \| reason`). For our code it allows exactly ONE line: `src.verify.runner.app.cardgate \| c:\hangeul\bot\data\verification\auto_verify.lock \| the default lock path, used only when its folder exists (R2.2)`. Third-party hits (for example ".venv" in torch's own code) are reviewed and listed with a reason before the build passes. The `src.*` module set equals `STAGE_LIST.txt`; no onnxruntime, PySide6 or `DirectML.dll`. |
+| **8 c Runtime trace** (amended) | As rev 1 on one case (CHECK_0001, `--auto`). | The allowed set adds `%WINDIR%` (nvml.dll; nvcuda.dll and the DriverStore) and `<DATA>\tmp\<job>\ascii`. No access under `C:\Hangeul\BOT`: the lock is only stat'ed, which raises no audit event. Native NVIDIA driver files (`%APPDATA%\NVIDIA\ComputeCache`, ProgramData) are outside the trace's reach; this is listed as a limit. |
+| **8 g Frozen smoke** (amended) | `--selftest-part imports` imports every bundled `src.*` module (gpuread included), torch, torchvision, easyocr, `scipy.ndimage` and `skimage.io` without CUDA work. | No error. |
+| **8 h DLL closure** (amended) | As rev 1, over every `.dll` and `.pyd` of the dist (pefile, `fast_load` + import tables). | Every import is in the bundle or on the baseline; `nvcuda.dll` and `nvml.dll` count as "driver-provided"; no base name twice; the `torch\lib` DLL set equals the build env's; the VC++ rule of rev 1. |
+
+---------------------------------------------------------------------------------------------------------
+
+## R2.7 Build tasks (replace rev 1 §9)
+
+New app code goes in `C:\Hangeul\JARVIS\prototype\page-types\src\verify\runner\app\`; packaging goes in
+`...\page-types\packaging\`. The runner's own files change only in Task A. File ownership is disjoint.
+
+**Before the builders start**, the orchestrator creates the two EMPTY package files `app\__init__.py` and
+`app\tests\__init__.py`, and nobody else writes them. Packaging tests run as
+`-m unittest discover -s <PKG>\tests`, with no package files. Each task codes against the contracts of R2.1-R2.5 and
+rev 1 §§1.2, 1.3, 2, 3.3, 4. It fakes the other tasks' modules in its unit tests, which must not import the card,
+torch's CUDA or PyInstaller. `emit` and `hooks` are passed in, so E and T can be built before A.
+
+**Every builder:**
+- runs only its own light unit tests, with `HDC_TEST_NO_CARD=1` and in the runner venv;
+- writes test files only under `private-runner\selftest\app\<task>`;
+- never runs the full runner suite, a real case or PyInstaller, and never uses the card;
+- leaves no process behind;
+- puts no personal data anywhere;
+- does not commit.
+
+At most 3 builders run at a time, because of PC load.
+
+| Task | Owns (exactly) | Delivers |
+|---|---|---|
+| **A Runner seam** | `src\verify\runner\places.py`, `devplaces.py`, `hooks.py`, `resultcode.py`, `tests\test_places.py`, `tests\test_resultcode.py`, `tests\test_reader_factory.py`; and ONLY the edits of rev 1 §4.3 + R2.1.6 in `botimport.py`, `safety.py`, `engine.py`, `pipeline.py`, `__main__.py`, `report.py`, `birth.py`, `tin.py`, `doccheck.py`, `tests\test_report.py` | The seam with DEV unchanged; `READER_FACTORY`; APP `models_dir` and `glue_data`; `prepare` safe to call twice; `load_page_texts` under write_root. It runs its own new tests and `test_report`, `test_safety` and `test_engine` (with the reader faked), not the whole suite. |
+| **E Card info and gate** | `app\gpuinfo.py`, `app\cardgate.py`, `app\tests\test_gpuinfo.py`, `app\tests\test_cardgate.py` | R2.2 and R2.3.1: NVML through an injectable loader (a fake DLL object in the tests); `problems()` order and thresholds; `card_env`; `arch_ok`; lock stat-only, stale rule, `CHECK_EVERY_S`, waits with fake clock and sleep, Cancelled passing through, `wait_memory` timeout; `default_lock_setting` only when the folder exists (fake folders under private-runner). |
+| **T Torch engine** | `app\gpuengine.py`, `app\tests\test_gpuengine.py`, `app\tests\fake_torch.py` | R2.1.2, R2.1.3, R2.1.5. `start_card` (refuses under `HDC_TEST_NO_CARD` before importing torch; cap fraction; native allocator; defaults asserted); `GatedReader`; `ascii_path`; `first_read` around the REAL `gpuread.read_all` with a fake dv and a fake reader (resume, skip, save, page events, release in `finally`); `strict_fp32`; `load_models` (node-for-node test against export_onnx.py when present); `TorchSession` (input checks, one OOM retry, processor call, CUDA error raised, output checks); `CardLightReader`; `card_error_code`; `reading_note`. Uses a fake torch namespace (`cuda.*`, `OutOfMemoryError`, `inference_mode`, `from_numpy`). |
+| **C Process plumbing** | `app\entry.py`, `app\boot.py`, `app\protocol.py`, `app\spawn.py`, `app\controller.py`, `app\trace.py`, `app\version.py`, `app\tests\fake_worker.py`, `test_protocol.py`, `test_controller.py`, `test_boot.py`, `test_trace.py`, `test_spawn.py`, `test_version.py` | Rev 1 §2 and §6.2 with R2.3.3: the `card` and `gpu_wait` events, job.json `gpu`, exit 6, the waiting state and Cancel during a wait, `--cli` as the in-process `worker.run_job` (imported lazily), `--data-dir`, `--gpu-lock-extra`, boot applying `gpuinfo.card_env` + `OPENBLAS_NUM_THREADS` for the worker roles, the spawn environment, `version.py` with the BUILD.json GPU fields (`ARCH_FLAGS` ...). |
+| **W Worker** | `app\worker.py`, `app\checkfacts.py`, `app\summarypdf.py`, `app\tests\test_worker.py`, `test_checkfacts.py`, `test_summarypdf.py` | R2.1.1 `run_job`: the order of the phases, the guard before the card, the input snapshot, `READER_FACTORY`, the reading note, error mapping (CardRefused, CardMemoryShort, CUDA errors to the six codes and exit 6; Cancelled to exit 4), the `done` gpu block, the checkfacts `gpu` block (counts, no personal data). Tests fake gpuinfo, cardgate, gpuengine and pipeline. |
+| **B Window** | `app\window.py`, `app\messages.py`, `app\recent.py`, `app\settingsfile.py`, `app\userdirs.py`, `app\tests\test_messages.py`, `test_recent.py`, `test_userdirs.py`, `test_settingsfile.py`, `test_window_model.py` | Rev 1 §3 with R2.3.2: card messages and waiting banners, the startup and pre-Check probe (Check disabled on a hard problem), the footer card line, the Options lock setting (`gpu_lock_path`, default from `cardgate.default_lock_setting()`), GPU seconds per page. The window logic sits in a headless `WindowModel`, tested without a display. |
+| **D Self-test** | `app\selftest.py`, `app\sysinfo.py`, `app\tests\test_selftest.py`, `test_sysinfo.py`, `packaging\make_selftest_pages.py` | Rev 1 §1.2 with R2.3.4: part `card` (fakes in the tests), part `runtime` with the CUDA DLL origins (a fake module list), the new SELFTEST.txt lines and warnings, READ CODE per card; `selftest_page1.jpg`. |
+| **F Build** | `packaging\make_build_env.py`, `build.py`, `stage.py`, `hdc.spec`, `version.py`, `make_icon.py`, `manifest.py`, `dll_baseline.txt`, `scan_allow.txt`, `packaging\tests\test_stage.py`, `test_build_env.py`, `test_manifest.py` | R2.4: the build env (create, check, remove; only under app-build), the generated stage list, weights with MD5 and sha256, the seven gpuread swaps plus the rev 1 swaps under the AST check, BUILD.json fields, the spec, the after-Analysis assertions, `build.py` (`stage`, `freeze`, `check`, `installer` calling Task G's `build_installer.main`), BELOW_NORMAL subprocesses. Tests use made-up stage trees; none runs PyInstaller. |
+| **G Installer** | `packaging\installer\hdc.iss`, `packaging\installer\build_installer.py`, `packaging\installer\README_INSTALL.txt`, `packaging\tests\install_cycle.py`, `packaging\tests\test_installer.py` | R2.5 and P3: the .iss (a fixed AppId GUID), ISCC at BELOW_NORMAL with the `/DSpan=1` second pass, filling the README, the cycle with its "never touch the owner's install or data" preconditions. Tests: static checks of the .iss text, the README fill, and the cycle's precondition and manifest logic on made-up folders. No ISCC run. |
+| **H Release tests** | `packaging\tests\scan_bundle.py`, `dll_check.py`, `trace_check.py`, `parity.py`, `politeness.py`, `timing.py`, `cardrun.py`, `packaging\tests\test_release_tools.py` | R2.6 (8 b, 8 c, 8 h, P1, P4, P5, cardrun) with unit tests on fakes: made-up dist trees and DLL import tables, made-up r8/app run.json and summary pairs (equal, a verdict change, a page-text change), recorded event streams for the politeness rules, and a fake gpu_guard for cardrun. |
+
+**Shared contracts:**
+- E defines `gpuinfo.card_env`, `Problem` codes and `cardgate` events; C, W, B and D use them.
+- T defines `Card`, `first_read`, `light_reader`, `TorchSession.stats`, `card_error_code` and `reading_note`; W and D
+  use them.
+- A defines `hooks`, `places` and `READER_FACTORY`; C, W and T use them.
+- C defines the protocol and `app\version.py`; B renders C's events.
+- F owns BUILD.json's fields (C's `version.py` reads them).
+- G's `build_installer.main(argv)` is called by F's `build.py installer`.
+- H's `cardrun.run(cmd, timeout)` is used by F's `build.py check` and by G's `install_cycle.py`.
+
+**Integration (one integrator, after all tasks; WORKPLAN G1 then G2; one heavy process at a time, BELOW_NORMAL, at
+most about half the threads and 6 GB, no process left behind, never stopping a process it did not start):**
+1. Check ownership with `git status`; check that the 7 bot modules are unchanged since 07b1f22 (`git diff --quiet`).
+2. Run the full runner suite once (DEV), then every app and packaging unit test, then `pii_scan`. Owners fix their own
+   files.
+3. `make_build_env create` and `check`; `build.py stage`, `freeze`, `check` (P2 on the dist through cardrun).
+4. P1 parity, case by case; then P4, P5 and 8 c.
+5. `build.py installer`, then P3.
+6. Report: sizes, times, THIS_PC_CODE, the MISS lists, calls on the processor, waits, peaks; the paths of Setup.exe
+   and README_INSTALL.txt.
+7. Update WORKPLAN.md. Leave the commit to the orchestrator.
+
+---------------------------------------------------------------------------------------------------------
+
+## R2.8 Open risks
+
+1. **The bot's 15-minute check on this PC.**
+   - The overlap with a starting bot check is at most one model call (about 1.5 s for the largest detection). In
+     that window this process may hold up to 3 GB plus its CUDA context, while the bot runs uncapped.
+   - During a wait the app keeps its CUDA context and the weights (target reserved ≤ 256 MB, plus a context of about
+     0.3-0.5 GB that torch does not count).
+   - If the bot keeps a large idle cache, free memory may stay under 4.0 GB, so checks on this PC would wait and then
+     fail with LOW_CARD_MEMORY. P4 and P5 log the free memory while the bot idles.
+2. **Drivers on other PCs.** A driver for CUDA 12.8 (R570 or newer) is required, and older drivers get
+   DRIVER_TOO_OLD. Owners of other PCs must update; no driver ships with the app.
+3. **Other card models read slightly differently.** Turing has no TF32, and other cards get other cuDNN kernels. A
+   few characters can differ from this PC, and through them a verdict and the result code. The result code and
+   checkfacts.json show it. Only a strict-fp32 first read everywhere would remove it, and that needs a new baseline
+   instead of r8 (out of scope).
+4. **Antivirus and SmartScreen** on an unsigned 2.5-3 GB Setup.exe and 4.6 GB of DLLs: slow scans, a possible
+   quarantine (MISSING_PART), the "Windows protected your PC" prompt when downloaded. Mitigations: deliver by USB (no
+   internet mark), Inno's well-known stub, no UPX, version resources. Code signing remains a later owner decision.
+5. **Size and time.** Installed 4.6 GB; Setup.exe about 2.5-3.1 GB (not measured yet). Above Inno's 4.2e9-byte limit
+   the installer spans into `.bin` files. The build needs about 15-25 min of PyInstaller and 30-60 min of LZMA2 alone
+   on the owner's PC; a heavy step during the owner's work would slow the PC.
+6. **Phase 2 is not bit-identical to DEV.** The light reader's calls run on the card in strict fp32 (or on the
+   processor for oversize calls) instead of ONNX on the CPU: numbers equal within about 1e-6. Decisions were equal on
+   550 closer looks, but the other light-reader uses (crop re-reads, turned pages) are covered only by P1's four
+   cases. Without `max_split_size_mb:256`, large detections may fall to the processor more often (slower, not
+   different).
+7. **Phase 1 exactness rests on the same process conditions as gpuread** (R2.1.2). These matter: torch defaults,
+   allocator and cuBLAS settings untouched, the cap, the package versions (imageio 2.38.1 against 2.37.4 for picture
+   files), and `OPENBLAS_NUM_THREADS=1`, which DEV gpuread did not set. P1 (a) checks every page.
+8. **The gpuread review findings of WORKPLAN step 2 a** are inherited unchanged so the verdicts stay those of r8: an
+   OOM inside the bot's rotation tries is swallowed (GatedReader's wait-and-retry lowers the chance), and the RGB/BGR
+   order of a picture after an OOM is wrong. Fixing them later changes gpuread for DEV and the app together and needs
+   a new P1.
+9. **RAM.** torch and CUDA host state (about 1 GB) come on top of the runner's 2-2.8 GB: the target is 4.5 GB, so an
+   8 GB PC may page. Each check starts in about 15-25 s (torch import, CUDA start, two model loads).
+10. **The DEV card rule.** gpu_guard's 90 s slots cannot hold a whole app check, so cardrun.py needs approval (Q-O1).
+11. **PyInstaller and the build path.** If a code object kept `C:\Hangeul\...\app-build\...`, the scan fails and the
+    build root must move (Q-O2).
+12. **Wall-clock budgets** (rev 1 §10 item 7: QR and barcode ladders in birth and tin) still make verdicts depend on
+    CPU speed on slower PCs.
+13. **One card per PC.** The first NVIDIA card in PCI order is used; there is no choice in the window. On laptops a
+    weak card can hit Windows' 2 s TDR on large detections (CARD_FAILED).
+14. **The one C:\Hangeul string.** The default lock path is a literal in the bundle (one scan allow-list line). It is
+    only stat'ed, and only when its folder exists.
+
+## R2.9 Questions (recommended answer first)
+
+| # | For | Question | Recommended |
+|---|---|---|---|
+| Q4 | owner | A single model call too large for the card's 3 GB cap: (a) run that one call on the processor with the same weights, or (b) stop the check with "a page is too large for the graphics card"? | **(a)**: the verdict stays the tested one; it is rare and reported. |
+| Q5 | owner | Bigger cards (12 GB and more): keep the 3 GB cap, or use more? | **Keep 3 GB**: the same pages are read the same way as on this PC. |
+| Q6 | owner | Desktop shortcut ticked by default? | Yes. |
+| Q2, Q3 | owner | Rev 1's OneDrive question and the 30-day cache. | As rev 1 recommends; page texts now live in `DATA\cache\pagetexts` too. |
+| Q-O1 | orchestrator | Frozen-app card runs on this PC go through `cardrun.py` (gpu_guard's dev lock held and refreshed for the whole run; the app's own gate for the bot and the 3 GB cap) instead of ≤ 90 s gpu_guard slots. | Approve before G2. Without it, the app cannot be tested on the card here. |
+| Q-O2 | orchestrator | If PyInstaller keeps the build path in code objects, may the build root move to `%LOCALAPPDATA%\HDCBuild` (rev 1) while the venv stays in app-build? | Yes; the scan decides. |
+
+## R2.10 Integration notes (29 Oct; G1 integrated, nothing frozen yet)
+
+Where the built code differs from the text above, the code is right and these notes say why. Each is pinned by a test
+(`packaging\tests\test_integration.py` holds the cross-task ones).
+
+| # | Where | Built | Why |
+|---|---|---|---|
+| I1 | R2.3.1 `arch_ok`, R2.3.1 / R2.1.2 `start_card` | CUDA binary compatibility, the same rule in `gpuinfo.arch_ok` (before torch) and `gpuengine.arch_supported` (after torch): `sm_XY` runs on X.Y and later minors of major X; `sm_XYa` on X.Y only; `compute_XY` on X.Y and newer. Equal on cc 5.0-13.9 (tested). | The literal "cc in the list" would refuse every RTX 40 card (cc 8.9: torch ships sm_86, no sm_89), and 8.7 / 10.3 / 12.1 cards. torch's own check uses the same-major rule. |
+| I2 | R2.3.3 boot line | `gpuinfo.apply_card_env(os.environ, index)` changes the environment in place. | `os.environ.update(card_env(...))` cannot delete a variable. |
+| I3 | R2.1.3 `load_models` | export_onnx's `load_reader` is unchanged node for node; `easyocr` reaches it through a thin facade that adds the bundle's `user_network_directory`. | Otherwise EasyOCR makes `%USERPROFILE%\.EasyOCR\user_network`, which the APP guard refuses on a fresh PC (this PC already has the folder, so P1 would not show it). |
+| I4 | R2.6 8 g | `--selftest-part imports` = `selftest.part_imports` (not one of the nine parts): every runner module found package by package, the bot modules through `botimport.load`, then torch, torchvision, easyocr, scipy.ndimage, skimage.io and the other packages; FAIL if torch started CUDA. `build.py check` judges `imports.json`'s status, not only the exit code (a part child exits 0 once its result is written). | Task D had no such part; F's check runs it. |
+| I5 | R2.6 8 c | `trace_check` fails only the guard's network socket events (connect, getaddrinfo, sendto, sendmsg, gethostbyname(_ex), gethostbyaddr, getnameinfo) without `refused: true`. `socket.__new__` / `socket.gethostname` (from `platform.uname()`) are counted, not failed. | Task C's trace records them with `refused: false`; they reach no other host. |
+| I6 | R2.5 listing | Corrected above (comments on their own lines; `VersionInfoProductTextVersion`). | ISCC 6.7.4. |
+| I7 | rev 1 §6.4 order | `build.py check`: imports smoke → MANIFEST → scan_bundle, dll_check → frozen `--selftest` (9 of 9 + READ CODE) → `build_read.json` → MANIFEST rewritten and verified. | The self-test's `integrity` part needs a MANIFEST. |
+| I8 | R2.3.4 part `card` | Waits at most 300 s for free card memory (inside the 900 s child); CER over A-Z and 0-9 only; READ CODE over four texts (page 1, page 2, photo, light reader page 1); no QR on page 2; the photo is read inside the first read. | Fit the child timeout; spacing is not reading; a QR's blocks would count as stray characters. |
+| I9 | R2.6 Q-O1 | `cardrun.run` refuses (NotApproved) unless `HDC_CARDRUN_APPROVAL=Q-O1` is set. | The approval is enforced in code, not only in a docstring. |
+| I10 | rev 1 §2 `done` | `done.lines` and `done.out` hold student data; P1 / P4 / P5 print counts and codes only, and cardrun writes the child's stdout only to `apptest\...\stdout.log`. | S9. |
+
+**G1 smoke (29 Oct, from source on this PC's card, made-up self-test pages, one gpu_guard slot):** `worker.run_job`
+with places in APP mode through the test overrides: exit 0 in 56 s; first read CER 0.0 on both PDF pages and the photo,
+page 2 reported sideways; light reader 167 calls on the card, 0 on the processor, 0 OOM retries; peak card reserved
+2.97 GB (the first read fills the 3 GB cap, as gpuread did); guard refusals 0, process starts 0. The DEV runner (ONNX
+on the CPU) on the same input and page texts gave equal summary lines, equal run.json findings and the same result
+code, and B's window rendered the worker's events on real Tk widgets. Seen: the worker's peak commit was 5.4 GB
+(working set 1.8 GB) against P5's 4.5 GB target, and the runner's `bot` stage took 47 s for 3 made-up pages (DEV: 74 s,
+so it is the runner's own work).
+
+---------------------------------------------------------------------------------------------------------
+
+# REVISION 1 — the CPU design (27 Oct 2026); in force wherever revision 2 above does not override it
+
 Status: design, revision 1, 27 Oct 2026. It builds on RUNNER_SPEC.md revision 2 (runner 0.2.0, rules: bot
 2026-10-21.3 + runner 2026-10-27.r2). Apply it AFTER the runner build finishes. This file holds no personal data:
 every name, number, date and code in it is a placeholder.

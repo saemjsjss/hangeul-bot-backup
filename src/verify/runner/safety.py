@@ -39,6 +39,11 @@ tests arm it in a child process (tests/test_safety.py). Writes made by native co
 OpenCV writing an image) raise no audit event; the runner's own code calls assert_writable() before
 every such write (engine.cut, engine.cut_page).
 
+APP mode (places.py; APP_SPEC rev 1 section 4.2, rev 2 R2.1.6): the write root is DATA, nothing is forbidden but
+the input, there is no bot folder and no sibling rule; prepare() also allows the report folder the user picked
+(checked by check_out_dir's APP rules) and may be called twice with the same arguments; arm_window() and
+allow_file() guard the window. DEV values, guards and messages are unchanged.
+
 Standard library only, so the GPU worker can import it in the bot venv. No personal data.
 """
 from __future__ import annotations
@@ -53,7 +58,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from . import botimport
+from . import botimport, places
 
 
 class SafetyError(Exception):
@@ -76,12 +81,18 @@ def redact(text: Any) -> str:
     return _PATHLIKE.sub("<path>", str(text))
 
 
+# APP_SPEC rev 1 section 4.3: every value below comes from places (DEV: devplaces, the same values as before; APP:
+# DATA, nothing forbidden, no bot folder, no sibling rule). The names are kept for the tests.
+_PLACES = places.current()
+APP_MODE = _PLACES.mode == places.APP
 PRIVATE = botimport.PRIVATE
-BOT = Path(r"C:\Hangeul\BOT")
-HANGEUL = Path(r"C:\Hangeul")
-FORBIDDEN = [BOT, Path(r"C:\Hangeul\VERIFIED STUDENT DOCUMENTS")]   # + siblings "C:\Hangeul\* STUDENT DOCUMENTS"
-NO_INSTALL = [Path(r"C:\Hangeul\DOCCHECK\lab\onnx\.venv-pkg-numpy")]  # never written either (S1)
-TMP_DIR = PRIVATE / "tmp"
+BOT = _PLACES.no_open_root                  # None in APP
+HANGEUL = _PLACES.sibling_root              # the "* STUDENT DOCUMENTS" siblings are forbidden too; None in APP
+FORBIDDEN = list(_PLACES.forbidden)
+NO_INSTALL = list(_PLACES.no_install)       # never written either (S1)
+TMP_DIR = _PLACES.temp_dir
+WRITE_LABEL = _PLACES.write_label           # message words for the write root (DEV: as the messages always said)
+NO_OPEN_LABEL = _PLACES.no_open_label       # message words for the folder nothing is opened in
 # The roots the guard is armed with. Tests narrow them in a CHILD process (tests/test_safety.py) so that
 # the guard can be proven without a single write outside private-runner and without touching the bot.
 WRITE_ROOT = PRIVATE
@@ -174,6 +185,8 @@ def is_forbidden(p: Path) -> bool:
         return False
     if any(_under(s, _norm(f)) for f in [*FORBIDDEN, *NO_INSTALL]):
         return True
+    if HANGEUL is None:                          # APP: no sibling rule
+        return False
     h = _norm(HANGEUL)
     if _under(s, h) and s != h:
         first = s[len(h):].lstrip("\\").split("\\", 1)[0]
@@ -202,14 +215,17 @@ def _private(p: Path, what: str) -> Path:
 def check_out_dir(out: Path, input_path: Path) -> Path:
     """The resolved --out folder. Raises SafetyError when it is not absolute, not strictly under
     private-runner, inside a forbidden folder, inside the input (or the input itself), or when the
-    input lies inside it (its fixed file names are overwritten). Nothing is created."""
+    input lies inside it (its fixed file names are overwritten). Nothing is created. APP mode: the rules of
+    APP_SPEC rev 1 section 4.2 instead (_check_out_dir_app)."""
+    if APP_MODE:
+        return _check_out_dir_app(Path(out), Path(input_path))
     o = _private(Path(out), "--out")
     if _norm(o) == _norm(PRIVATE):
         raise SafetyError(f"--out must be a folder inside {PRIVATE}, not the folder itself")
     if not Path(input_path).is_absolute():
         raise SafetyError("the input must be an absolute path")
     if _under(_norm(input_path), _norm(BOT_ROOT)):
-        raise SafetyError("the input must not lie under C:\\Hangeul\\BOT (the runner never opens it)")
+        raise SafetyError(f"the input must not lie under {NO_OPEN_LABEL} (the runner never opens it)")
     i = _resolved(Path(input_path))
     if _under(_norm(o), _norm(i)):
         raise SafetyError("--out must not lie inside the input")
@@ -218,9 +234,83 @@ def check_out_dir(out: Path, input_path: Path) -> Path:
     return o
 
 
+# APP mode (APP_SPEC rev 1 section 4.2): the report folder the user picked. The messages are pinned: the app maps
+# them to its plain-English messages (REPORT_INSIDE_INPUT, INPUT_INSIDE_REPORT, REPORT_NOT_WRITABLE).
+APP_OUT_RELATIVE = "the report folder must be an absolute path"
+APP_OUT_DEVICE = "the report folder must be on a drive of this PC, not a network or device path"
+APP_OUT_ROOT = "the report folder must not be a drive root"
+APP_OUT_PROTECTED = "the report folder must not lie in a Windows, program or app folder"
+APP_OUT_DATA = "the report folder must not be the app's data folder itself"
+APP_OUT_INSIDE_INPUT = "the report folder must not lie inside the input"
+APP_INPUT_INSIDE_OUT = "the input must not lie inside the report folder"
+APP_INPUT_RELATIVE = "the input must be an absolute path"
+_PROTECTED_ENV = ("SystemRoot", "WINDIR", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "ProgramData")
+
+
+def _protected_roots() -> List[str]:
+    """%WINDIR%, the program folders, %ProgramData% and the app's own folder (normalised; unset ones left out)."""
+    roots = [os.environ.get(k, "") for k in _PROTECTED_ENV]
+    roots += [str(places.app_install_dir())]
+    if _PLACES.bundle is not None:
+        roots.append(str(_PLACES.bundle))
+    out: List[str] = []
+    for r in roots:
+        s = _norm(r) if r and os.path.isabs(r) else None
+        if s and s not in out:
+            out.append(s)
+    return out
+
+
+def _is_drive_root(p: Path) -> bool:
+    a = Path(os.path.abspath(p))
+    return a.parent == a
+
+
+def _check_out_dir_app(out: Path, input_path: Path) -> Path:
+    """The resolved report folder in APP mode. Pure checks, nothing is created: absolute; on a drive (not a share or
+    a device path); not a drive root; not under %WINDIR%, the program folders, %ProgramData% or the app's own folder;
+    not DATA itself (under DATA is fine); not inside the input, nor the input inside it."""
+    if not out.is_absolute():
+        raise SafetyError(APP_OUT_RELATIVE)
+    if _device(_norm(out)):
+        raise SafetyError(APP_OUT_DEVICE)
+    o = _resolved(out)
+    if _device(_norm(o)):
+        raise SafetyError(APP_OUT_DEVICE)
+    if _is_drive_root(out) or _is_drive_root(o):
+        raise SafetyError(APP_OUT_ROOT)
+    forms = (_norm(out), _norm(o))
+    if any(_under(s, r) for s in forms for r in _protected_roots()):
+        raise SafetyError(APP_OUT_PROTECTED)
+    if any(s in (_norm(WRITE_ROOT), _norm(_resolved(Path(WRITE_ROOT)))) for s in forms):
+        raise SafetyError(APP_OUT_DATA)
+    if not input_path.is_absolute():
+        raise SafetyError(APP_INPUT_RELATIVE)
+    i = _resolved(input_path)
+    ins = (_norm(input_path), _norm(i))
+    if any(_under(s, x) for s in forms for x in ins):
+        raise SafetyError(APP_OUT_INSIDE_INPUT)
+    if any(_under(x, s) for s in forms for x in ins):
+        raise SafetyError(APP_INPUT_INSIDE_OUT)
+    return o
+
+
 def assert_writable(p: Path) -> None:
     """Raises SafetyError unless p (a file or folder to be written) lies under private-runner and outside
-    every forbidden folder. Called before writes made by native code, which the audit hook cannot see."""
+    every forbidden folder. Called before writes made by native code, which the audit hook cannot see.
+    APP mode: p must be allowed by the armed guard's roots (DATA, the report folder; the window's report root and
+    allowed files), or lie under DATA when no guard is armed."""
+    if APP_MODE:
+        if not Path(p).is_absolute():
+            raise SafetyError("a written path must be an absolute path")
+        pol = _POLICY
+        if pol is None:
+            _private(Path(p), "a written path")
+            return
+        why = _write_refusal(pol, _norm(p))
+        if why:
+            raise SafetyError(f"{why}: {p}")
+        return
     _private(Path(p), "a written path")
     if _POLICY is not None:
         why = _write_refusal(_POLICY, _norm(p))
@@ -271,7 +361,7 @@ class SafetyState:
     bot_opens: int = 0                                      # opens / listings under C:\Hangeul\BOT (all refused)
     input: Optional[Path] = None
     spawned: List[str] = field(default_factory=list)        # process creations seen (refused in the runner)
-    mode: str = "runner"                                    # "runner" | "worker"
+    mode: str = "runner"                                    # "runner" | "worker" | "window" (APP: arm_window)
     blocked_total: int = 0                                  # every refused event (blocked keeps the first ones)
 
 
@@ -283,6 +373,7 @@ class _Policy:
     bot_root: Optional[str]           # None: no bot-open check at all (tests only)
     state: SafetyState
     bot_read_ok: List[str] = field(default_factory=list)   # reads allowed under these (GPU worker: the bot venv)
+    key: Any = None                   # APP prepare(): the arguments it was armed with (a second call re-arms it)
 
 
 _POLICY: Optional[_Policy] = None
@@ -304,7 +395,7 @@ def _write_refusal(pol: _Policy, s: Optional[str]) -> Optional[str]:
     if is_forbidden(s) or _under(s, pol.bot_root):
         return "write into a protected folder"
     if not any(_under(s, r) for r in pol.write_roots):
-        return "write outside private-runner"
+        return f"write outside {WRITE_LABEL}"
     try:
         real = os.path.normcase(os.path.realpath(s))
     except (OSError, ValueError):
@@ -314,7 +405,7 @@ def _write_refusal(pol: _Policy, s: Optional[str]) -> Optional[str]:
             return None
         if (is_forbidden(real) or _under(real, pol.bot_root) or any(_under(real, f) for f in pol.forbidden)
                 or not any(_under(real, r) for r in pol.write_roots)):
-            return "write through a link that leaves private-runner"
+            return f"write through a link that leaves {WRITE_LABEL}"
     return None
 
 
@@ -369,7 +460,7 @@ def _check_bot(pol: _Policy, event: str, path: Any, exc: type = PermissionError)
                                              "share) cannot be checked", exc)
     if _bot_hit(pol, path):
         pol.state.bot_opens += 1
-        _refuse(pol, event, path, "nothing under C:\\Hangeul\\BOT may be opened here" +
+        _refuse(pol, event, path, f"nothing under {NO_OPEN_LABEL} may be opened here" +
                 (" (only its venv is read)" if pol.bot_read_ok else ""), exc)
 
 
@@ -537,10 +628,10 @@ def check_input(input_path: Path) -> Path:
     if _device(_norm(input_path)):
         raise SafetyError("the input must be a drive path (C:\\...), not a device-namespace spelling")
     if _under(_norm(input_path), _norm(BOT_ROOT)):
-        raise SafetyError("the input must not lie under C:\\Hangeul\\BOT (the runner never opens it)")
+        raise SafetyError(f"the input must not lie under {NO_OPEN_LABEL} (the runner never opens it)")
     inp = _resolved(Path(input_path))
     if _under(_norm(inp), _norm(BOT_ROOT)):
-        raise SafetyError("the input must not lie under C:\\Hangeul\\BOT (the runner never opens it)")
+        raise SafetyError(f"the input must not lie under {NO_OPEN_LABEL} (the runner never opens it)")
     if not inp.exists():
         raise SafetyError("the input does not exist")
     if inp.is_dir():
@@ -592,7 +683,9 @@ def prepare(out: Path, cache_root: Path, input_path: Path,
     """Checks the paths, snapshots the input, points the temp folder into private-runner, creates --out and
     arms the runner's audit hook (writes only under private-runner and outside the input and
     `extra_forbidden`; nothing under C:\\Hangeul\\BOT opened; no process started; no network). Raises
-    SafetyError on an unsafe path or a missing input."""
+    SafetyError on an unsafe path or a missing input. APP mode: _prepare_app."""
+    if APP_MODE:
+        return _prepare_app(Path(out), Path(cache_root), Path(input_path), extra_forbidden)
     o = check_out_dir(Path(out), Path(input_path))
     cr = _private(Path(cache_root), "the cache root")
     inp = check_input(Path(input_path))
@@ -603,6 +696,88 @@ def prepare(out: Path, cache_root: Path, input_path: Path,
     _arm(_Policy(write_roots=[_norm(WRITE_ROOT)], allowed_files=[], forbidden=forbidden,
                  bot_root=_norm(BOT_ROOT), state=state))
     return state
+
+
+def _app_roots(paths: Iterable[Path]) -> List[str]:
+    """Normalised write roots, each as given and resolved (a junction or a redirected profile folder on the way)."""
+    out: List[str] = []
+    for p in paths:
+        for s in (_norm(p), _norm(_resolved(Path(p)))):
+            if s and s not in out:
+                out.append(s)
+    return out
+
+
+def _prepare_app(out: Path, cache_root: Path, input_path: Path, extra_forbidden: Sequence[Path]) -> SafetyState:
+    """prepare() in APP mode (APP_SPEC rev 1 section 4.2, rev 2 R2.1.6): writes only under DATA and the report
+    folder; nothing inside the input (or `extra_forbidden`) written, even under those roots; no bot folder; network
+    refused; process starts refused (the worker starts none). The input is snapshotted.
+    A second call in the same process with the same arguments (the worker arms the guard before its card work, then
+    pipeline.run arms it again) arms the same policy again and returns the same state (the first snapshot is kept,
+    so finish() compares against the input as it was when the check started). A call with other arguments while
+    such a guard is armed raises SafetyError: one worker process checks one input."""
+    o = check_out_dir(out, input_path)
+    cr = _private(cache_root, "the cache root")
+    inp = check_input(input_path)
+    forbidden = [s for s in (_norm(_resolved(Path(f))) for f in [inp, *extra_forbidden]) if s]
+    roots = _app_roots([Path(WRITE_ROOT), o])
+    key = ("app-runner", tuple(roots), tuple(forbidden), _norm(cr))
+    pol = _POLICY
+    if pol is not None and pol.key is not None:
+        if pol.key != key:
+            raise SafetyError("the guard of this process is already armed for another check")
+        _temp_to_private()
+        _make_out(o)
+        _arm(pol)
+        return pol.state
+    state = SafetyState(out=o, cache_root=cr, snapshots=snapshot(_input_files(inp)), input=inp, mode="runner")
+    _temp_to_private()
+    _make_out(o)
+    _arm(_Policy(write_roots=roots, allowed_files=[], forbidden=forbidden, bot_root=None, state=state, key=key))
+    return state
+
+
+def arm_window(roots: Sequence[Path] = ()) -> SafetyState:
+    """The window's guard (APP_SPEC rev 1 section 4.2): writes only under DATA and `roots` (the report root) and the
+    files allow_file() adds; network refused; process starts recorded, not refused (the window starts its own
+    workers and opens the report). Temp points into DATA\\tmp. Called again (another report root), it replaces the
+    window's policy. Returns the guard's state."""
+    rs = [Path(r) for r in roots]
+    if any(not r.is_absolute() for r in rs):
+        raise SafetyError("a report root must be an absolute path")
+    if any(_device(_norm(r)) for r in rs):
+        raise SafetyError(APP_OUT_DEVICE)
+    state = SafetyState(out=None, cache_root=None, snapshots={}, mode="window")
+    _temp_to_private()
+    _arm(_Policy(write_roots=_app_roots([Path(WRITE_ROOT), *rs]), allowed_files=[], forbidden=[],
+                 bot_root=_norm(BOT_ROOT), state=state))
+    return state
+
+
+def allow_file(path: Path) -> str:
+    """Allows writes to exactly this one file under the armed guard ("Save as PDF..." in the window; the caller has
+    already refused a target inside the checked input). Returns the normalised path. Raises SafetyError when no
+    guard is armed, or for a relative, device or share path, or one in a protected folder."""
+    pol = _POLICY
+    if pol is None:
+        raise SafetyError("no guard is armed")
+    p = Path(path)
+    if not p.is_absolute():
+        raise SafetyError("a file to allow must be an absolute path")
+    s = _norm(p)
+    if s is None or _device(s):
+        raise SafetyError("a file to allow must be on a drive of this PC, not a network or device path")
+    if is_forbidden(p) or _under(s, pol.bot_root) or any(_under(s, f) for f in pol.forbidden):
+        raise SafetyError("a file in a protected folder cannot be allowed")
+    with _LOCK:
+        if s not in pol.allowed_files:
+            pol.allowed_files.append(s)
+    return s
+
+
+def _bot_venv_name() -> str:
+    from . import devplaces                     # DEV only: the GPU worker reads the bot's venv (never in the app)
+    return devplaces.BOT_VENV_NAME
 
 
 def install_write_guard(extra_allowed: Sequence[Path] = (), block_bot_opens: bool = True,
@@ -621,7 +796,7 @@ def install_write_guard(extra_allowed: Sequence[Path] = (), block_bot_opens: boo
     _arm(_Policy(write_roots=[_norm(WRITE_ROOT)], allowed_files=allowed, forbidden=forbidden,
                  bot_root=_norm(BOT_ROOT), state=state,
                  bot_read_ok=[] if block_bot_opens else [_norm(Path(p)) for p in (
-                     bot_read_ok if bot_read_ok is not None else [Path(BOT_ROOT) / ".venv"])]))
+                     bot_read_ok if bot_read_ok is not None else [Path(BOT_ROOT) / _bot_venv_name()])]))
     return state
 
 

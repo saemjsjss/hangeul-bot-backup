@@ -50,6 +50,8 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+from . import hooks
+
 try:
     from pyzbar.pyzbar import decode as _zbar_decode, ZBarSymbol
     _ZBAR = True
@@ -370,6 +372,7 @@ def _stage_b(img, budget: float = 8.0) -> Tuple[List[str], str, int]:
     boxes = sorted(_detect_boxes(img), key=lambda b: -texture_score(img, b))
     for b in boxes:
         if time.perf_counter() - t0 > budget:
+            hooks.emit("budget", where="tin.stage_b", page=None)    # record only (APP_SPEC rev 1 section 10 item 7)
             break
         codes, how = _try_box(img, b)
         if codes:
@@ -438,6 +441,7 @@ def _stage_e(img, budget: float = 12.0) -> Tuple[List[str], str]:
         # the densest window is often only the middle of the code: try it grown around its centre
         for grow in (1.5, 2.1, 1.0):
             if time.perf_counter() - t0 > budget:
+                hooks.emit("budget", where="tin.stage_e", page=None)
                 return [], ""
             half = side * grow / 2
             box = (max(0, int(cx - half)), max(0, int(cy - half)), min(w, int(cx + half)), min(h, int(cy + half)))

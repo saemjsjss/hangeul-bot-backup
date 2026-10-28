@@ -18,6 +18,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .model import (ERROR, FAIL, FLAG, MISSING, NEW_CHECK_RULES, NOT_JUDGED, NOTE, ORDER, PASS, PRESENT, STOP,
                     DocResult, DocUnit, Finding, Notice, RunResult)
+from . import places
 from . import verdict as V
 
 MAX_LINES = 80
@@ -233,11 +234,28 @@ def new_checks_fired(r: RunResult) -> List[Tuple[str, Optional[DocUnit]]]:
     return out
 
 
+def result_code(r: RunResult) -> Optional[str]:
+    """resultcode.code(r) (APP_SPEC rev 1 section 1.3), or None when it cannot be computed (the report is still
+    written; the summary then says so). resultcode imports this module, hence the lookup at call time."""
+    try:
+        return importlib.import_module(__package__ + ".resultcode").code(r)
+    except Exception:
+        return None
+
+
+def result_code_line(r: RunResult) -> str:
+    """The summary's third line: "RESULT CODE: XXXX-XXXX (check date YYYY-MM-DD)"."""
+    rc = result_code(r)
+    return f"RESULT CODE: {rc if rc else 'not available'} (check date {getattr(r, 'today', None) or '-'})"
+
+
 def summary_lines(r: RunResult, out: Optional[Path] = None) -> List[Tuple[str, str]]:
-    """(label, line) pairs of the chat-ready summary (RUNNER_SPEC 5.11.1); the label colours the Excel cell."""
+    """(label, line) pairs of the chat-ready summary (RUNNER_SPEC 5.11.1); the label colours the Excel cell.
+    Line 3 is the result code (APP_SPEC rev 1 section 1.3)."""
     L: List[Tuple[str, str]] = []
     L.append((r.overall, f"{r.case_id} | {r.program} | {r.mode} | {len(r.pages)} pages | RESULT: {r.overall}"))
     L.append((r.overall, r.headline))
+    L.append(("", result_code_line(r)))
     L.append(("", reading_line(r)))
     notices = list(r.notices)
     orders = [n for n in notices if n.kind == ORDER]
@@ -462,7 +480,7 @@ def _facts(r: RunResult, extra: Optional[Mapping[str, Any]]) -> List[Tuple[str, 
     sf = r.safety or {}
     facts.append(("safety: blocked events", str(len(sf.get("blocked") or [])) if isinstance(sf.get("blocked"), list)
                   else str(sf.get("blocked", ""))))
-    facts.append(("safety: opens under C:\\Hangeul\\BOT", str(sf.get("bot_opens", ""))))
+    facts.append((f"safety: opens under {places.current().no_open_label}", str(sf.get("bot_opens", ""))))
     for k in ("input_unchanged", "unchanged", "snapshot_before", "snapshot_after", "spawned"):
         if k in sf:
             facts.append((f"safety: {k}", _short_json(sf[k], 1000) if not isinstance(sf[k], (str, bool, int))
@@ -647,12 +665,13 @@ def _pages_of_finding(f: Finding, u: DocUnit, r: RunResult) -> str:
 
 # ================================================================================= all three
 def write_all(r: RunResult, out: Path, extra: Optional[Mapping[str, Any]] = None) -> Dict[str, Path]:
-    """summary.txt, report.xlsx and run.json in `out` (each path checked by safety.assert_writable)."""
+    """summary.txt, report.xlsx and run.json in `out` (each path checked by safety.assert_writable). run.json gets
+    "result_code" (APP_SPEC rev 1 section 1.3; null when it cannot be computed)."""
     out = Path(out)
     paths = {"summary": out / "summary.txt", "excel": out / "report.xlsx", "json": out / "run.json"}
     for p in paths.values():
         _assert_writable(p)
     paths["summary"].write_text(summary_text(r, out), encoding="utf-8")
     write_excel(r, paths["excel"], extra)
-    write_json(r, paths["json"], extra)
+    write_json(r, paths["json"], {**dict(extra or {}), "result_code": result_code(r)})
     return paths

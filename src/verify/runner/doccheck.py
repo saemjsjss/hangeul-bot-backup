@@ -33,7 +33,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from . import botimport
+from . import botimport, places
 from .model import (ERROR, FAIL, FLAG, NOTE, ORDER, PASS, PORTAL_KEYS, PRESENT, AffidavitInfo, BirthFacts,
                     DerivedRecord, DocUnit, Finding, Identity, MachineRead, PageRead)
 
@@ -409,7 +409,7 @@ def crop_unit_photo(eng: Any, unit: DocUnit, pages: List[PageRead], source_pdf: 
     i = unit.pages[0]
     page = pages[i]
     if docs_dir is None:
-        docs_dir = Path(unit.path).parent if unit.path is not None else botimport.PRIVATE / "tmp"
+        docs_dir = Path(unit.path).parent if unit.path is not None else places.current().temp_dir
     out = Path(docs_dir) / f"PASSPORT SIZE PHOTO p{input_page(i, pages):02d}.jpg"
     embedded = None
     if source_pdf is not None:
@@ -1291,7 +1291,7 @@ def check_documents(units: List[DocUnit], pages: List[PageRead], rec: DerivedRec
             return Path(work_dir)
         if u.path is not None:
             return Path(u.path).resolve().parent.parent / "work"
-        return botimport.PRIVATE / "tmp" / "work"
+        return places.current().temp_dir / "work"
 
     def check_unit(u: DocUnit) -> List[Finding]:
         key = u.key

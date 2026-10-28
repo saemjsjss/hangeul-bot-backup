@@ -1,0 +1,87 @@
+# dll_baseline.txt - imports the bundle may leave to the PC (APP_SPEC r1 8 h, amended by r2 R2.4.7 and R2.6 8 h).
+# Read by packaging\tests\dll_check.py (Task H). One line per DLL:   name | kind | reason
+#   name : a DLL file name, case-insensitive; "*" matches any characters (api sets)
+#   kind : system        - every Windows 10 x64 (1809, build 17763, or newer) and 11 has it in System32
+#          driver        - comes with the NVIDIA graphics driver; loaded at run time; never bundled
+#          bundle-only   - must be satisfied by the bundle (version-checked), NEVER by this baseline
+#          delay-only    - never called by the checker; may be missing only as a DELAY-loaded import
+# Every import of every .dll / .pyd in the dist must be in the bundle or on a "system" / "driver" line.
+# Delay-loaded imports are listed by dll_check separately; DirectML.dll is NOT on this list any more: onnxruntime is
+# not in the GPU build at all (R2.4.2), so any reference to it is a finding.
+
+# --- Windows API sets and the core ------------------------------------------------------------------------------
+api-ms-win-*.dll    | system | API set names, resolved by the Windows loader (the UCRT forwarders included)
+ext-ms-win-*.dll    | system | extension API set names, resolved by the Windows loader
+ntdll.dll           | system | the native API, in every Windows process
+kernel32.dll        | system | Win32 base API
+kernelbase.dll      | system | Win32 base API (kernel32's implementation)
+ucrtbase.dll        | system | the Universal C Runtime, part of Windows 10 and newer
+msvcrt.dll          | system | the Windows system C runtime (used by MinGW-built libraries such as libzbar and libiconv)
+user32.dll          | system | windows and messages (Tk, the self-test's message boxes)
+gdi32.dll           | system | GDI drawing (Tk, MuPDF)
+gdi32full.dll       | system | GDI implementation behind gdi32
+win32u.dll          | system | the user-mode side of win32k
+advapi32.dll        | system | registry, security, event log
+sechost.dll         | system | service host helpers behind advapi32
+shell32.dll         | system | shell API (known folders, ShellExecute)
+shlwapi.dll         | system | shell light-weight utilities
+shcore.dll          | system | shell core (DPI awareness)
+ole32.dll           | system | COM
+oleaut32.dll        | system | OLE automation (ctypes, COM types)
+combase.dll         | system | COM base
+rpcrt4.dll          | system | RPC runtime (_uuid, COM)
+comdlg32.dll        | system | common dialogs (Tk's file dialogs)
+comctl32.dll        | system | common controls (Tk)
+imm32.dll           | system | input method manager (Tk)
+uxtheme.dll         | system | visual styles (Tk's ttk on Windows)
+dwmapi.dll          | system | desktop window manager (Tk)
+oleacc.dll          | system | accessibility (Tk)
+version.dll         | system | file version resources (Python, the self-test's runtime part)
+winmm.dll           | system | multimedia timers (Python, Tk)
+ws2_32.dll          | system | Winsock (Python's socket and select modules, libuv, c10); the app's guard refuses every connection
+wsock32.dll         | system | old Winsock names
+mswsock.dll         | system | Winsock provider
+iphlpapi.dll        | system | IP helper (_socket, libuv)
+userenv.dll         | system | user profile API (libuv in torch\lib)
+psapi.dll           | system | process status API (libuv, torch)
+dbghelp.dll         | system | stack walking (torch, libuv)
+crypt32.dll         | system | certificates (_ssl, libcrypto)
+bcrypt.dll          | system | CNG random numbers and hashes (Python, libcrypto)
+bcryptprimitives.dll| system | CNG primitives behind bcrypt
+ncrypt.dll          | system | CNG key storage (libcrypto)
+secur32.dll         | system | security support provider interface
+wintrust.dll        | system | signature checks
+setupapi.dll        | system | device installation API (NVML-adjacent queries, torch)
+cfgmgr32.dll        | system | configuration manager (device queries)
+powrprof.dll        | system | power settings (CUDA runtime queries)
+netapi32.dll        | system | network API names (libuv)
+normaliz.dll        | system | Unicode normalisation (IDN)
+mpr.dll             | system | multiple provider router (network drives in file dialogs)
+propsys.dll         | system | property system (shell)
+winspool.drv        | system | the print spooler client (GDI users)
+opengl32.dll        | system | OpenGL (Tk; never used by the checker)
+glu32.dll           | system | OpenGL utilities (never used by the checker)
+d3d11.dll           | system | Direct3D 11 (Windows graphics stack; never used by the checker)
+d3d12.dll           | system | Direct3D 12 (Windows graphics stack; never used by the checker)
+dxgi.dll            | system | DXGI (Windows graphics stack; never used by the checker)
+dwrite.dll          | system | DirectWrite (Windows text stack)
+windowscodecs.dll   | system | Windows Imaging Component
+msimg32.dll         | system | GDI image helpers
+avrt.dll            | system | multimedia class scheduler (Media Foundation users)
+mfplat.dll          | delay-only | never called: Media Foundation, cv2's video I/O only; Windows N editions lack it without the Media Feature Pack, so it may only be a delay-loaded import
+mf.dll              | delay-only | never called: Media Foundation (as above)
+mfreadwrite.dll     | delay-only | never called: Media Foundation (as above)
+
+# --- NVIDIA driver (R2.4.7): loaded at run time, never bundled ----------------------------------------------------
+nvcuda.dll          | driver | the CUDA driver API; cudart64_12.dll loads it at run time (the driver must support CUDA 12.8, R2.3.1)
+nvml.dll            | driver | NVML; gpuinfo loads %SystemRoot%\System32\nvml.dll by full path through ctypes (R2.3.1)
+
+# --- VC++ runtimes: in the bundle at the checked versions, never from this baseline (r1 1.4, R2.4.7) ---------------
+vcruntime140.dll    | bundle-only | _internal\, >= 14.40 (preloaded by boot.preload_runtime)
+vcruntime140_1.dll  | bundle-only | _internal\, >= 14.40
+msvcp140.dll        | bundle-only | _internal\, >= 14.40 (MuPDF, OpenCV, torch_cpu)
+msvcp140_1.dll      | bundle-only | _internal\, >= 14.40
+msvcp140_2.dll      | bundle-only | a VC++ 2015-2022 runtime part; if anything imports it, it must be bundled
+concrt140.dll       | bundle-only | the VC++ concurrency runtime; if anything imports it, it must be bundled
+vcomp140.dll        | bundle-only | the VC++ OpenMP runtime; if anything imports it, it must be bundled
+msvcr120.dll        | bundle-only | _internal\pyzbar\, 12.0 (VC++ 2013, imported by libzbar-64.dll)

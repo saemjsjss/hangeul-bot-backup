@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
+from . import hooks, places
 from . import report as REPORT
 from . import verdict as V
 from .model import (BASE_RULES_VERSION, NOTE, PROGRAMS, RUN_SCHEMA, RUNNER_RULES_VERSION, RUNNER_VERSION,
@@ -70,6 +71,7 @@ class _Clock:
     @contextlib.contextmanager
     def __call__(self, key: str) -> Iterator[None]:
         self.stage = key
+        hooks.emit("stage", key=key, state="start")       # the app's progress and cancel point (no-op in DEV)
         t0 = time.perf_counter()
         try:
             yield
@@ -78,6 +80,7 @@ class _Clock:
             self.t[key] = round(self.t.get(key, 0.0) + dt_s, 3)
             if VERBOSE:
                 print(f"[runner] {key} {dt_s:.1f}s", file=sys.stderr, flush=True)
+            hooks.emit("stage", key=key, state="end", seconds=round(dt_s, 3))   # the listener never raises here
 
 
 @dataclass
@@ -530,7 +533,7 @@ def _write_log(m: _Modules, rs: _Run, r: Optional[RunResult], tb: str = "") -> N
             lines.append("engine stats " + REPORT._short_json(stats, 2000))
         sf = r.safety or {}
         lines.append(f"safety: blocked {len(sf.get('blocked') or []) if isinstance(sf.get('blocked'), list) else sf.get('blocked')}"
-                     f", opens under C:\\Hangeul\\BOT {sf.get('bot_opens')}")
+                     f", opens under {places.current().no_open_label} {sf.get('bot_opens')}")
     lines.append("timings " + ", ".join(f"{k} {v:.1f}s" for k, v in rs.clock.t.items()))
     lines += [f"WARNING {w}" for w in rs.warnings]
     if tb:
