@@ -286,6 +286,8 @@ _INPUT_TABLE: Tuple[Tuple[str, str], ...] = (
     ("could not be opened as a pdf", "UNREADABLE_PDF"), ("is not a pdf", "UNREADABLE_PDF"),
     ("could not be opened as an image", "UNREADABLE_IMAGE"),
     ("holds no .pdf", "EMPTY_FOLDER"),
+    # safety.APP_DATA_OUTSIDE (1.0.1, I28): the app's own data folder (cache root, page texts), never the report folder
+    ("lies outside the app's data folder", "DATA_NOT_WRITABLE"),
     # safety.check_out_dir (APP_OUT_* and the DEV wording)
     ("must not lie inside the input", "REPORT_INSIDE_INPUT"), ("inside the input", "REPORT_INSIDE_INPUT"),
     ("input must not lie inside", "INPUT_INSIDE_REPORT"), ("inside the report", "INPUT_INSIDE_REPORT"),

@@ -65,7 +65,7 @@ The owner's answers the same night:
 | G8 | Phase 1 runs with torch's defaults exactly as gpuread ran: cuDNN TF32 allowed, not deterministic, benchmark off; no `PYTORCH_CUDA_ALLOC_CONF`, no `CUBLAS_WORKSPACE_CONFIG`. Phase 2 then sets strict fp32 (`cudnn.deterministic` True, `benchmark` False, both TF32 switches off), as gpu_worker did. | Phase 1's texts must equal the r8 page texts, which gpuread made under torch's defaults. Phase 2's numbers must match the ONNX CPU ones (measured within 1e-6). |
 | G9 | `gpuread.py` is bundled with no source change. The stage swaps its seven DEV path literals (R2.4.4), checked by AST. | The first read then has one source, in DEV and in the app. |
 | G10 | The build environment lives only under `C:\Hangeul\DOCCHECK\lab\app-build`: a `--without-pip` venv of the system Python 3.12.10 with one `.pth` that points read-only at the site-packages of `lab\onnx\.venv` and `.venv-pkg-numpy`. Outputs go to `app-build\builds\<build-id>`. Nothing is installed anywhere. | Hard rule. |
-| G11 | App version 1.0.0, flavour "GPU (CUDA 12.8)". Build id as in rev 1: `YYYYMMDD.N-<git short>[-dirty]`. | The first release. |
+| G11 | App version 1.0.0, flavour "GPU (CUDA 12.8)". Build id as in rev 1: `YYYYMMDD.N-<git short>[-dirty]`. 1.0.1: the fixes of R2.10 I28-I30. | The first release; 1.0.1 fixes what 1.0.0's check found. |
 | G12 | "Best verdict" is the pass condition of test P1 (R2.6). On this PC, on the four r8 cases, the app's page texts must equal the r8 page texts and its verdict lines must equal the r8 lines. | The owner's definition. |
 
 **What revision 2 changes in revision 1** (everything not listed still holds):
@@ -740,38 +740,84 @@ CurUninstallStepChanged(usPostUninstall): "Also delete the app's saved data (sav
   - If ISCC refuses on that limit, `build_installer.py` compiles again with `/DSpan=1`. The result is then
     `... Setup 1.0.0 GPU.exe` plus `...-1.bin`, `...-2.bin`, which must stay in one folder, and README_INSTALL.txt
     says so.
-  - The target PC needs about 5 GB of free disk.
-- **Version stamp.** One version, 1.0.0 with build `<id>`, appears in: Setup.exe's version resource and
+  - The target PC needs about 7 GB of free disk (1.0.1, I30: the Setup file and the installed app together; build
+    20261029.3 measured 1.8 GB + 4.4 GB as Explorer counts GB). The 1.0.0 README said 5 GB.
+- **Version stamp.** One version (1.0.0; 1.0.1 since I28-I30) with build `<id>`, appears in: Setup.exe's version resource and
   `AppVerName`; Settings → Apps (DisplayVersion); the app exe's version resource; BUILD.json; the window footer;
   SELFTEST.txt; summary.pdf; checkfacts.json; log.txt. All come from BUILD.json through `app\version.py`. Test P3
   checks that the installed BUILD.json `build_id` equals the Setup's `/DBuildId`.
 - **Outputs** in `builds\<id>\installer\`: Setup.exe, `setup.sha256`, `installer.json` (bytes, seconds, ratio,
-  spanning yes/no) and README_INSTALL.txt, filled from `packaging\installer\README_INSTALL.txt`:
+  spanning yes/no; 1.0.1: also `installed_gb`, `disk_gb`, and P1's check date and code), README_INSTALL.txt
+  and `SHA256SUMS.txt` (the Setup file(s) and README_INSTALL.txt): what a release folder holds. 1.0.1 (I30)
+  replaced the 1.0.0 text: README_INSTALL.txt is now the owner's release README in plain English, with this
+  build's sizes (`SETUP_GB`, `SETUP_BYTES`, `INSTALLED_GB` as Explorer counts GB, and `DISK_GB` = Setup +
+  installed + 0.5 GB, rounded up) and the app's own Self-test as the check (CHECK_0001.pdf is not shipped).
+  It is filled from `packaging\installer\README_INSTALL.txt`:
 
 ```
-HANGEUL DOCUMENT CHECKER {APP_VERSION} (GPU) - INSTALL (build {BUILD_ID})
+HANGEUL DOCUMENT CHECKER {APP_VERSION} (GPU) - build {BUILD_ID}
 
-NEEDS: Windows 10 (1809 or newer) or 11, 64-bit; an NVIDIA graphics card, GeForce RTX 20 series or newer, with 6 GB
-or more; NVIDIA driver 570 or newer; about 5 GB of free disk. No internet and no admin rights are needed.
+WHAT IS IN THIS FOLDER
+  - Hangeul Document Checker Setup {APP_VERSION} GPU.exe: the installer, {SETUP_GB} GB ({SETUP_BYTES} bytes).
+    If there are also files ending in "-1.bin", "-2.bin" and so on, they belong to it: keep them in the same folder.
+  - This text file.
+  - SHA256SUMS.txt: checksums, to confirm that a copy is complete and unchanged.
 
-1. COPY "Hangeul Document Checker Setup {APP_VERSION} GPU.exe" (about {SETUP_GB} GB) to the PC, for example with a
-   USB stick. If there are also files ending in "-1.bin", "-2.bin", copy them into the same folder.
-2. RUN it. If Windows says "Windows protected your PC": click "More info", then "Run anyway".
-   Your antivirus may take a few minutes to scan it.
-3. OPEN "Hangeul Document Checker" from the Start menu. If it says the graphics card or driver is not suitable,
-   do what the message says (usually: update the NVIDIA driver) and open it again.
-4. SELF-TEST: click "Self-test" and wait about 2 minutes. It saves SELFTEST.txt in Documents\Hangeul Document Checks.
-5. CHECK ONE CASE AND COMPARE: click "Choose PDF..." and pick CHECK_0001.pdf, program KLP. Open "Options", choose
-   "Check date: fixed" and type {CHECK_DATE}. Click "Check" and look at "Result code".
-   The office PC's code is {THIS_PC_CODE}. The same code means the same verdicts. Another graphics card model can
-   read a few characters differently: if the code differs, send checkfacts.json too.
-6. SEND BACK SELFTEST.txt and the code. Never send summary.txt, report.xlsx or run.json: they hold student data.
+WHAT THE PC NEEDS
+  - Windows 10 (version 1809 or newer) or Windows 11, 64-bit.
+  - An NVIDIA graphics card with 6 GB of graphics memory or more (GeForce RTX 20 series or newer).
+    The checker reads documents only on this card. It does not work on a PC without one.
+  - A recent NVIDIA driver: version 570 or newer. If the checker says the driver is too old, update it with the
+    NVIDIA app (or from nvidia.com), restart the PC and open the checker again.
+  - About {DISK_GB} GB of free disk space: {SETUP_GB} GB for the Setup file and {INSTALLED_GB} GB for the installed
+    checker. After installing, the Setup file can be deleted from the PC (keep a copy on the USB stick).
+  - No internet connection and no administrator rights.
 
-ON THE OFFICE PC (where the Telegram bot runs): while the bot is checking documents, the checker shows "Waiting for
-the graphics card" and goes on by itself when the bot is done.
+HOW TO INSTALL
+  1. Copy the Setup file to the PC, for example with a USB stick.
+  2. Double-click it.
+  3. Windows may show a blue box: "Windows protected your PC". This happens because the installer is
+     not digitally signed (signing needs a paid certificate), not because something is wrong with it.
+     Click "More info", then "Run anyway". Your antivirus may also take a few minutes to scan the file.
+  4. If the PC has no NVIDIA driver, Setup asks "Install anyway?". Choose No, install the NVIDIA driver, then run
+     Setup again.
+  5. Click "Next" and "Install". Setup installs the checker for your Windows user only. "Create a desktop shortcut"
+     is ticked; untick it if you do not want one. At the end, leave "Open the checker now" ticked and click
+     "Finish".
 
-TO REMOVE: Settings > Apps > Hangeul Document Checker > Uninstall. It asks whether to delete the saved page texts and
-settings too (Yes is the default). Your reports in Documents\Hangeul Document Checks stay.
+THE FIRST START
+  - The first start can take a few minutes: Windows and the antivirus look at about {INSTALLED_GB} GB of program
+    files. Later starts are quicker.
+  - The checker looks at the graphics card and its driver. If something is not suitable, a message at the top of
+    the window says what to do, and the "Check" button stays off.
+  - Reports go to Documents\Hangeul Document Checks. If Documents is synced by OneDrive, they go to
+    C:\Users\<your name>\Hangeul Document Checks instead, so that student documents are not uploaded.
+  - The checker keeps its settings and saved page texts (they make a second check of the same documents faster)
+    in its own data folder; saved page texts are deleted after 30 days.
+
+CHECK THAT IT WORKS (once on every new PC)
+  1. Open "Hangeul Document Checker" from the desktop shortcut or the Start menu.
+  2. Click the "Self-test" button at the bottom of the window and wait: about 2 minutes, longer while the
+     graphics card is busy. The self-test uses only the test pages that come with the checker, never student
+     documents.
+  3. If it says "every part is OK", the PC is ready. If it says "finished with problems", send the file
+     SELFTEST.txt from the report folder (see "Reports go to" above). SELFTEST.txt holds no student data.
+  Never send summary.txt, report.xlsx or run.json to anyone: they hold student data.
+
+ON THE OFFICE PC (where the Telegram bot runs)
+  While the bot is checking documents, the checker shows "Waiting for the graphics card" and goes on by itself
+  when the bot is done. A check uses at most 3 GB of the graphics card's memory.
+
+HOW TO UNINSTALL
+  Close the checker first. Then Settings > Apps > "Hangeul Document Checker (GPU)" > Uninstall (or Control Panel >
+  Programs and Features). The uninstaller asks whether to delete the saved page texts and settings too; Yes is
+  the default. Your reports in Documents\Hangeul Document Checks are kept; delete them yourself if you no longer
+  need them.
+
+CHECKING A COPY (optional)
+  In PowerShell, in this folder:
+      Get-FileHash -Algorithm SHA256 "Hangeul Document Checker Setup {APP_VERSION} GPU.exe"
+  The hash must equal the one in SHA256SUMS.txt (upper or lower case does not matter).
 ```
 
 ---------------------------------------------------------------------------------------------------------
@@ -963,6 +1009,12 @@ Where the built code differs from the text above, the code is right and these no
 | I25 | R2.6 P5 (G2, build 20261029.3-369528d) | Memory met on every case: worker peak working set 1.84-2.08 GB (≤ 3.5), commit 4.85-5.47 GB (≤ 6.0), card reserved ≤ 2.973 GB, 0 processor calls. One time miss: owner folder 9 took 336 s against r8's 101 s + 150 s + 60 s = 311 s. | r8's runner reused cached bot-stage reads from earlier DEV runs (folder 9: 0 reads, 1 cache hit; 76 s), while every app check starts with a fresh DATA folder (53 reads in 172 s on the card; bot stage 254 s). On the same footing the app is faster: first read about 50 s against r8's 150 s; DEV rev 2.7 on the EAP folder with no cache (`runs\owner_eap1_chk_cpu`) took 619 s against the app's 311 s. The light reader's recogniser averaged 25 ms per call on the card; 3686 of its 4658 calls in folder 9 ended with an `empty_cache` (I11's 256 MB rule). |
 | I26 | R2.5, R2.6 P3 (G3, build 20261029.3-369528d) | `build.py installer --check-date 2026-10-29 --this-pc-code 90A2-20FC`: ISCC 6.7.4 at BELOW_NORMAL in 384 s (peak job memory 2469 MB), one Setup.exe of 1,939,911,235 bytes (ratio 0.41 of 4.71 GB; no disk spanning), unsigned, FileVersion 1.0.0.3, product version "1.0.0 (GPU, build 20261029.3-369528d)". `install_cycle.py` gained `--case <r8 run>` (after the upgrade and its self-test, the installed app checks that case with `--cli` through cardrun; its code must equal P1's `parity.json`, (b)-(d) must equal r8, its page texts must equal P1's read page by page) and `--data-dir` (I27). P3 with `--case owner_eap1_r8 --data-dir <apptest>`: PASS, 36 of 36 checks: Setup 92 s and 95 s, 3589 files equal MANIFEST twice, the upgrade's `[InstallDelete]` removed the probe, self-test 9 of 9 twice (READ CODE F6BF-334B), the case exit 0 in 313 s with code 2E6C-FDEC (= P1), 22 summary lines, run.json and 11 of 11 closer looks equal to r8, 29 of 29 pages equal to P1 (27 of 29 to r8: pages 9 and 14, as I23), 0 processor calls, worker working set 2076 MB; the silent uninstall removed the folder, the HKCU key, the Start-menu shortcut and the data folder. Tests: `test_installer.TestCycleCase` (8) and `TestCycleMain.test_main_with_a_case`. | The orchestrator asked for one owner case on the INSTALLED app with P1's code. Inno's uninstaller leaves its own copy in `%TEMP%\is-*-uninstall.tmp` (`_unins.tmp`, 4.4 MB, with `_unins-done.tmp`); the next Inno uninstall removes it. G3 removed the two its runs left. |
 | I27 | R2.6 P3 on THIS PC; `safety._private` (G3) | Run inside the Claude desktop app's process tree (an MSIX package), a NEW top-level folder of `%LOCALAPPDATA%` is redirected into `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Local` (existing folders such as `Temp` and `Programs` are not, so Setup's files were real; the Start-menu `.lnk` went to the package's `LocalCache\Roaming`). DATA's real path then differs from its name and `_private` (the resolved cache root against the UNRESOLVED write root) refuses: the first P3 run's installed self-test failed only part `guard` (8 of 9) and the case exited 2 (REPORT_NOT_WRITABLE, stage `safety`). Its SELFTEST files are in `reports\install_cycle\run1-redirected-data`. P3 was therefore re-run with `--data-dir` (a new folder under apptest) and a made-up file in the real data folder for the uninstaller's question. NOT changed in the app (it would need a new build and P1 again): a user who starts the app from Explorer or the Start menu is outside any package, so DATA is not redirected. | Open for the orchestrator: the same refusal would hit a PC whose `%LOCALAPPDATA%` lies behind a junction. A fix would let `_private` (APP mode) also accept a path under the RESOLVED write root, as `_app_roots` already does for the write roots; and the message would then not say REPORT_NOT_WRITABLE. |
+| I28 | R2.1.7 S1 and S3, rev 1 §4.2 (the APP guard), R2.3.2 messages (1.0.1) | APP mode's `safety._private` is `safety._in_data(p, what, DATA)`: p as written must lie under DATA's name or DATA's real path, and p's REAL path under DATA's REAL path (resolved against resolved, as `_app_roots` already did for the write roots). Its refusal says `APP_DATA_OUTSIDE` ("<what> lies outside the app's data folder"); the worker maps it to the new code DATA_NOT_WRITABLE ("Cannot use the checker's data folder": nothing checked, files and reports unchanged, restart and check again, then the Self-test), not REPORT_NOT_WRITABLE. Kept refusals: a path outside DATA as written, a `..` way out, a sibling folder with a longer name, a junction or link inside DATA that leads elsewhere; the guard's write rules, the report-folder rules (`APP_OUT_*`, which keep their codes) and DEV's `_private` (bot, student folders, private-runner) are unchanged. Tests: `test_places.TestInDataFakeResolver` (a fake resolver for the redirection: paths under it accepted; the refusals kept; DEV unchanged), `test_places.TestAppRedirectedData` (an APP child whose DATA is a real JUNCTION to another folder: the cache root, temp, the page-texts store and `load_page_texts` accepted; `prepare` arms and still refuses writes elsewhere, through a junction inside DATA and into the input; with 1.0.0's `_private` put back the same child fails, tried once by hand), `test_worker.TestClassify.test_a_data_folder_refusal_has_its_own_code`, `test_messages.test_data_folder_refusal`. | I27: inside the Claude app's MSIX container, and on a PC whose %LOCALAPPDATA% lies behind a junction or folder redirection, every path under DATA resolves elsewhere, and 1.0.0 compared that real path with DATA's NAME: every check ended with exit 2 (REPORT_NOT_WRITABLE, stage `safety`) and self-test part `guard` failed. P3 must now pass on the default data folder with no `--data-dir` (install_cycle keeps the option for diagnosis only). |
+| I29 | R2.1.2 (`GatedReader`, `usable_done`), R2.3.3 done event, I13, I14 (1.0.1) | `GatedReader.busy` turns True when an out-of-memory retry was not made on a free card: `gate.stats()`'s `waits` or `room_short` changed across its pause, `wait_turn("oom")` and `wait_room("oom")`, or the room could not be confirmed (`wait_room` gave None; a gate without stats). `first_read` gives every page read smaller a `downscaled_why`: "busy" when the flag was set while that page was read (it is cleared at every page save), else "cap" (the retry found room for the whole 3 GB cap at once and still ran out: the page is larger than the cap allows, the same on every check). `usable_done` keeps "cap" pages, reused like any other page (`first_read` puts their marks back, which gpuread's `_previous` drops), and still leaves out "busy" pages and pages with no reason. `first_read` returns `downscaled_cap` and `downscaled_busy`; checkfacts' `first_read` block and the done event carry `downscaled_busy` (a result without it counts every page read smaller as busy). `messages.downscaled_note(n, busy)`: for cap pages "<c> very large page(s) were read at a smaller size to stay within the checker's graphics-card limit. This is normal: such pages are always read this way, and the result is the tested one."; busy pages keep 1.0.0's words ("... because the graphics card ran out of memory. Check again when the graphics card is free; the result may then differ."). The READING line (`reading_note`) and gpuread.py are unchanged. Tests: test_gpuengine (`StatGate`; a cap page reused on two re-checks with its marks and no model loaded; a cap page kept while another page is read; a cap and a busy page in one check, only the busy one read again; room short, unknown free memory and a gate without stats count as busy; a picture too large for the cap; the real `cardgate.CardGate` with a lock that appears during the call, and with a room wait; the `usable_done`, `_kept_cuts` and `_mark_cuts` rules), test_checkfacts, test_worker, test_messages, test_window_model. | I23: owner folder 9's pages 1, 2 and 11 are read at 2000 px on EVERY check because of the 3 GB cap (one retry each, card free), and 1.0.0 told the owner that the card ran out of memory and to check again when it is free, which cannot help, and read those pages again on every re-check. r8 read them at 2000 px too, so these texts are the tested ones. |
+| I30 | R2.5 README and outputs, G11, `packaging\version.py` (1.0.1) | Version 1.0.1 wherever it is stamped: `packaging\version.py` APP_VERSION (BUILD.json; the exe's FileVersion 1.0.1.N and ProductVersion), `app\version.py`'s DEV default, `build_installer.APP_VERSION_DEFAULT`, `manifest.py`'s default, the window footer's fallback, hdc.iss's usage lines; the Setup file is "Hangeul Document Checker Setup 1.0.1 GPU.exe". README_INSTALL.txt (the R2.5 listing) is the owner's release README in plain English: what is in the folder; what the PC needs (an NVIDIA card with 6 GB or more, driver 570 or newer, about `DISK_GB` of free disk for the Setup file and the installed app together); SmartScreen on the unsigned Setup ("More info", "Run anyway"); Setup's driver question; the first start; the check with the window's "Self-test" button; the office PC's waiting; the uninstall; the checksum. Its sizes come from the build (`setup_gb`, `bytes_text`, `disk_gb`): for build 20261029.3 the Setup is "1.8 GB (1,939,911,235 bytes)", the installed app "4.4 GB" and the free disk "7 GB" (GB as Explorer counts them, 1024^3 bytes; in decimal GB that is 1.94 + 4.71). `build_installer` also writes `SHA256SUMS.txt` (the Setup file(s) and README_INSTALL.txt), so the installer folder holds what a release folder holds; `--check-date` and `--this-pc-code` stay, recorded in installer.json only. Tests: test_installer (`test_fill`, `test_the_release_readme_says_what_the_owner_needs`, `test_sizes_come_from_the_build`, `test_fill_refuses`, `TestBuildMain`), test_stage, test_version. | The 1.0.0 README (written by hand in `release\1.0.0`) asked for 5 GB of free disk, while the Setup file and the app need about 6.2 GB, and its self-check used CHECK_0001.pdf, which is not shipped. The window has a "Self-test" button; there is no Help menu and no Start-menu entry for the self-test, so the README names the button. |
+| I31 | R2.6 P3 precondition, R2.7 P0 (1.0.1) | `test_window_model.test_window_args_and_build_model` builds its model without `--data-dir` under `HDC_DATA_DIR` = the test's own folder. | It called `window.build_model` with no data folder, which made the REAL `%LOCALAPPDATA%\Hangeul Document Checker` (empty) on every app test run; P3 refuses to run while that folder exists. The app tests, packaging tests and runner suite now leave it absent (checked after each). The empty folder the first 1.0.1 test run made (and the bisect that found the test) was removed again. |
+
+**1.0.1 (29 Oct, not built yet).** I28-I30 are code, messages and README only; the first read, the light reader and the rules are unchanged, so P1's (b)-(d) are expected to stay equal to r8, but 1.0.1 needs the full release run again (stage, freeze, check, P1 on the four cases, P4 in full with all 7 scenarios in one report, P5, 8 c, installer, P3 on the default data folder). Known and NOT in 1.0.1 (next release 1.1): the tin and birth wall-clock budgets (owner folder 9 hits `tin.stage_e` 4 times; a slower PC could differ: step-count budgets are planned) and the third-party test modules shipped inside torch (advisory).
 
 **G1 smoke (29 Oct, from source on this PC's card, made-up self-test pages, one gpu_guard slot):** `worker.run_job`
 with places in APP mode through the test overrides: exit 0 in 56 s; first read CER 0.0 on both PDF pages and the photo,

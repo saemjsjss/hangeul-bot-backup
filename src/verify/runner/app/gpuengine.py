@@ -101,6 +101,12 @@ ROOM_HEADROOM_MB = 512
 # the page-texts file (DATA\cache\pagetexts\<case_id>.json) names the build that wrote it; a file of another build
 # or engine label is not reused (R2.1.2)
 BUILD_KEY = "app_build"
+# 1.0.1 (APP_SPEC R2.10 I29): why a page of the first read was cut down (gpuread's "downscaled": the long side used).
+# "cap": the full-size read did not fit the 3 GB cap on a free card (GatedReader's retry made at once, with room for
+# the whole cap): the same on every check, so the page is reused from the store like any other. "busy": the cut-down
+# followed a wait, or another program held card memory (or room could not be confirmed): read again by the next check.
+WHY_KEY = "downscaled_why"
+CUT_CAP, CUT_BUSY = "cap", "busy"
 _MIB = 1024 * 1024
 _GIB = 1024 ** 3
 
@@ -414,11 +420,26 @@ def start_card(info: Any, gate: Any, cap_gb: float = CAP_GB, torch_loader: Optio
     return card
 
 
-def _wait_room(gate: Any, where: str) -> None:
-    """gate.wait_room(where) when the gate has it (cardgate.CardGate does; a plain test gate may not)."""
+def _wait_room(gate: Any, where: str) -> Optional[int]:
+    """gate.wait_room(where) when the gate has it (cardgate.CardGate does; a plain test gate may not). Returns what it
+    returns: the free card memory read (MiB), or None when nothing could be checked."""
     fn = getattr(gate, "wait_room", None)
     if callable(fn):
-        fn(where)
+        return fn(where)
+    return None
+
+
+def _gate_marks(gate: Any) -> Optional[Tuple[int, int]]:
+    """(waits, room_short) from gate.stats(), to tell whether a stretch of gate calls waited; None when the gate has
+    no stats (a plain test gate)."""
+    fn = getattr(gate, "stats", None)
+    if not callable(fn):
+        return None
+    try:
+        st = fn()
+        return int(st.get("waits", 0) or 0), int(st.get("room_short", 0) or 0)
+    except Exception:
+        return None
 
 
 # ----------------------------------------------------------------------------------------- non-ASCII paths
@@ -480,7 +501,14 @@ class GatedReader:
     path made ASCII, the call; on a card out-of-memory, ONCE: ``card.pause()``, the gate's turn ("oom"), room on the
     card (``gate.wait_room("oom")``: another program may still hold memory), the same call again at full size. A
     second out-of-memory error goes on to gpuread's ladder or the bot's own handling, as in DEV. Every other
-    attribute is the inner reader's."""
+    attribute is the inner reader's.
+
+    ``busy`` (1.0.1, APP_SPEC R2.10 I29) turns True when an out-of-memory retry was NOT made on a free card: the gate
+    waited (for a lock or for room; ``gate.stats()``'s waits or room_short changed), or the room could not be
+    confirmed (``wait_room`` gave None, or the gate has no stats). A retry made at once with room for the whole cap
+    that runs out of memory again ran into the 3 GB cap itself: the page is too large for the cap, and the cut-down
+    that follows is the same on every check (``first_read`` marks it "cap", others "busy"). ``first_read`` reads and
+    clears the flag after every page."""
 
     def __init__(self, inner: Any, gate: Any, card: Any, ascii_dir: Optional[str] = None) -> None:
         self.inner = inner
@@ -489,6 +517,7 @@ class GatedReader:
         self.ascii_dir = ascii_dir
         self.calls = 0
         self.oom_retries = 0
+        self.busy = False
 
     def readtext(self, image, *args, **kw):
         self.gate.wait_turn("read")
@@ -501,9 +530,13 @@ class GatedReader:
                 raise
         # outside the handler: the failed call's frames (and its card tensors) are released before the cache is
         self.oom_retries += 1
+        before = _gate_marks(self.gate)
         self.card.pause()
         self.gate.wait_turn("oom")
-        _wait_room(self.gate, "oom")
+        free = _wait_room(self.gate, "oom")
+        after = _gate_marks(self.gate)
+        if before is None or after is None or before != after or free is None:
+            self.busy = True                                     # not a retry on a free card (see the class)
         self.calls += 1
         return self.inner.readtext(image, *args, **kw)
 
@@ -592,10 +625,13 @@ def usable_done(done: Mapping[str, Any], build_id: str) -> Tuple[Dict[str, Any],
     """The part of an earlier check's page-texts file that this check may reuse, and what was left out (counts).
 
     Nothing is reused from a file another engine or another build wrote (its engine label or ``app_build`` differ):
-    a later build with a corrected first read reads every page again. A page that was read SMALLER ("downscaled",
-    after the card ran out of memory) is never reused: it is read again at full size, and when it is cut down again
-    the new record carries the mark itself. (gpuread's _previous rebuilds reused pages without that key, so reusing
-    one would lose it.) The other pages and the file's other fields are kept as they were."""
+    a later build with a corrected first read reads every page again. A page that was read SMALLER ("downscaled")
+    because the card was busy (``WHY_KEY`` "busy", or no reason recorded) is not reused: it is read again at full
+    size, and when it is cut down again the new record carries the mark itself. A page cut down by the 3 GB cap
+    alone (``WHY_KEY`` "cap", 1.0.1) is reused like any other page: on a free card the next check would cut it down
+    the same way (``first_read`` puts its marks back, as gpuread's _previous rebuilds reused pages without them).
+    The other pages and the file's other fields are kept as they were. ``left["downscaled"]`` counts the pages left
+    out to be read again."""
     if not isinstance(done, Mapping) or not done:
         return {}, {"stale": 0, "downscaled": 0}
     if done.get("engine") != APP_ENGINE_LABEL or done.get(BUILD_KEY) != build_id:
@@ -606,12 +642,63 @@ def usable_done(done: Mapping[str, Any], build_id: str) -> Tuple[Dict[str, Any],
     for e in done.get("files") or []:
         if isinstance(e, dict):
             pages = e.get("pages") or []
-            keep = [p for p in pages if not (isinstance(p, dict) and p.get("downscaled"))]
+            keep = [p for p in pages if not (isinstance(p, dict) and p.get("downscaled") and not _cut_by_cap(p))]
             dropped += len(pages) - len(keep)
             e = {**e, "pages": keep}
         files.append(e)
     out["files"] = files
     return out, {"stale": 0, "downscaled": dropped}
+
+
+def _cut_by_cap(p: Mapping[str, Any]) -> bool:
+    """A page record cut down by the cap alone: "downscaled" a positive long side and WHY_KEY "cap"."""
+    side = p.get("downscaled")
+    return (p.get(WHY_KEY) == CUT_CAP and isinstance(side, int) and not isinstance(side, bool) and side > 0)
+
+
+def _kept_cuts(done: Mapping[str, Any]) -> Dict[Tuple[str, str, int], Dict[int, Dict[str, Any]]]:
+    """{(file name, sha256, page count): {page: {"downscaled", WHY_KEY}}} of the cap cut-downs ``done`` keeps, as
+    gpuread's _previous takes a file's pages (the first entry with that name, sha256 and page count; a record with a
+    page number, a text and a known kind). first_read puts these marks back on the pages read_all reuses."""
+    out: Dict[Tuple[str, str, int], Dict[int, Dict[str, Any]]] = {}
+    for e in done.get("files") or []:
+        if not isinstance(e, dict):
+            continue
+        key = (str(e.get("name")), str(e.get("sha256")), e.get("n_pages"))
+        if key in out:
+            continue
+        marks: Dict[int, Dict[str, Any]] = {}
+        for p in e.get("pages") or []:
+            if (isinstance(p, dict) and isinstance(p.get("page"), int) and isinstance(p.get("text"), str)
+                    and p.get("kind") in ("layer", "ocr", "image") and _cut_by_cap(p)):
+                marks[int(p["page"])] = {"downscaled": int(p["downscaled"]), WHY_KEY: CUT_CAP}
+        out[key] = marks
+    return out
+
+
+def _mark_cuts(d: Mapping[str, Any], kept: Mapping[Tuple[str, str, int], Mapping[int, Mapping[str, Any]]],
+               busy: bool) -> None:
+    """In place, on read_all's result: the cap marks of the reused pages put back (``kept``), and every page cut down
+    in this check that has no reason yet gets one, "busy" when ``busy`` (GatedReader's flag since the last page)."""
+    for e in d.get("files") or []:
+        if not isinstance(e, dict):
+            continue
+        marks = kept.get((str(e.get("name")), str(e.get("sha256")), e.get("n_pages"))) or {}
+        for p in e.get("pages") or []:
+            if not isinstance(p, dict):
+                continue
+            m = marks.get(p.get("page")) if isinstance(p.get("page"), int) else None
+            if m is not None and not p.get("downscaled"):
+                p.update(m)                                      # a reused page: gpuread's _rec dropped the marks
+            elif p.get("downscaled") and p.get(WHY_KEY) not in (CUT_CAP, CUT_BUSY):
+                p[WHY_KEY] = CUT_BUSY if busy else CUT_CAP
+
+
+def _cut_counts(d: Mapping[str, Any]) -> Tuple[int, int, int]:
+    """(pages read smaller, of them by the cap alone, of them after a busy card) in a page-texts dict."""
+    pages = [p for p in _page_keys(d).values() if p.get("downscaled")]
+    cap = sum(1 for p in pages if _cut_by_cap(p))
+    return len(pages), cap, len(pages) - cap
 
 
 def first_read(card: Card, bot: Any, src: Any, gate: Any, store: Any, emit: Optional[Callable[..., None]] = None,
@@ -622,8 +709,10 @@ def first_read(card: Card, bot: Any, src: Any, gate: Any, store: Any, emit: Opti
     every page; one ``page`` event per page read).
 
     Pages read by an earlier check of the same input (gpuread.load_done: same names, sha256 and page counts) are
-    reused, except what ``usable_done`` leaves out (another build's or engine's file; pages read smaller); with
-    nothing pending no reader is made and read_all only rebuilds the file. Between pages the gate's
+    reused, except what ``usable_done`` leaves out (another build's or engine's file; pages read smaller after a busy
+    card); with nothing pending no reader is made and read_all only rebuilds the file. Every page read smaller carries
+    ``WHY_KEY`` ("cap" or "busy", from GatedReader's ``busy`` flag of that page; 1.0.1), and a reused "cap" page gets
+    its marks back. Between pages the gate's
     turn ("page"); before every model call GatedReader's. In a ``finally``: ``bot.dv._reader = None``, the reader
     dropped, ``card.free()``. A Cancelled (or any error) leaves the partial file saved (read_all saves, then raises)
     and the next check resumes from it. Returns counts only (no text).
@@ -653,15 +742,20 @@ def first_read(card: Card, bot: Any, src: Any, gate: Any, store: Any, emit: Opti
         progress["handled"], progress["t"] = handled, now
         emit("page", done=handled, of=pending, seconds=round(seconds, 3), where="card")
 
+    kept = _kept_cuts(done)
+    gated: Optional[GatedReader] = None
+
     def save(d: Dict[str, Any]) -> None:
         d["engine"] = APP_ENGINE_LABEL
         d[BUILD_KEY] = build
+        _mark_cuts(d, kept, bool(gated is not None and gated.busy))   # read_all saves after every page
+        if gated is not None:
+            gated.busy = False
         _write_store(store, d)
         if pending:
             report(d)
 
     dv = bot.dv
-    gated: Optional[GatedReader] = None
     model_load_s = 0.0
     try:
         if pending == 0:                                         # complete from an earlier check: no card work
@@ -687,12 +781,13 @@ def first_read(card: Card, bot: Any, src: Any, gate: Any, store: Any, emit: Opti
         gated = None                                             # the last reference: the reader goes with it
         card.free()
     c = gr.counts(result)
-    downscaled = sum(1 for p in _page_keys(result).values() if p.get("downscaled"))
+    downscaled, cut_cap, cut_busy = _cut_counts(result)
     return {"pages": c, "pending": pending, "reused": base, "complete": bool(result.get("complete")),
             "seconds_total": round(time.perf_counter() - t_start, 2),
             "read_seconds": float(result.get("seconds_total") or 0.0),
             "model_loaded": pending > 0, "model_load_s": round(model_load_s, 2),
-            "downscaled": downscaled, "skipped": int(c.get("skipped", 0)), "oom_retries": int(oom_retries),
+            "downscaled": downscaled, "downscaled_cap": cut_cap, "downscaled_busy": cut_busy,
+            "skipped": int(c.get("skipped", 0)), "oom_retries": int(oom_retries),
             "reread_downscaled": int(left_out["downscaled"]), "stale_store": bool(left_out["stale"]),
             "peak_alloc_gb": alloc_gb, "peak_reserved_gb": reserved_gb}
 

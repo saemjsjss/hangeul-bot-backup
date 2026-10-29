@@ -10,7 +10,7 @@ import subprocess
 from pathlib import Path
 from typing import Callable, Dict, Tuple
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"   # 1.0.1 (29 Oct 2026): APP_SPEC R2.10 I28-I30
 FLAVOUR = "gpu-cu128"
 FLAVOUR_LABEL = "GPU (CUDA 12.8)"
 PRODUCT_NAME = "Hangeul Document Checker"
@@ -36,7 +36,7 @@ def file_version_tuple(build_id: str) -> Tuple[int, int, int, int]:
 
 
 def file_version(build_id: str) -> str:
-    """"1.0.0.N" (the exe's FileVersion and the Setup's /DFileVersion)."""
+    """"1.0.1.N" (the exe's FileVersion and the Setup's /DFileVersion)."""
     return ".".join(str(x) for x in file_version_tuple(build_id))
 
 

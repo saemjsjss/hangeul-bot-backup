@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import weakref
 from pathlib import Path
@@ -76,6 +77,36 @@ class FakeGate:
             self.on_call(where)
         if self.raise_at and where == self.raise_at[0] and self.calls.count(where) == self.raise_at[1]:
             raise self.exc("made-up cancel")
+
+
+class StatGate(FakeGate):
+    """FakeGate with cardgate.CardGate's stats() (waits, room_short) and a wait_room that returns the free MiB read
+    (1.0.1, R2.10 I29). By default every out-of-memory retry finds the card free at once (no wait, room confirmed).
+    `wait_at_oom` = the numbers of the "oom" turns that wait for a lock (1 = the first); `short` = every room wait
+    gives up (room_short); `free` = what wait_room returns (None: the room could not be checked)."""
+
+    def __init__(self, wait_at_oom=(), short=False, free=6000, **kw):
+        super().__init__(**kw)
+        self.wait_at_oom = set(wait_at_oom)
+        self.short = short
+        self.free = free
+        self.waits = 0
+        self.room_short = 0
+
+    def wait_turn(self, where):
+        super().wait_turn(where)
+        if where == "oom" and self.calls.count("oom") in self.wait_at_oom:
+            self.waits += 1                                      # a lock wait (the bot's check), then room
+
+    def wait_room(self, where):
+        super().wait_room(where)
+        if self.short:
+            self.waits += 1
+            self.room_short += 1
+        return self.free
+
+    def stats(self):
+        return {"waits": self.waits, "waited_s": 0.0, "room_short": self.room_short, "room_checks": len(self.rooms)}
 
 
 def page_array(page: int, shape=(40, 30)) -> np.ndarray:
@@ -546,6 +577,95 @@ class FirstReadTests(_Dir):
         self.assertEqual(GE.current_build_id(), str(version.BUILD_ID))
         self.assertEqual(self.load(src)[GE.BUILD_KEY], str(version.BUILD_ID))
 
+    # -- 1.0.1 (APP_SPEC R2.10 I29): a page cut down by the 3 GB cap alone is "cap" and reused; "busy" is read again
+    def test_a_page_too_large_for_the_cap_on_a_free_card_is_reused(self):
+        pdf = make_pdf(self.dir / "bundle.pdf", 4, layer_pages=(1,))
+        src = source("bundle", [pdf])
+        dv = FakeDV(shapes={4: (2100, 30)})
+        gate = StatGate()                                                 # every retry on a free card
+        fr = self.run_fr(src, dv, gate, self.factory(oom={4: 2}), build_id="b1")   # full, retry, then 2000 px
+        self.assertEqual(gate.rooms, ["oom"])
+        self.assertEqual((fr["downscaled"], fr["downscaled_cap"], fr["downscaled_busy"]), (1, 1, 0))
+        p4 = self.pages_of(src)[4]
+        self.assertEqual((p4["downscaled"], p4[GE.WHY_KEY]), (2000, GE.CUT_CAP))
+        text = p4["text"]
+        for _ in range(2):                                                # the next checks: nothing is read
+            def no_model():
+                raise AssertionError("a page cut down by the cap alone is reused, so nothing is read")
+            fr = self.run_fr(src, dv, StatGate(), no_model, build_id="b1")
+            self.assertEqual((fr["pending"], fr["reused"], fr["model_loaded"]), (0, 4, False))
+            self.assertEqual((fr["reread_downscaled"], fr["downscaled"], fr["downscaled_cap"], fr["downscaled_busy"]),
+                             (0, 1, 1, 0))
+            p4 = self.pages_of(src)[4]                                    # the marks survive gpuread's rebuild
+            self.assertEqual((p4["downscaled"], p4[GE.WHY_KEY], p4["text"]), (2000, GE.CUT_CAP, text))
+            self.assertTrue(self.load(src)["complete"])
+        self.assertEqual(GE.reading_note(fr), GE.NOTE_BASE + "; 1 page(s) read smaller (card memory)")
+
+    def test_a_cap_page_keeps_its_marks_when_other_pages_are_read(self):
+        pdf = make_pdf(self.dir / "bundle.pdf", 5, layer_pages=(1,))
+        src = source("bundle", [pdf])
+        dv = FakeDV(shapes={3: (2100, 30)})
+        with self.assertRaises(Cancelled):                                # cancelled before page 5
+            self.run_fr(src, dv, StatGate(raise_at=("page", 4)), self.factory(oom={3: 2}), build_id="b1")
+        self.assertEqual(self.pages_of(src)[3][GE.WHY_KEY], GE.CUT_CAP)
+        log = []
+        fr = self.run_fr(src, dv, StatGate(), self.factory(log=log), build_id="b1")
+        self.assertEqual(log, [(5, (40, 30))])                            # only page 5; page 3 is reused
+        pages = self.pages_of(src)
+        self.assertEqual((pages[3]["downscaled"], pages[3][GE.WHY_KEY]), (2000, GE.CUT_CAP))
+        self.assertNotIn(GE.WHY_KEY, pages[5])
+        self.assertEqual((fr["reused"], fr["downscaled"], fr["downscaled_cap"]), (4, 1, 1))
+
+    def test_a_cut_down_after_a_wait_is_busy_and_read_again(self):
+        pdf = make_pdf(self.dir / "bundle.pdf", 4, layer_pages=(1,))
+        src = source("bundle", [pdf])
+        dv = FakeDV(shapes={3: (2100, 30), 4: (2100, 30)})
+        # page 3's retry finds the card free; page 4's waits for the bot's lock first (the 2nd "oom" turn)
+        fr = self.run_fr(src, dv, StatGate(wait_at_oom={2}), self.factory(oom={3: 2, 4: 2}), build_id="b1")
+        self.assertEqual((fr["downscaled"], fr["downscaled_cap"], fr["downscaled_busy"]), (2, 1, 1))
+        pages = self.pages_of(src)
+        self.assertEqual((pages[3][GE.WHY_KEY], pages[4][GE.WHY_KEY]), (GE.CUT_CAP, GE.CUT_BUSY))
+        log = []
+        fr = self.run_fr(src, dv, StatGate(), self.factory(log=log), build_id="b1")   # the card is free now
+        self.assertEqual(log, [(4, (2100, 30))])                          # only the busy page, at full size
+        self.assertEqual((fr["reread_downscaled"], fr["downscaled"], fr["downscaled_cap"], fr["downscaled_busy"]),
+                         (1, 1, 1, 0))
+        pages = self.pages_of(src)
+        self.assertNotIn("downscaled", pages[4])
+        self.assertNotIn(GE.WHY_KEY, pages[4])
+        self.assertEqual(pages[3][GE.WHY_KEY], GE.CUT_CAP)
+
+    def test_no_room_or_an_unknown_card_state_is_busy(self):
+        for name, gate in (("room short", StatGate(short=True)), ("free unknown", StatGate(free=None)),
+                           ("no stats", FakeGate())):
+            with self.subTest(name):
+                d = self.dir / name.replace(" ", "-")
+                d.mkdir()
+                src = source("bundle", [make_pdf(d / "bundle.pdf", 2, layer_pages=(1,))])
+                fr = self.run_fr(src, FakeDV(shapes={2: (2100, 30)}), gate, self.factory(oom={2: 2}),
+                                 build_id="b1")
+                self.assertEqual((fr["downscaled"], fr["downscaled_cap"], fr["downscaled_busy"]), (1, 0, 1))
+                self.assertEqual(self.pages_of(src)[2][GE.WHY_KEY], GE.CUT_BUSY)
+                self.store(src).unlink()                                  # the next made-up PDF may share its id
+
+    def test_a_picture_too_large_for_the_cap(self):
+        """gpuread's picture path: read_document runs out of memory (GatedReader's retry too), then the array at
+        full size and at 2000 px through read_with_retries; every retry on a free card: "cap"."""
+        folder = self.dir / "pics"
+        folder.mkdir()
+        png = make_png(folder / "photo.png", size=2100)
+        src = source("folder", [png])
+
+        class PicReader(FakePageReader):
+            def readtext(self, image, detail=1, **kw):
+                if isinstance(image, str) or max(image.shape[:2]) > 2000:
+                    raise FT.oom("picture")
+                return ["MADE-UP", "PICTURE"]
+        fr = self.run_fr(src, FakeDV(), StatGate(), lambda: PicReader(), build_id="b1")
+        p = self.load(src)["files"][0]["pages"][0]
+        self.assertEqual((p["kind"], p["downscaled"], p[GE.WHY_KEY]), ("image", 2000, GE.CUT_CAP))
+        self.assertEqual((fr["downscaled_cap"], fr["downscaled_busy"]), (1, 0))
+
 
 class UsableDoneTests(unittest.TestCase):
     def test_rules(self):
@@ -566,6 +686,36 @@ class UsableDoneTests(unittest.TestCase):
         no_build = {k: v for k, v in done.items() if k != GE.BUILD_KEY}  # a file from before this rule
         self.assertEqual(GE.usable_done(no_build, "b1")[1]["stale"], 1)
         self.assertEqual(GE.usable_done({}, "b1"), ({}, {"stale": 0, "downscaled": 0}))
+
+    def test_a_page_cut_down_by_the_cap_alone_is_kept(self):
+        """1.0.1 (APP_SPEC R2.10 I29): "cap" pages stay; "busy" ones, those without a reason (and a malformed
+        mark) are read again."""
+        def page(n, **kw):
+            return {"page": n, "text": "made-up", "kind": "ocr", "sideways": False, "seconds": 1.0, **kw}
+        cap = {GE.WHY_KEY: GE.CUT_CAP}
+        done = {"schema": GR.SCHEMA, "engine": GE.APP_ENGINE_LABEL, GE.BUILD_KEY: "b1", "case_id": "B-x",
+                "files": [{"name": "a.pdf", "sha256": "0" * 64, "n_pages": 6,
+                           "pages": [page(1), page(2, downscaled=2000, **cap), page(3, downscaled=1600, **cap),
+                                     page(4, downscaled=2000, **{GE.WHY_KEY: GE.CUT_BUSY}), page(5, downscaled=2000),
+                                     page(6, downscaled=True, **cap)]}]}
+        out, left = GE.usable_done(done, "b1")
+        self.assertEqual([p["page"] for p in out["files"][0]["pages"]], [1, 2, 3])
+        self.assertEqual(left, {"stale": 0, "downscaled": 3})
+        kept = GE._kept_cuts(out)
+        self.assertEqual(kept, {("a.pdf", "0" * 64, 6): {2: {"downscaled": 2000, GE.WHY_KEY: GE.CUT_CAP},
+                                                          3: {"downscaled": 1600, GE.WHY_KEY: GE.CUT_CAP}}})
+        rebuilt = {"files": [{"name": "a.pdf", "sha256": "0" * 64, "n_pages": 6,      # as gpuread's _previous
+                              "pages": [page(1), page(2), page(3), page(4, downscaled=2000), page(5)]}]}
+        GE._mark_cuts(rebuilt, kept, busy=True)
+        p = {x["page"]: x for x in rebuilt["files"][0]["pages"]}
+        self.assertEqual((p[2]["downscaled"], p[2][GE.WHY_KEY], p[3]["downscaled"]), (2000, GE.CUT_CAP, 1600))
+        self.assertEqual(p[4][GE.WHY_KEY], GE.CUT_BUSY)                   # cut down in this check, after a wait
+        self.assertNotIn("downscaled", p[1])
+        self.assertNotIn(GE.WHY_KEY, p[5])
+        self.assertEqual(GE._cut_counts(rebuilt), (3, 2, 1))
+        other = {"files": [{"name": "a.pdf", "sha256": "1" * 64, "n_pages": 6, "pages": [page(2)]}]}
+        GE._mark_cuts(other, kept, busy=False)                           # another file's bytes: no mark
+        self.assertNotIn("downscaled", other["files"][0]["pages"][0])
 
 
 class GatedReaderTests(_Dir):
@@ -607,6 +757,75 @@ class GatedReaderTests(_Dir):
         g = GE.GatedReader(FakePageReader(oom={7: 1}), SimpleNamespace(wait_turn=lambda where: None), self.card,
                            None)
         self.assertEqual(g.readtext(page_array(7), detail=0)[0], "MADE-UP PAGE 7")
+        self.assertTrue(g.busy)                                           # the room could not be confirmed
+
+    def test_busy_only_when_the_retry_was_not_on_a_free_card(self):
+        """1.0.1 (APP_SPEC R2.10 I29): the flag first_read turns into "cap" / "busy"."""
+        g = GE.GatedReader(FakePageReader(oom={7: 1}), StatGate(), self.card, None)
+        g.readtext(page_array(7), detail=0)
+        self.assertFalse(g.busy)                                          # no wait, room confirmed: the cap
+        g = GE.GatedReader(FakePageReader(), StatGate(), self.card, None)
+        g.readtext(page_array(8), detail=0)
+        self.assertFalse(g.busy)                                          # no out-of-memory error at all
+        for gate in (StatGate(wait_at_oom={1}), StatGate(short=True), StatGate(free=None), FakeGate()):
+            g = GE.GatedReader(FakePageReader(oom={7: 1}), gate, self.card, None)
+            g.readtext(page_array(7), detail=0)
+            self.assertTrue(g.busy, type(gate).__name__)
+        broken = StatGate()
+        broken.stats = lambda: 1 / 0                                      # stats that fail count as unknown
+        g = GE.GatedReader(FakePageReader(oom={7: 1}), broken, self.card, None)
+        g.readtext(page_array(7), detail=0)
+        self.assertTrue(g.busy)
+
+    def test_the_real_card_gate_tells_a_wait(self):
+        """With cardgate.CardGate itself: a retry on a free card (no lock, room at once) is not busy; a retry that
+        waits for the bot's lock, or for room, is."""
+        from src.verify.runner.app import cardgate as CG
+        lock = self.dir / "made-up.lock"
+        clock = [0.0]
+        free = [6000]
+
+        def sleep(s):
+            clock[0] += s
+            if lock.exists() and clock[0] > 30:
+                lock.unlink()                                             # the made-up bot finishes
+
+        def make():
+            gate = CG.CardGate([str(lock)], lambda *a, **k: None, free_mb=lambda: free[0],
+                               clock=lambda: clock[0], wall=time.time, sleep=sleep)
+            gate.on_room = lambda: 3500                                   # what Card.room_mb would ask
+            return gate
+
+        class BotStartsDuringTheCall(FakePageReader):
+            """The first call takes a second, the bot's lock appears meanwhile, and it runs out of memory."""
+            first = True
+
+            def readtext(self, image, detail=1, **kw):
+                if self.first:
+                    self.first = False
+                    clock[0] += 1.0
+                    lock.write_text("made-up", encoding="ascii")
+                    raise FT.oom("made-up")
+                return super().readtext(image, detail=detail, **kw)
+
+        g = GE.GatedReader(FakePageReader(oom={7: 1}), make(), self.card, None)       # no lock, room at once
+        g.readtext(page_array(7), detail=0)
+        self.assertFalse(g.busy)
+        g = GE.GatedReader(BotStartsDuringTheCall(), make(), self.card, None)
+        self.assertEqual(g.readtext(page_array(7), detail=0)[0], "MADE-UP PAGE 7")
+        self.assertTrue(g.busy)                                           # the retry waited for the bot
+        self.assertFalse(lock.exists())
+        free[0] = 1000                                                    # another program holds card memory
+        gate = make()
+
+        def room_comes_back(s):
+            clock[0] += s
+            free[0] = 6000
+        gate._sleep = room_comes_back
+        g = GE.GatedReader(FakePageReader(oom={7: 1}), gate, self.card, None)
+        g.readtext(page_array(7), detail=0)
+        self.assertTrue(g.busy)                                           # the retry waited for room
+        self.assertGreaterEqual(gate.stats()["waits"], 1)
 
     def test_a_second_oom_goes_on(self):
         g = GE.GatedReader(FakePageReader(oom={7: 2}), FakeGate(), self.card, None)

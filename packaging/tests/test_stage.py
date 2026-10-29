@@ -345,7 +345,7 @@ class StageOutputTests(unittest.TestCase):
     def test_build_json_fields(self) -> None:
         b = json.loads((self.st / "BUILD.json").read_text(encoding="utf-8"))
         self.assertEqual(b, self.build)
-        want = {"app_version": "1.0.0", "build_id": "20261029.1-abcdef1", "file_version": "1.0.0.1",
+        want = {"app_version": "1.0.1", "build_id": "20261029.1-abcdef1", "file_version": "1.0.1.1",
                 "flavour": "gpu-cu128", "built": "2026-10-29T00:00:00Z", "runner_version": "0.0.9",
                 "base_rules_version": "2000-01-01.1", "runner_rules_version": "2000-01-02.r1",
                 "spec": "RUNNER_SPEC r2.7 / APP_SPEC r2", "baseline": "r8 (runner 0.2.7, 344b342)",
@@ -373,7 +373,7 @@ class StageOutputTests(unittest.TestCase):
         self.assertEqual((self.st / "hdc_entry.py").read_text(encoding="utf-8"), stage.HDC_ENTRY)
         vi = (self.st / "version_info.txt").read_text(encoding="utf-8")
         self.assertIn("Hangeul Document Checker (GPU)", vi)
-        self.assertIn("1.0.0.1", vi)
+        self.assertIn("1.0.1.1", vi)
         self.assertTrue((self.st / "icon.ico").read_bytes().startswith(b"\x00\x00\x01\x00"))
         for n in stage.VCRT_MIN:
             self.assertTrue((self.st / "vcrt" / n).is_file())
@@ -848,7 +848,7 @@ class VersionTests(unittest.TestCase):
         (root / "20261028.9-abc1234").mkdir()
         (root / "junk").mkdir()
         self.assertEqual(version.next_build_id(root, "20261029", "abc1234", True), "20261029.5-abc1234-dirty")
-        self.assertEqual(version.file_version("20261029.5-abc1234-dirty"), "1.0.0.5")
+        self.assertEqual(version.file_version("20261029.5-abc1234-dirty"), "1.0.1.5")
 
     def test_git_facts(self) -> None:
         calls = []
@@ -871,14 +871,14 @@ class VersionTests(unittest.TestCase):
         names = {n: rec(n) for n in ("VSVersionInfo", "FixedFileInfo", "StringFileInfo", "StringTable",
                                       "StringStruct", "VarFileInfo", "VarStruct")}
         v = eval(compile(ast.parse(text, mode="eval"), "vi", "eval"), {"__builtins__": {}}, names)
-        self.assertEqual(v["ffi"]["filevers"], (1, 0, 0, 2))
-        self.assertEqual(v["ffi"]["prodvers"], (1, 0, 0, 0))
+        self.assertEqual(v["ffi"]["filevers"], (1, 0, 1, 2))
+        self.assertEqual(v["ffi"]["prodvers"], (1, 0, 1, 0))
         table = v["kids"][0]["args"][0][0]
         strings = {s["args"][0]: s["args"][1] for s in table["args"][1]}
         self.assertEqual(strings["FileDescription"], "Hangeul Document Checker (GPU)")
         self.assertEqual(strings["OriginalFilename"], "Hangeul Document Checker.exe")
-        self.assertEqual(strings["FileVersion"], "1.0.0.2")
-        self.assertEqual(strings["ProductVersion"], "1.0.0")
+        self.assertEqual(strings["FileVersion"], "1.0.1.2")
+        self.assertEqual(strings["ProductVersion"], "1.0.1")
         self.assertIn("GPU (CUDA 12.8)", strings["Comments"])
         self.assertIn("build 20261029.2-abc1234", strings["Comments"])
 

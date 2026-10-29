@@ -41,12 +41,14 @@ heavy job runs (one heavy process at a time): Setup unpacks about 4.6 GB twice.
 With ``--case``: ``%RPY% -I -B packaging\\tests\\install_cycle.py --build-id <id> --case owner_eap1_r8``.
 
 ``--data-dir <new folder outside AppData>`` (G3): the installed self-test and case get ``--data-dir`` instead of the
-real ``%LOCALAPPDATA%\\Hangeul Document Checker``. Needed when this script runs inside a packaged (MSIX) app's
-process tree, such as the Claude desktop app's: Windows then redirects a NEW top-level folder of %LOCALAPPDATA% into
-``%LOCALAPPDATA%\\Packages\\<package>\\LocalCache\\Local``, so DATA's real path differs from its name and the app's
-guard (safety._private) refuses the cache root (exit 2, REPORT_NOT_WRITABLE; self-test part ``guard`` FAIL).
-Existing folders such as ``%LOCALAPPDATA%\\Temp`` and ``Programs`` are not redirected, so Setup's files are real.
-Before the uninstall a made-up file is then put in the data folder, so the uninstaller's data question still runs.
+real ``%LOCALAPPDATA%\\Hangeul Document Checker``. 1.0.0 needed it when this script ran inside a packaged (MSIX)
+app's process tree, such as the Claude desktop app's: Windows then redirects a NEW top-level folder of %LOCALAPPDATA%
+into ``%LOCALAPPDATA%\\Packages\\<package>\\LocalCache\\Local``, so DATA's real path differs from its name, and 1.0.0's
+guard (safety._private) refused the cache root (exit 2, REPORT_NOT_WRITABLE; self-test part ``guard`` FAIL). From
+1.0.1 (APP_SPEC R2.10 I28) the guard compares real path with real path, so P3 runs on the DEFAULT data folder, without
+``--data-dir``, also there; the option stays for diagnosis only. Existing folders such as ``%LOCALAPPDATA%\\Temp`` and
+``Programs`` are not redirected, so Setup's files are real. With ``--data-dir`` a made-up file is put in the data
+folder before the uninstall, so the uninstaller's data question still runs.
 
 Exit codes: 0 PASS; 1 FAIL; 2 bad arguments or missing build files; 3 SKIPPED; 4 PARTIAL (--no-selftest).
 Output: ok/MISS lines with counts, versions, codes and the app's own relative file names; never an absolute path,
@@ -863,7 +865,8 @@ def main(argv: Optional[List[str]] = None, *, system: Any = None, places: Option
     p.add_argument("--case-timeout-s", type=float, default=CASE_TIMEOUT_S)
     p.add_argument("--data-dir", help="an absolute, new or empty folder outside AppData: the installed self-test and "
                                       "case use it (--data-dir) instead of %%LOCALAPPDATA%%\\Hangeul Document Checker; "
-                                      "for a test PC where that folder is redirected (see the docstring)")
+                                      "for diagnosis only: from 1.0.1 a redirected data folder works (see the "
+                                      "docstring)")
     p.add_argument("--runs-root", default=str(RUNS), help=argparse.SUPPRESS)
     p.add_argument("--apptest-root", default=str(APPTEST), help=argparse.SUPPRESS)
     try:

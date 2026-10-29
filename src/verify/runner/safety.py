@@ -42,7 +42,9 @@ every such write (engine.cut, engine.cut_page).
 APP mode (places.py; APP_SPEC rev 1 section 4.2, rev 2 R2.1.6): the write root is DATA, nothing is forbidden but
 the input, there is no bot folder and no sibling rule; prepare() also allows the report folder the user picked
 (checked by check_out_dir's APP rules) and may be called twice with the same arguments; arm_window() and
-allow_file() guard the window. DEV values, guards and messages are unchanged.
+allow_file() guard the window. DEV values, guards and messages are unchanged. A path that must lie in DATA (the cache
+root, the page texts, a written path with no guard armed) is judged by _in_data: its real path against DATA's REAL path
+(1.0.1), so a %LOCALAPPDATA% that resolves elsewhere is no refusal; the refusal says APP_DATA_OUTSIDE.
 
 Standard library only, so the GPU worker can import it in the bot venv. No personal data.
 """
@@ -56,7 +58,7 @@ import tempfile
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from . import botimport, places
 
@@ -201,14 +203,43 @@ def _resolved(p: Path) -> Path:
 
 def _private(p: Path, what: str) -> Path:
     """p resolved; raises SafetyError unless it lies under PRIVATE and outside every forbidden folder. The
-    pure checks come first, so a path under a forbidden folder is refused without touching it."""
+    pure checks come first, so a path under a forbidden folder is refused without touching it.
+    APP mode: _in_data (PRIVATE is DATA there; its real path may differ from its name)."""
     if not Path(p).is_absolute():               # a relative path is never echoed: redact() cannot see it (S3)
         raise SafetyError(f"{what} must be an absolute path")
+    if APP_MODE:
+        return _in_data(Path(p), what, Path(PRIVATE))
     if is_forbidden(Path(p)) or not _under(_norm(p), _norm(PRIVATE)):
         raise SafetyError(f"{what} must lie under {PRIVATE}: {p}")
     r = _resolved(Path(p))
     if not _under(_norm(r), _norm(PRIVATE)) or is_forbidden(r):
         raise SafetyError(f"{what} must lie under {PRIVATE}: {p}")
+    return r
+
+
+# APP mode (1.0.1, APP_SPEC R2.10 I28): the refusal of a path that is not in the app's data folder. Pinned: the worker
+# maps it to DATA_NOT_WRITABLE (not REPORT_NOT_WRITABLE: the report folder is not involved).
+APP_DATA_OUTSIDE = "lies outside the app's data folder"
+
+
+def _in_data(p: Path, what: str, data: Path, resolve: Optional[Callable[[Path], Path]] = None) -> Path:
+    """APP mode's _private: p resolved; raises SafetyError(f"{what} {APP_DATA_OUTSIDE}") unless
+      * p as written lies under DATA as written or under DATA's real path (a caller may pass either), and
+      * p's real path lies under DATA's REAL path (resolved against resolved).
+    The second rule is the one that matters for safety, and it is the same as before: a junction or link inside DATA
+    that leads elsewhere is refused. What changed (1.0.1) is that DATA's own real path is the yardstick: when
+    %LOCALAPPDATA% resolves elsewhere (an MSIX package's redirection of a new top-level folder, a junction, folder
+    redirection), every path under DATA resolves there too, and 1.0.0 refused them all (its real path was compared
+    with DATA's NAME). `resolve` is os.path.realpath's wrapper (tests pass a fake). Nothing is created; DATA need not
+    exist yet (the real path of a missing folder is its name)."""
+    resolve = resolve or _resolved
+    s, d = _norm(p), _norm(data)
+    d_real = _norm(resolve(Path(data)))
+    if is_forbidden(Path(p)) or not (_under(s, d) or _under(s, d_real)):
+        raise SafetyError(f"{what} {APP_DATA_OUTSIDE}: {p}")
+    r = resolve(Path(p))
+    if is_forbidden(r) or not _under(_norm(r), d_real):
+        raise SafetyError(f"{what} {APP_DATA_OUTSIDE}: {p}")
     return r
 
 

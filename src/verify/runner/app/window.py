@@ -246,7 +246,7 @@ def _get(obj: Any, name: str, default: Any = None) -> Any:
 def footer_app_line(versions: Mapping[str, Any]) -> str:
     if versions.get("footer"):
         return str(versions["footer"])                 # version.footer_text() (Task C)
-    app = versions.get("app_version") or "1.0.0"
+    app = versions.get("app_version") or "1.0.1"
     build = versions.get("build_id") or "dev"
     base = versions.get("base_rules_version") or "?"
     runner = versions.get("runner_rules_version") or "?"
@@ -773,7 +773,10 @@ class WindowModel:
         # what can change a verdict against an idle PC: pages read smaller or left to the light reader (card
         # memory), and time-boxed QR / barcode steps that ran out of time (the done event's counts; the window's
         # own count of budget events when an older worker sends none)
-        for note in (M.downscaled_note(gpu.get("downscaled") if gpu else 0),
+        # (1.0.1: pages cut down by the 3 GB limit alone are normal and the tested result; only the "busy" ones ask
+        # for another check. An event without "downscaled_busy" counts them all as busy, as 1.0.0 did.)
+        for note in (M.downscaled_note(gpu.get("downscaled") if gpu else 0,
+                                       gpu.get("downscaled_busy") if gpu else None),
                      M.skipped_note(gpu.get("skipped") if gpu else 0)):
             if note:
                 notes.append(note)

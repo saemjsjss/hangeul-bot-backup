@@ -144,6 +144,40 @@ class WaitingAndLines(unittest.TestCase):
             self.assertTrue(text.isascii())
             self.assertIsNone(DRIVE_PATH.search(text))
 
+    def test_pages_cut_down_by_the_card_limit_are_normal(self):
+        """1.0.1 (APP_SPEC R2.10 I29): pages too large for the 3 GB limit on a free card are read smaller on every
+        check; the note says so and asks for nothing. The busy-card wording stays for the pages cut down after a
+        wait or while another program held card memory."""
+        cap = ("3 very large page(s) were read at a smaller size to stay within the checker's graphics-card limit. "
+               "This is normal: such pages are always read this way, and the result is the tested one.")
+        self.assertEqual(M.downscaled_note(3, 0), cap)
+        self.assertNotIn("Check again", M.downscaled_note(3, 0))
+        self.assertNotIn("ran out of memory", M.downscaled_note(3, 0))
+        self.assertEqual(M.downscaled_note(1, 1), M.downscaled_note(1))        # busy: 1.0.0's words
+        both = M.downscaled_note(3, 1)
+        self.assertTrue(both.startswith("2 very large page(s) were read at a smaller size"), both)
+        self.assertTrue(both.endswith("1 page(s) were read at a smaller size because the graphics card ran out of "
+                                      "memory. Check again when the graphics card is free; the result may then "
+                                      "differ."), both)
+        self.assertEqual(M.downscaled_note(2, 7), M.downscaled_note(2))         # busy never above the total
+        self.assertEqual(M.downscaled_note(0, 0), "")
+        self.assertEqual(M.downscaled_note(2, "x"), M.downscaled_note(2, 0))   # a bad count is none
+        for text in (cap, both):
+            self.assertTrue(text.isascii())
+            self.assertIsNone(DRIVE_PATH.search(text))
+
+    def test_data_folder_refusal(self):
+        """1.0.1 (APP_SPEC R2.10 I28): the app's own data folder has its own message, not the report folder's."""
+        m = M.render(M.DATA_NOT_WRITABLE)
+        self.assertEqual((m.code, m.title, m.kind), ("DATA_NOT_WRITABLE", "Cannot use the checker's data folder",
+                                                     M.ERROR))
+        self.assertEqual(m.text, "The checker could not use its own data folder (\"Hangeul Document Checker\" in your "
+                                 "AppData folder) safely, so nothing was checked. Your files and reports were not "
+                                 "changed. Restart the PC and check again; if it happens again, run the Self-test and "
+                                 "send SELFTEST.txt.")
+        self.assertNotEqual(m.text, M.render(M.REPORT_NOT_WRITABLE).text)
+        self.assertIsNone(DRIVE_PATH.search(m.text))
+
     def test_low_memory_note_is_yellow(self):
         n = M.low_card_memory_note(3000)
         self.assertEqual(n.kind, M.NOTE)

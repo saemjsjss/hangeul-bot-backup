@@ -255,14 +255,30 @@ class TestGpuBlock(unittest.TestCase):
         self.assertNotIn("Hangeul", json.dumps(b))
         self.assertEqual(CF.done_gpu(b), {"card": "NVIDIA GeForce RTX 0000", "peak_alloc_gb": 2.6,
                                           "peak_reserved_gb": 2.9, "cpu_calls": 1, "waits": 2, "waited_s": 181.5,
-                                          "downscaled": 1, "skipped": 1})
+                                          "downscaled": 1, "downscaled_busy": 1, "skipped": 1})
+
+    def test_pages_cut_down_by_the_cap_or_a_busy_card(self):
+        """1.0.1 (APP_SPEC R2.10 I29): first_read's split reaches checkfacts and the done event; a result without
+        the split (an older first read) counts every page read smaller as busy, as 1.0.0 did."""
+        fr = {"downscaled": 3, "downscaled_cap": 2, "downscaled_busy": 1, "skipped": 0}
+        b = CF.gpu_block(fr=fr)
+        self.assertEqual((b["first_read"]["downscaled"], b["first_read"]["downscaled_cap"],
+                          b["first_read"]["downscaled_busy"]), (3, 2, 1))
+        self.assertEqual((CF.done_gpu(b)["downscaled"], CF.done_gpu(b)["downscaled_busy"]), (3, 1))
+        cap_only = CF.gpu_block(fr={"downscaled": 3, "downscaled_cap": 3, "downscaled_busy": 0})
+        self.assertEqual((CF.done_gpu(cap_only)["downscaled"], CF.done_gpu(cap_only)["downscaled_busy"]), (3, 0))
+        old = CF.gpu_block(fr={"downscaled": 2})
+        self.assertEqual((old["first_read"]["downscaled_cap"], old["first_read"]["downscaled_busy"]), (0, 2))
+        self.assertEqual(CF.done_gpu(old)["downscaled_busy"], 2)
+        self.assertEqual(CF.busy_count({"downscaled": 1, "downscaled_busy": 5}), 1)    # never more than read smaller
 
     def test_empty_block(self):
         b = CF.gpu_block()
         self.assertEqual(b["card"], {})
         self.assertEqual(b["cpu_calls"], 0)
         self.assertEqual(CF.done_gpu(b), {"card": None, "peak_alloc_gb": None, "peak_reserved_gb": None,
-                                          "cpu_calls": 0, "waits": 0, "waited_s": 0.0, "downscaled": 0, "skipped": 0})
+                                          "cpu_calls": 0, "waits": 0, "waited_s": 0.0, "downscaled": 0,
+                                          "downscaled_busy": 0, "skipped": 0})
         self.assertEqual(CF.done_gpu(None)["waits"], 0)
 
 

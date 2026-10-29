@@ -1,7 +1,7 @@
 ; Hangeul Document Checker - installer script for Inno Setup 6.7.4 (APP_SPEC revision 2, R2.5).
 ;
 ; Compiled only by packaging\installer\build_installer.py, never by hand:
-;   ISCC.exe /Qp /DAppFolder="<dist>\Hangeul Document Checker" /DAppVersion=1.0.0 /DFileVersion=1.0.0.<N>
+;   ISCC.exe /Qp /DAppFolder="<dist>\Hangeul Document Checker" /DAppVersion=1.0.1 /DFileVersion=1.0.1.<N>
 ;            /DBuildId=<build id> /O"<builds>\<build id>\installer" hdc.iss
 ; and a second time with /DSpan=1 only when ISCC reports its 4,200,000,000-byte limit for one Setup.exe.
 ;
@@ -17,10 +17,10 @@
 #error AppFolder is missing - compile with /DAppFolder=<dist folder of the app>
 #endif
 #ifndef AppVersion
-#error AppVersion is missing - compile with /DAppVersion=1.0.0
+#error AppVersion is missing - compile with /DAppVersion=1.0.1
 #endif
 #ifndef FileVersion
-#error FileVersion is missing - compile with /DFileVersion=1.0.0.N
+#error FileVersion is missing - compile with /DFileVersion=1.0.1.N
 #endif
 #ifndef BuildId
 #error BuildId is missing - compile with /DBuildId=<build id>

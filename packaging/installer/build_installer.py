@@ -15,8 +15,10 @@ What it does, in order (any failure stops it, exit code 1; bad arguments give 2)
    BELOW_NORMAL, and ended together on the 3 h timeout), with ISCC's output in ``<builds>\\<id>\\reports\\iscc.log``.
 3. Only when ISCC refuses on its 4,200,000,000-byte limit for one Setup.exe, compiles once more with ``/DSpan=1``
    (Setup.exe plus ``-1.bin``, ``-2.bin`` ...).
-4. Writes ``setup.sha256``, ``installer.json`` and ``README_INSTALL.txt`` (filled from this folder's template) next to
-   Setup.exe in ``<builds>\\<id>\\installer``.
+4. Writes ``setup.sha256``, ``installer.json``, ``README_INSTALL.txt`` (the owner's release README, filled from this
+   folder's template with this build's sizes: the Setup file, the installed app, the free disk space needed) and
+   ``SHA256SUMS.txt`` (the Setup file(s) and README_INSTALL.txt) next to Setup.exe in ``<builds>\\<id>\\installer``:
+   that folder holds what a release folder holds (1.0.1, APP_SPEC R2.10 I30).
 
 Standard library only (it runs in the build venv and in the runner venv). It never installs anything. It prints
 counts, sizes, seconds, file names of the app and codes; no student data exists anywhere in its inputs.
@@ -29,6 +31,7 @@ import argparse
 import datetime as _dt
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -46,19 +49,22 @@ APP_GUID = "767599DF-1DFD-490C-A03A-32EE783D7301"
 APP_ID = "{" + APP_GUID + "}"
 UNINSTALL_KEY = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\" + APP_ID + "_is1"   # under HKCU
 UNINSTALL_DISPLAY_NAME = APP_NAME + " (GPU)"
-APP_VERSION_DEFAULT = "1.0.0"
+APP_VERSION_DEFAULT = "1.0.1"
 SETUP_BASE = APP_NAME + " Setup {version} GPU"           # = OutputBaseFilename of hdc.iss
 
 HERE = Path(__file__).resolve().parent
 ISS = HERE / "hdc.iss"
 README_TEMPLATE = HERE / "README_INSTALL.txt"
 README_NAME = "README_INSTALL.txt"
+SUMS_NAME = "SHA256SUMS.txt"
 ISCC = Path(r"C:\Hangeul\DOCCHECK\tools\InnoSetup6\ISCC.exe")
 BUILDS = Path(r"C:\Hangeul\DOCCHECK\lab\app-build\builds")
 
 INNO_LIMIT_BYTES = 4_200_000_000     # Inno Setup 6.7.4: the most compressed data one Setup.exe may hold
 TIMEOUT_S = 3 * 3600                 # per ISCC pass
-README_KEYS = ("APP_VERSION", "BUILD_ID", "SETUP_GB", "CHECK_DATE", "THIS_PC_CODE")
+# 1.0.1 (R2.10 I30): the release README names sizes of THIS build; no CHECK_0001 step (that file is not shipped)
+README_KEYS = ("APP_VERSION", "BUILD_ID", "SETUP_GB", "SETUP_BYTES", "INSTALLED_GB", "DISK_GB")
+DISK_MARGIN_GB = 0.5                 # added before the free disk space is rounded up to whole GB
 
 BUILD_ID_RE = re.compile(r"^(?P<date>\d{8})\.(?P<n>\d{1,5})-(?P<git>[0-9a-f]{7,40})(?P<dirty>-dirty)?$")
 APP_VERSION_RE = re.compile(r"^\d{1,5}\.\d{1,5}\.\d{1,5}$")
@@ -134,6 +140,20 @@ def setup_gb(total_bytes: int) -> str:
     return "%.1f" % (total_bytes / float(1 << 30))
 
 
+def disk_gb(setup_bytes: int, app_bytes: int) -> str:
+    """The free disk space README_INSTALL.txt asks for, in whole GB as Explorer counts them (1024^3 bytes): the Setup
+    file(s) and the installed app together (both are on the disk until the Setup file is deleted), plus
+    DISK_MARGIN_GB (the data folder, Windows' own files), rounded up. Build 20261029.3: 1.8 + 4.4 GB -> "7"."""
+    if setup_bytes < 0 or app_bytes < 0:
+        raise ValueError("a size cannot be negative")
+    return "%d" % math.ceil((setup_bytes + app_bytes) / float(1 << 30) + DISK_MARGIN_GB)
+
+
+def bytes_text(n: int) -> str:
+    """A byte count with thousands separators, such as "1,939,911,235" (as Explorer's Properties show a size)."""
+    return "{:,}".format(int(n))
+
+
 def needs_span(returncode: Optional[int], log_text: str) -> bool:
     """True only when ISCC failed because one Setup.exe would exceed its 4,200,000,000-byte limit."""
     return returncode not in (0, None) and bool(SPAN_RE.search(log_text or ""))
@@ -164,7 +184,8 @@ def iscc_command(iscc: Path, iss: Path, app_folder: Path, app_version: str, file
 
 
 def fill_readme(template: str, values: Mapping[str, str]) -> str:
-    """Fill the five ``{KEY}`` places of README_INSTALL.txt; the result has CRLF line ends (Notepad, USB sticks)."""
+    """Fill the ``{KEY}`` places of README_INSTALL.txt (exactly README_KEYS); the result has CRLF line ends (Notepad,
+    USB sticks)."""
     found = PLACEHOLDER_RE.findall(template)
     if sorted(set(found)) != sorted(README_KEYS):
         raise BuildError("README_INSTALL.txt must hold exactly the places %s" % ", ".join(README_KEYS))
@@ -622,10 +643,12 @@ def output_files(out_dir: Path, base: str) -> List[Path]:
     return files + [p for _, p in sorted(bins)]
 
 
-def write_sha256(out_dir: Path, files: Sequence[Path]) -> Dict[str, str]:
+def write_sha256(out_dir: Path, files: Sequence[Path], name: str = "setup.sha256") -> Dict[str, str]:
+    """``<sha256> *<file name>`` per file, in order, into ``out_dir`` / ``name`` (setup.sha256: the Setup files;
+    SUMS_NAME: those and README_INSTALL.txt, for the release folder)."""
     sums = {p.name: sha256_file(p) for p in files}
     text = "".join("%s *%s\n" % (sums[p.name], p.name) for p in files)
-    (Path(out_dir) / "setup.sha256").write_text(text, encoding="ascii", newline="\n")
+    (Path(out_dir) / name).write_text(text, encoding="ascii", newline="\n")
     return sums
 
 
@@ -657,8 +680,10 @@ def main(argv: Optional[Sequence[str]] = None, *, runner: Optional[Runner] = Non
     p = argparse.ArgumentParser(prog="build_installer.py",
                                 description="Build the Setup.exe of the Hangeul Document Checker (APP_SPEC r2 R2.5).")
     p.add_argument("--build-id", required=True, help="YYYYMMDD.N-<git short>[-dirty]")
-    p.add_argument("--check-date", required=True, help="the fixed check date of README step 5 (YYYY-MM-DD)")
-    p.add_argument("--this-pc-code", required=True, help="CHECK_0001's result code on this PC (XXXX-XXXX)")
+    p.add_argument("--check-date", required=True,
+                   help="P1's fixed check date of CHECK_0001 (YYYY-MM-DD), recorded in installer.json")
+    p.add_argument("--this-pc-code", required=True,
+                   help="CHECK_0001's result code on this PC (XXXX-XXXX, P1), recorded in installer.json")
     p.add_argument("--builds-root", default=str(BUILDS))
     p.add_argument("--app-folder", help="default: <builds>\\<id>\\dist\\Hangeul Document Checker")
     p.add_argument("--out-dir", help="default: <builds>\\<id>\\installer")
@@ -770,11 +795,14 @@ def main(argv: Optional[Sequence[str]] = None, *, runner: Optional[Runner] = Non
         sums = write_sha256(out_dir, files)
         total = sum(f.stat().st_size for f in files)
         gb = setup_gb(total)
+        installed_gb = setup_gb(tree.bytes)
+        need_gb = disk_gb(total, tree.bytes)
         info = {
             "app_id": APP_ID, "app_version": app_version, "build_id": build_id, "file_version": file_ver,
             "setup": files[0].name,
             "files": [{"name": f.name, "bytes": f.stat().st_size, "sha256": sums[f.name]} for f in files],
             "bytes": total, "setup_gb": gb, "app_files": tree.checked, "app_bytes": tree.bytes,
+            "installed_gb": installed_gb, "disk_gb": need_gb,
             "ratio": round(total / tree.bytes, 4) if tree.bytes else None,
             "seconds": round(sum(x["seconds"] for x in passes), 1), "spanning": spanning,
             "passes": passes, "iscc": file_version_of(iscc), "check_date": a.check_date,
@@ -782,11 +810,14 @@ def main(argv: Optional[Sequence[str]] = None, *, runner: Optional[Runner] = Non
         }
         (out_dir / "installer.json").write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")
         readme = fill_readme(template, {"APP_VERSION": app_version, "BUILD_ID": build_id, "SETUP_GB": gb,
-                                        "CHECK_DATE": a.check_date, "THIS_PC_CODE": a.this_pc_code})
+                                        "SETUP_BYTES": bytes_text(total), "INSTALLED_GB": installed_gb,
+                                        "DISK_GB": need_gb})
         (out_dir / README_NAME).write_bytes(readme.encode("ascii"))
+        write_sha256(out_dir, list(files) + [out_dir / README_NAME], SUMS_NAME)
         _say("  ok   %s: %s bytes (%s GB), %d file(s), spanning %s, ratio %s, %.0f s"
              % (files[0].name, total, gb, len(files), "yes" if spanning else "no", info["ratio"], info["seconds"]))
-        _say("  ok   setup.sha256, installer.json, %s written" % README_NAME)
+        _say("  ok   README: Setup %s GB, installed %s GB, free disk %s GB" % (gb, installed_gb, need_gb))
+        _say("  ok   setup.sha256, installer.json, %s, %s written" % (README_NAME, SUMS_NAME))
         return 0
     except BuildError as e:
         _say("build_installer: FAILED: %s" % e)

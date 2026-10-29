@@ -27,7 +27,7 @@ APP_NAME = "Hangeul Document Checker"
 
 # DEV defaults (R2.0 G11, R2.3.1, R2.4.4; the lab engine's versions read on 29 Oct)
 DEV_DEFAULTS: Dict[str, Any] = {
-    "app_version": "1.0.0",
+    "app_version": "1.0.1",
     "build_id": "dev",
     "flavour": "gpu-cu128",
     "runner_version": _model.RUNNER_VERSION,
@@ -208,7 +208,7 @@ def flavour_label(info: Optional[BuildInfo] = None) -> str:
 
 
 def footer_text(info: Optional[BuildInfo] = None) -> str:
-    """The window footer's version part: "App 1.0.0 (build <id>, GPU (CUDA 12.8)) · Rules: bot ... + runner ..."."""
+    """The window footer's version part: "App 1.0.1 (build <id>, GPU (CUDA 12.8)) · Rules: bot ... + runner ..."."""
     v = (info or CURRENT).values
     return (f"App {v['app_version']} (build {v['build_id']}, {flavour_label(info)}) · "
             f"Rules: {rules_label(info)}")

@@ -3,7 +3,7 @@
 The manifest lives at `<app folder>\\_internal\\MANIFEST.json` and lists every file of the app folder (the folder that
 holds `Hangeul Document Checker.exe`) except itself. Paths are relative to the app folder, with "/" separators.
 
-    {"schema": "hdc-manifest/1", "build_id": "...", "app_version": "1.0.0", "count": N, "bytes": B,
+    {"schema": "hdc-manifest/1", "build_id": "...", "app_version": "1.0.1", "count": N, "bytes": B,
      "files": {"Hangeul Document Checker.exe": {"size": 123, "sha256": "<64 hex>"},
                "_internal/BUILD.json": {...}, ...}}
 
@@ -128,7 +128,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     w = sub.add_parser("write")
     w.add_argument("app_folder")
     w.add_argument("--build-id", required=True)
-    w.add_argument("--app-version", default="1.0.0")
+    w.add_argument("--app-version", default="1.0.1")
     v = sub.add_parser("verify")
     v.add_argument("app_folder")
     v.add_argument("--sizes-only", action="store_true")

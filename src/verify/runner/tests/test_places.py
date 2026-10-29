@@ -595,6 +595,206 @@ class TestAppMode(unittest.TestCase):
         self.assertFalse((self.base / "reports" / "c3").exists())
 
 
+class TestInDataFakeResolver(unittest.TestCase):
+    """1.0.1 (APP_SPEC R2.10 I28): safety._in_data, the APP rule for a path that must lie in DATA, with a FAKE
+    resolver standing for Windows' redirection of %LOCALAPPDATA% (an MSIX package, a junction, folder redirection).
+    Pure: made-up drive X:, nothing is touched."""
+
+    DATA = Path(r"X:\Users\Someone\AppData\Local\Hangeul Document Checker")
+    REAL = Path(r"X:\Users\Someone\AppData\Local\Packages\Made.Up_0000\LocalCache\Local\Hangeul Document Checker")
+    OUTSIDE = Path(r"X:\Elsewhere")
+
+    def resolve(self, p: Path) -> Path:
+        """DATA's name redirects to REAL; DATA\\cache\\jout is a made-up junction to X:\\Elsewhere; DATA\\cache\\jbot one
+        to the DEV bot folder (a forbidden folder in this DEV process)."""
+        s = os.path.normcase(os.path.abspath(str(p)))
+        for name, target in ((self.DATA / "cache" / "jout", self.OUTSIDE / "target"),
+                             (self.DATA / "cache" / "jbot", TODAY_BOT / "made-up"),
+                             (self.DATA, self.REAL)):
+            n = os.path.normcase(str(name))
+            if s == n or s.startswith(n + "\\"):
+                return Path(str(target) + str(p)[len(str(name)):])
+        return Path(os.path.abspath(str(p)))
+
+    def refused(self, p: Path) -> str:
+        try:
+            safety._in_data(p, "the cache root", self.DATA, self.resolve)
+        except safety.SafetyError as e:
+            return str(e)
+        return "ok"
+
+    def test_paths_under_a_redirected_data_folder_are_accepted(self):
+        got = safety._in_data(self.DATA / "cache", "the cache root", self.DATA, self.resolve)
+        self.assertEqual(got, self.REAL / "cache")                    # the real path, as before
+        page_texts = self.DATA / "cache" / "pagetexts" / "F-0123456789abcdef.json"
+        self.assertEqual(safety._in_data(page_texts, "--page-texts", self.DATA, self.resolve),
+                         self.REAL / "cache" / "pagetexts" / "F-0123456789abcdef.json")
+        # a caller that passes the real path already is accepted too
+        self.assertEqual(safety._in_data(self.REAL / "tmp", "a written path", self.DATA, self.resolve),
+                         self.REAL / "tmp")
+        # 1.0.0's rule (the real path against DATA's NAME) refused exactly these: the regression of I27
+        self.assertFalse(str(self.resolve(self.DATA / "cache")).lower().startswith(str(self.DATA).lower() + "\\"))
+
+    def test_the_guard_keeps_its_refusals(self):
+        for p in (self.OUTSIDE / "cache",                                   # outside DATA as written
+                  self.DATA.parent / "Hangeul Document Checker2" / "cache",  # a sibling with a longer name
+                  self.DATA / ".." / "Programs" / "x",                       # leaves DATA through ".."
+                  self.DATA / "cache" / "jout" / "x.json",                   # a junction inside DATA that leads out
+                  self.DATA / "cache" / "jbot" / "x.json"):                  # ... into a forbidden folder (DEV)
+            why = self.refused(p)
+            self.assertTrue(why.startswith("the cache root " + safety.APP_DATA_OUTSIDE), (p, why))
+        self.assertTrue(safety.is_forbidden(TODAY_BOT / "made-up"))         # DEV keeps the bot rule
+        self.assertIn("lies outside", self.refused(TODAY_BOT / "made-up"))
+
+    def test_not_resolved_data_folder(self):
+        """No redirection (the usual case): the same answers as the DEV rule had for PRIVATE."""
+        plain = lambda p: Path(os.path.abspath(str(p)))                      # noqa: E731
+        self.assertEqual(safety._in_data(self.DATA / "cache", "x", self.DATA, plain), self.DATA / "cache")
+        with self.assertRaises(safety.SafetyError):
+            safety._in_data(self.OUTSIDE, "x", self.DATA, plain)
+
+    def test_dev_private_is_unchanged(self):
+        """In DEV, _private still compares with private-runner as written and resolved (no _in_data)."""
+        self.assertFalse(safety.APP_MODE)
+        with self.assertRaises(safety.SafetyError) as cm:
+            safety._private(self.DATA / "cache", "the cache root")
+        self.assertIn("must lie under", str(cm.exception))
+        self.assertNotIn(safety.APP_DATA_OUTSIDE, str(cm.exception))
+
+
+_REDIRECT_CHILD = r'''
+import json, os, sys
+from pathlib import Path
+base = Path(sys.argv[1])
+data, real, inp, elsewhere = base / "data", base / "realdata", base / "input", base / "elsewhere"
+res = {}
+from src.verify.runner import places, safety, engine, ingest
+from src.verify.runner.model import PAGE_TEXTS_SCHEMA, Source, SourceFile
+P = places.current()
+res["data_is_junction"] = os.path.isjunction(data)
+res["write_root"] = str(P.write_root)
+def try_private(p, what="the cache root"):
+    try:
+        return "ok:" + str(safety._private(Path(p), what))
+    except safety.SafetyError as e:
+        return "SafetyError: " + str(e)
+# the paths the worker uses, before the guard is armed (1.0.0 refused the first three)
+res["cache_root"] = try_private(P.cache_root)
+res["tmp"] = try_private(P.temp_dir, "a written path")
+res["store"] = try_private(P.cache_root / "pagetexts" / "F-0123456789abcdef.json", "--page-texts")
+res["real_name"] = try_private(real / "cache")
+res["outside"] = try_private(elsewhere / "cache")
+res["inner_junction"] = try_private(data / "cache" / "jout" / "x.json")
+# load_page_texts of the store under DATA (its name), read through the junction
+f = inp / "PASSPORT.pdf"
+src = Source(mode="folder", root=inp, case_id="F-0123456789abcdef",
+             files=[SourceFile(path=f, name=f.name, is_image=False, n_pages=1, size=f.stat().st_size,
+                               mtime=f.stat().st_mtime)])
+doc = {"schema": PAGE_TEXTS_SCHEMA, "engine": "made-up", "mode": "folder", "complete": True,
+       "files": [{"name": f.name, "sha256": ingest.file_sha256(f), "n_pages": 1,
+                  "pages": [{"page": 1, "text": "MADE UP TEXT", "kind": "ocr", "sideways": False, "seconds": 0.5}]}]}
+store = P.cache_root / "pagetexts" / "F-0123456789abcdef.json"
+store.parent.mkdir(parents=True, exist_ok=True)
+store.write_text(json.dumps(doc), encoding="utf-8")
+res["store_on_disk"] = (real / "cache" / "pagetexts" / "F-0123456789abcdef.json").is_file()
+pt = engine.load_page_texts(store, src)
+res["pt"] = [pt.complete, pt.get("PASSPORT.pdf", 0)[0]]
+# the guard, armed as the worker and the self-test's part "guard" arm it
+out = base / "reports" / "c1"
+try:
+    state = safety.prepare(out, P.cache_root, inp)
+    res["prepare"] = "ok"
+except safety.SafetyError as e:
+    res["prepare"] = "SafetyError: " + str(e)
+    state = None
+def attempt(name, fn, probe=None):
+    try:
+        fn()
+        res[name] = "ok"
+    except PermissionError as e:
+        res[name] = "PermissionError: " + str(e)[:200]
+    except Exception as e:
+        res[name] = type(e).__name__ + ": " + str(e)[:200]
+    if probe is not None:
+        res[name + "_exists"] = probe.exists()
+if state is not None:
+    attempt("w_data", lambda: (data / "w.txt").write_text("x"))
+    attempt("w_cache", lambda: (P.cache_root / "pagetexts" / "w.txt").write_text("x"))
+    attempt("w_out", lambda: (out / "w.txt").write_text("x"))
+    attempt("w_elsewhere", lambda: (elsewhere / "x.txt").write_text("x"), elsewhere / "x.txt")
+    attempt("w_through_inner_junction", lambda: (data / "cache" / "jout" / "y.txt").write_text("x"),
+            elsewhere / "y.txt")
+    attempt("w_input", lambda: (inp / "new.txt").write_text("x"), inp / "new.txt")
+    attempt("aw_cache", lambda: safety.assert_writable(P.cache_root / "docs"))
+    attempt("aw_elsewhere", lambda: safety.assert_writable(elsewhere / "z"))
+    res["finish"] = safety.finish(state)["input_unchanged"]
+print(json.dumps(res))
+'''
+
+
+class TestAppRedirectedData(unittest.TestCase):
+    """1.0.1 (APP_SPEC R2.10 I27/I28): DATA's name is a JUNCTION to another folder, as when %LOCALAPPDATA% resolves
+    elsewhere (the Claude app's MSIX container redirects a new top-level folder; a junction or folder redirection on
+    another PC). HDC_MODE=app in a child; every folder under private-runner. 1.0.0 refused the cache root here, and so
+    every check (exit 2) and the self-test's part "guard"."""
+
+    @classmethod
+    def setUpClass(cls):
+        import _winapi
+        cls.base = _run_folder()
+        b = cls.base
+        cls.junctions = []                              # removed in reverse order
+        try:
+            _fake_bundle(b)
+            (b / "input").mkdir()
+            (b / "input" / "PASSPORT.pdf").write_bytes(b"%PDF-1.4 made-up bytes, never parsed\n")
+            (b / "elsewhere").mkdir()
+            (b / "realdata" / "cache").mkdir(parents=True)
+            for target, link in ((b / "realdata", b / "data"),                     # DATA's name -> the real folder
+                                 (b / "elsewhere", b / "realdata" / "cache" / "jout")):   # leads out of DATA
+                _winapi.CreateJunction(str(target), str(link))
+                cls.junctions.insert(0, link)
+            cls.r = _child(_REDIRECT_CHILD, b, _app_env(b))
+        except BaseException:
+            cls.tearDownClass()                         # unittest skips tearDownClass when setUpClass fails
+            raise
+
+    @classmethod
+    def tearDownClass(cls):
+        for j in cls.junctions:                         # the junctions themselves, never their targets
+            if os.path.lexists(j) and os.path.isjunction(j):
+                os.rmdir(j)
+        _rmtree(cls.base)
+
+    def test_the_data_folder_paths_are_accepted(self):
+        r, real = self.r, (self.base / "realdata").resolve()
+        self.assertTrue(r["data_is_junction"])
+        self.assertEqual(r["write_root"], str(self.base / "data"))
+        self.assertEqual(r["cache_root"], "ok:" + str(real / "cache"))
+        self.assertEqual(r["tmp"], "ok:" + str(real / "tmp"))
+        self.assertEqual(r["store"], "ok:" + str(real / "cache" / "pagetexts" / "F-0123456789abcdef.json"))
+        self.assertEqual(r["real_name"], "ok:" + str(real / "cache"))
+        self.assertTrue(r["store_on_disk"])
+        self.assertEqual(r["pt"], [True, "MADE UP TEXT"])
+
+    def test_refusals_are_kept_and_say_data_folder(self):
+        r = self.r
+        for k in ("outside", "inner_junction"):
+            self.assertTrue(r[k].startswith("SafetyError: the cache root " + safety.APP_DATA_OUTSIDE), (k, r[k]))
+
+    def test_the_guard_arms_and_still_refuses(self):
+        r = self.r
+        self.assertEqual(r["prepare"], "ok")
+        for k in ("w_data", "w_cache", "w_out", "aw_cache"):
+            self.assertEqual(r[k], "ok", k)
+        for k in ("w_elsewhere", "w_through_inner_junction", "w_input"):
+            self.assertTrue(r[k].startswith("PermissionError"), (k, r[k]))
+            self.assertFalse(r[k + "_exists"], k)
+        self.assertIn("leaves the app's data folder", r["w_through_inner_junction"])
+        self.assertTrue(r["aw_elsewhere"].startswith("SafetyError"))
+        self.assertTrue(r["finish"])
+
+
 class TestWindowGuard(unittest.TestCase):
     def test_arm_window_and_allow_file(self):
         base = _run_folder()

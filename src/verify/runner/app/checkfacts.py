@@ -173,6 +173,14 @@ def card_info_block(info: Any) -> Dict[str, Any]:
             "total_mb": count(getattr(info, "total_mb", 0)), "free_mb": count(getattr(info, "free_mb", 0))}
 
 
+def busy_count(fr: Mapping[str, Any]) -> int:
+    """The pages read smaller after a busy card (1.0.1: "downscaled_busy"); a result without that count (an older
+    first read) counts every page read smaller as busy, as 1.0.0 did."""
+    if fr.get("downscaled_busy") is None:
+        return count(fr.get("downscaled"))
+    return min(count(fr.get("downscaled_busy")), count(fr.get("downscaled")))
+
+
 def first_read_block(fr: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     """gpuengine.first_read's result (counts only): pages by kind, downscaled, skipped, OOM retries, seconds,
     model load, the phase-1 peaks, and what was not reused from an earlier check (pages read smaller before, read
@@ -181,7 +189,8 @@ def first_read_block(fr: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
         return {}
     pages = fr.get("pages") if isinstance(fr.get("pages"), Mapping) else {}
     return {"pages": {k: count(pages.get(k, 0)) for k in ("total", "read", "ocr", "layer", "image", "skipped")},
-            "downscaled": count(fr.get("downscaled")), "skipped": count(fr.get("skipped")),
+            "downscaled": count(fr.get("downscaled")), "downscaled_cap": count(fr.get("downscaled_cap")),
+            "downscaled_busy": busy_count(fr), "skipped": count(fr.get("skipped")),
             "oom_retries": count(fr.get("oom_retries")), "seconds_total": number(fr.get("seconds_total")),
             "model_load_s": number(fr.get("model_load_s")),
             "reread_downscaled": count(fr.get("reread_downscaled")), "stale_store": bool(fr.get("stale_store")),
@@ -249,15 +258,16 @@ def gpu_block(*, info: Any = None, card: Optional[Mapping[str, Any]] = None, cap
 
 def done_gpu(block: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     """The "gpu" part of the done event (R2.3.3): card, peaks, calls on the processor, waits, and the first read's
-    pages read smaller ("downscaled") and left to the light reader ("skipped") because of card memory (the window
-    shows them as result notes)."""
+    pages read smaller ("downscaled"; of them "downscaled_busy" after a busy card, 1.0.1) and left to the light reader
+    ("skipped") because of card memory (the window shows them as result notes)."""
     b = block if isinstance(block, Mapping) else {}
     card, peaks, waits = b.get("card") or {}, b.get("peaks") or {}, b.get("waits") or {}
     fr = b.get("first_read") or {}
     return {"card": card.get("name"), "peak_alloc_gb": peaks.get("alloc_gb"),
             "peak_reserved_gb": peaks.get("reserved_gb"), "cpu_calls": count(b.get("cpu_calls")),
             "waits": count(waits.get("count")), "waited_s": number(waits.get("seconds")) or 0.0,
-            "downscaled": count(fr.get("downscaled")), "skipped": count(fr.get("skipped"))}
+            "downscaled": count(fr.get("downscaled")), "downscaled_busy": busy_count(fr),
+            "skipped": count(fr.get("skipped"))}
 
 
 # ------------------------------------------------------------------------------------------ the run's lines

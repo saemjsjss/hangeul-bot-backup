@@ -46,7 +46,7 @@ class Load(unittest.TestCase):
         self.assertEqual(info.source, "dev")
         self.assertEqual(info.problems, ())
         v = info.values
-        self.assertEqual(v["app_version"], "1.0.0")
+        self.assertEqual(v["app_version"], "1.0.1")
         self.assertEqual(v["build_id"], "dev")
         self.assertEqual(v["arch_flags"], ("sm_75", "sm_80", "sm_86", "sm_90", "sm_100", "sm_120"))
         self.assertEqual((v["cuda_driver_min"], v["cap_gb"], v["need_free_mb"], v["min_total_mb"]),
@@ -59,7 +59,7 @@ class Load(unittest.TestCase):
         if os.environ.get("HDC_BUNDLE_DIR"):
             self.skipTest("HDC_BUNDLE_DIR is set for this process")
         self.assertEqual(V.SOURCE, "dev")
-        self.assertEqual(V.APP_VERSION, "1.0.0")
+        self.assertEqual(V.APP_VERSION, "1.0.1")
         self.assertEqual(V.BUILD_ID, "dev")
         self.assertIsInstance(V.ARCH_FLAGS, tuple)
         self.assertEqual(V.CUDA_DRIVER_MIN, 12080)

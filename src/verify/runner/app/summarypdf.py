@@ -3,7 +3,7 @@
 The worker writes it after the runner, into the case folder, next to summary.txt. A4 pages made with PyMuPDF's
 `page.insert_htmlbox` from the HTML-escaped summary lines (report.summary_lines without paths), the verdict words
 in colour; the result code, the check date and the program at the top; on every page a footer with the result
-code, check date, program, the app version ("App 1.0.0 GPU, build ...") and the rules and runner versions.
+code, check date, program, the app version ("App 1.0.1 GPU, build ...") and the rules and runner versions.
 
 Pages are filled greedily: as many whole lines as fit (binary search on a scratch document, no scaling); a line
 that does not fit a page on its own is shrunk to fit. The file is written by Python (`open`), after the guard's
@@ -64,7 +64,7 @@ def head_html(code: str, check_date: str, program: str, overall: str) -> str:
 
 def version_text(app_version: str, build_id: str = "", runner_version: str = "", rules_bot: str = "",
                  rules_runner: str = "", flavour: str = "GPU") -> str:
-    """'App 1.0.0 GPU (CUDA 12.8), build <id> · rules bot <x> + runner <y> · runner <z>' (always says GPU)."""
+    """'App 1.0.1 GPU (CUDA 12.8), build <id> · rules bot <x> + runner <y> · runner <z>' (always says GPU)."""
     fl = str(flavour or "").strip()
     fl = fl if "GPU" in fl else ("GPU " + fl).strip()
     s = f"App {app_version or '?'} {fl}" + (f", build {build_id}" if build_id else "")

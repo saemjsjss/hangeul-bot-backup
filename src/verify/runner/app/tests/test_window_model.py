@@ -439,6 +439,25 @@ class CheckStream(Base):
                         end=outcome("done", exit=0, done=done_event(budget_hits=0)))
         self.assertFalse([n for n in m.view().result.notes if "ran out of time" in n])
 
+    def test_pages_cut_down_by_the_card_limit_say_normal(self):
+        """1.0.1 (APP_SPEC R2.10 I29): a done event whose pages read smaller were all cut down by the 3 GB limit on a
+        free card shows the "normal, tested" note and no "check again" note; with one busy page, both."""
+        base = {"card": CARD, "peak_alloc_gb": 2.4, "peak_reserved_gb": 2.8, "cpu_calls": 0, "waits": 0,
+                "waited_s": 0.0, "skipped": 0}
+        m, h = self.started()
+        ev = done_event(gpu=dict(base, downscaled=3, downscaled_busy=0))
+        self.run_events(m, h, {"ev": "hello"}, ev, end=outcome("done", exit=0, done=ev))
+        notes = m.view().result.notes
+        self.assertIn(M.downscaled_note(3, 0), notes)
+        self.assertFalse([n for n in notes if "ran out of memory" in n or "Check again" in n])
+        m, h = self.started()
+        ev = done_event(gpu=dict(base, downscaled=3, downscaled_busy=1))
+        self.run_events(m, h, {"ev": "hello"}, ev, end=outcome("done", exit=0, done=ev))
+        note = [n for n in m.view().result.notes if "smaller size" in n]
+        self.assertEqual(note, [M.downscaled_note(3, 1)])
+        self.assertIn("2 very large page(s)", note[0])
+        self.assertIn("1 page(s) were read at a smaller size because the graphics card ran out of memory", note[0])
+
     def test_fixed_date_goes_into_the_job(self):
         m = self.model()
         m.set_date_mode("fixed", "2026-10-28")
@@ -1002,7 +1021,11 @@ class Adapters(Base):
         self.assertEqual((b.role, b.path, b.lock_extra), ("auto", str(self.pdf), [OTHER_LOCK]))
         c = W.window_args([str(self.pdf)])
         self.assertEqual((c.role, c.path), ("window", str(self.pdf)))
-        m = W.build_model(c, self.deps())
+        # no --data-dir: DATA comes from HDC_DATA_DIR, pointed at the test's folder. (Before 1.0.1 this made the REAL
+        # %LOCALAPPDATA%\Hangeul Document Checker on every test run, and P3 refuses to run while that folder exists.)
+        with mock.patch.dict(os.environ, {"HDC_DATA_DIR": str(self.data)}):
+            m = W.build_model(c, self.deps())
+        self.assertEqual(m.data_dir, self.data)
         self.assertEqual(m.view().input_text, "SAMPLE BUNDLE.pdf")
         self.assertIsNone(m.auto)
         m2 = W.build_model(W.window_args(dict_to_opts(opts, data_dir=str(self.data))), self.deps())

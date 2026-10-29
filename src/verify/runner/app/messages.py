@@ -50,6 +50,7 @@ PATH_TOO_LONG = "PATH_TOO_LONG"
 REPORT_INSIDE_INPUT = "REPORT_INSIDE_INPUT"
 INPUT_INSIDE_REPORT = "INPUT_INSIDE_REPORT"
 REPORT_NOT_WRITABLE = "REPORT_NOT_WRITABLE"
+DATA_NOT_WRITABLE = "DATA_NOT_WRITABLE"      # 1.0.1 (I28): the app's own data folder, not the report folder
 DISK_FULL = "DISK_FULL"
 LOW_MEMORY = "LOW_MEMORY"
 INPUT_CHANGED = "INPUT_CHANGED"
@@ -158,6 +159,11 @@ _TABLE: Dict[str, Tuple[str, str, str]] = {
     REPORT_NOT_WRITABLE: (
         "Cannot save reports",
         "The report folder cannot be written. Choose another folder in Options.", ERROR),
+    DATA_NOT_WRITABLE: (
+        "Cannot use the checker's data folder",
+        "The checker could not use its own data folder (\"Hangeul Document Checker\" in your AppData folder) "
+        "safely, so nothing was checked. Your files and reports were not changed. Restart the PC and check again; "
+        "if it happens again, run the Self-test and send SELFTEST.txt.", ERROR),
     DISK_FULL: (
         "Disk full",
         "There is not enough free disk space for the report. Free some space and check again.", ERROR),
@@ -447,14 +453,26 @@ def budget_note(n: Any) -> str:
             "the PC is idle; the result may then differ.")
 
 
-def downscaled_note(n: Any) -> str:
-    """The result note when the first read had to read pages at a smaller size (the graphics card ran out of
-    memory). A new check reads them at full size again. Empty for 0."""
+def downscaled_note(n: Any, busy: Any = None) -> str:
+    """The result note when the first read read pages at a smaller size. ``n`` counts them all, ``busy`` those cut
+    down after a wait or while another program held card memory (1.0.1, APP_SPEC R2.10 I29; None = not known, all
+    counted as busy, as 1.0.0 said). The others did not fit the checker's 3 GB card limit even with the card free:
+    that is deterministic, the same on every check of these pages, and it is how the tested results were read, so
+    their note says so instead of asking for another check. Only the busy ones ask to check again when the card is
+    free (that check reads them at full size). Empty for 0."""
     k = _count(n)
     if not k:
         return ""
-    return (f"{k} page(s) were read at a smaller size because the graphics card ran out of memory. Check again when "
-            "the graphics card is free; the result may then differ.")
+    b = k if busy is None else min(k, _count(busy))
+    c = k - b
+    parts = []
+    if c:
+        parts.append(f"{c} very large page(s) were read at a smaller size to stay within the checker's graphics-card "
+                     "limit. This is normal: such pages are always read this way, and the result is the tested one.")
+    if b:
+        parts.append(f"{b} page(s) were read at a smaller size because the graphics card ran out of memory. Check "
+                     "again when the graphics card is free; the result may then differ.")
+    return " ".join(parts)
 
 
 def skipped_note(n: Any) -> str:

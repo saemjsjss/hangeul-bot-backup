@@ -301,8 +301,8 @@ class TestReadme(unittest.TestCase):
         self.assertEqual(template, "\n".join(lines[start:end]))
 
     def values(self, **kw) -> Dict[str, str]:
-        v = {"APP_VERSION": "1.0.0", "BUILD_ID": BID, "SETUP_GB": "2.7", "CHECK_DATE": "2026-10-29",
-             "THIS_PC_CODE": "0A1B-2C3D"}
+        v = {"APP_VERSION": "1.0.1", "BUILD_ID": BID, "SETUP_GB": "1.8", "SETUP_BYTES": "1,939,911,235",
+             "INSTALLED_GB": "4.4", "DISK_GB": "7"}
         v.update(kw)
         return v
 
@@ -312,21 +312,60 @@ class TestReadme(unittest.TestCase):
         self.assertNotIn("}", text)
         self.assertNotIn("\n", text.replace("\r\n", ""))                     # CRLF everywhere
         self.assertTrue(text.endswith("\r\n"))
-        self.assertTrue(text.startswith("HANGEUL DOCUMENT CHECKER 1.0.0 (GPU) - INSTALL (build %s)\r\n" % BID))
-        self.assertIn('"Hangeul Document Checker Setup 1.0.0 GPU.exe" (about 2.7 GB)', text)
-        self.assertIn("type 2026-10-29.", text)
-        self.assertIn("The office PC's code is 0A1B-2C3D.", text)
+        self.assertTrue(text.isascii())
+        self.assertTrue(text.startswith("HANGEUL DOCUMENT CHECKER 1.0.1 (GPU) - build %s\r\n" % BID))
+        flat = " ".join(text.split())
+        self.assertIn("Hangeul Document Checker Setup 1.0.1 GPU.exe: the installer, 1.8 GB (1,939,911,235 bytes).",
+                      flat)
+        self.assertIn("About 7 GB of free disk space: 1.8 GB for the Setup file and 4.4 GB for the installed "
+                      "checker.", flat)
+        self.assertIn('Get-FileHash -Algorithm SHA256 "Hangeul Document Checker Setup 1.0.1 GPU.exe"', flat)
+
+    def test_the_release_readme_says_what_the_owner_needs(self):
+        """1.0.1 (APP_SPEC R2.10 I30): plain English for the owner. The self-check is the app's own Self-test (the
+        window's "Self-test" button), not CHECK_0001.pdf, which is not shipped; the PC's needs, SmartScreen, the
+        first start and the uninstall are there; the window's own words are quoted as the window says them."""
+        flat = " ".join(bi.fill_readme(bi.README_TEMPLATE.read_text(encoding="utf-8"), self.values()).split())
+        self.assertNotIn("CHECK_0001", flat)
+        self.assertNotIn("Result code", flat)
+        for want in ("An NVIDIA graphics card with 6 GB of graphics memory or more",
+                     "A recent NVIDIA driver: version 570 or newer",
+                     '"Windows protected your PC"', 'Click "More info", then "Run anyway".',
+                     "not digitally signed", "THE FIRST START", 'Click the "Self-test" button',
+                     '"every part is OK"', '"finished with problems"', "SELFTEST.txt holds no student data",
+                     "HOW TO UNINSTALL", '"Hangeul Document Checker (GPU)"', "Waiting for the graphics card",
+                     "SHA256SUMS.txt"):
+            self.assertIn(want, flat)
+        from src.verify.runner.app import messages as M                   # the window's own words
+        self.assertIn("every part is OK", M.render(M.SELFTEST_OK).text)
+        self.assertIn("finished with problems", M.render(M.SELFTEST_FAILED).text)
+        self.assertIn("Waiting for the graphics card", M.WAIT_TITLE)
+        iss = bi.ISS.read_text(encoding="ascii")
+        self.assertIn("UninstallDisplayName=Hangeul Document Checker (GPU)", iss)
+        self.assertIn('Description: "Create a desktop shortcut"', iss)
+        self.assertIn('Description: "Open the checker now"', iss)
+        self.assertIn("Install anyway?", iss)
+
+    def test_sizes_come_from_the_build(self):
+        setup, app = 1_939_911_235, 4_711_594_649                         # build 20261029.3 (1.0.0)
+        self.assertEqual((bi.setup_gb(setup), bi.setup_gb(app), bi.disk_gb(setup, app)), ("1.8", "4.4", "7"))
+        self.assertEqual(bi.disk_gb(0, 0), "1")
+        self.assertEqual(bi.disk_gb(1 << 30, 3 << 30), "5")               # 4.0 + 0.5 -> 5
+        with self.assertRaises(ValueError):
+            bi.disk_gb(-1, 0)
+        self.assertEqual(bi.bytes_text(setup), "1,939,911,235")
+        self.assertEqual(bi.bytes_text(7), "7")
 
     def test_fill_refuses(self):
         tpl = bi.README_TEMPLATE.read_text(encoding="utf-8")
-        for bad in (self.values(SETUP_GB=""), self.values(CHECK_DATE="2026-10-29\nX"), self.values(BUILD_ID="{x}"),
-                    self.values(THIS_PC_CODE="\u00e9")):
+        for bad in (self.values(SETUP_GB=""), self.values(DISK_GB="7\nX"), self.values(BUILD_ID="{x}"),
+                    self.values(INSTALLED_GB="\u00e9")):
             with self.assertRaises(bi.BuildError):
                 bi.fill_readme(tpl, bad)
         with self.assertRaises(bi.BuildError):
             bi.fill_readme(tpl + "{EXTRA}\n", self.values())
         with self.assertRaises(bi.BuildError):
-            bi.fill_readme(tpl.replace("{THIS_PC_CODE}", "X"), self.values())
+            bi.fill_readme(tpl.replace("{DISK_GB}", "X"), self.values())
 
 
 # ================================================================================================================
@@ -562,10 +601,22 @@ class TestBuildMain(unittest.TestCase):
         self.assertEqual(len(info["passes"]), 1)
         self.assertEqual((self.out / "setup.sha256").read_text(encoding="ascii"),
                          "%s *%s\n" % (bi.sha256_file(exe), exe.name))
-        readme = (self.out / "README_INSTALL.txt").read_bytes().decode("ascii")
-        self.assertIn("(about %s GB)" % bi.setup_gb(exe.stat().st_size), readme)
-        self.assertIn("build %s)" % BID, readme)
-        self.assertIn("0A1B-2C3D", readme)
+        readme_path = self.out / "README_INSTALL.txt"
+        readme = readme_path.read_bytes().decode("ascii")
+        size = exe.stat().st_size
+        self.assertIn("the installer, %s GB (%s bytes)." % (bi.setup_gb(size), bi.bytes_text(size)), readme)
+        self.assertIn("About %s GB of free disk space: %s GB for the Setup file and %s GB for the installed"
+                      % (bi.disk_gb(size, info["app_bytes"]), bi.setup_gb(size), bi.setup_gb(info["app_bytes"])),
+                      readme)
+        self.assertTrue(readme.startswith("HANGEUL DOCUMENT CHECKER 1.0.0 (GPU) - build %s\r\n" % BID))
+        self.assertNotIn("0A1B-2C3D", readme)                             # P1's code is in installer.json only
+        self.assertNotIn("CHECK_0001", readme)                            # not shipped (1.0.1, I30)
+        self.assertEqual((info["this_pc_code"], info["check_date"]), ("0A1B-2C3D", "2026-10-29"))
+        self.assertEqual((info["installed_gb"], info["disk_gb"]),
+                         (bi.setup_gb(info["app_bytes"]), bi.disk_gb(size, info["app_bytes"])))
+        self.assertEqual((self.out / "SHA256SUMS.txt").read_text(encoding="ascii"),
+                         "%s *%s\n%s *README_INSTALL.txt\n" % (bi.sha256_file(exe), exe.name,
+                                                               bi.sha256_file(readme_path)))
         self.assertTrue((self.builds / BID / "reports" / "iscc.log").is_file())
 
     def test_second_pass_only_on_the_limit(self):
@@ -582,6 +633,7 @@ class TestBuildMain(unittest.TestCase):
         self.assertEqual(info["bytes"], sum(f["bytes"] for f in info["files"]))
         self.assertEqual([p["limit_hit"] for p in info["passes"]], [True, False])
         self.assertEqual(len((self.out / "setup.sha256").read_text(encoding="ascii").splitlines()), 3)
+        self.assertEqual(len((self.out / "SHA256SUMS.txt").read_text(encoding="ascii").splitlines()), 4)
         self.assertTrue((self.builds / BID / "reports" / "iscc-span.log").is_file())
 
     def test_other_error_has_no_second_pass(self):

@@ -447,7 +447,7 @@ class TestEvents(Base):
         self.assertTrue(done["checkfacts"])
         self.assertEqual(done["gpu"], {"card": "NVIDIA GeForce RTX 0000", "peak_alloc_gb": 2.6,
                                        "peak_reserved_gb": 2.9, "cpu_calls": 1, "waits": 1, "waited_s": 2.5,
-                                       "downscaled": 0, "skipped": 0})
+                                       "downscaled": 0, "downscaled_busy": 0, "skipped": 0})
         self.assertEqual((done["budget_hits"], done["check_date"]), (1, "2026-10-28"))
         if os.name == "nt":
             self.assertIsInstance(done["peak_mb"], int)
@@ -508,6 +508,14 @@ class TestReviewFixes(Base):
         self.run_job()
         done = self.w.ev("done")[0]
         self.assertEqual((done["gpu"]["downscaled"], done["gpu"]["skipped"], done["budget_hits"]), (2, 1, 1))
+        self.assertEqual(done["gpu"]["downscaled_busy"], 2)          # no split from first_read: all counted busy
+
+    def test_pages_cut_down_by_the_cap_alone_reach_the_done_event_as_such(self):
+        """1.0.1 (APP_SPEC R2.10 I29): first_read's cap / busy split goes to the done event (the window's note)."""
+        self.w.fr.update(downscaled=3, downscaled_cap=3, downscaled_busy=0)
+        self.run_job()
+        done = self.w.ev("done")[0]
+        self.assertEqual((done["gpu"]["downscaled"], done["gpu"]["downscaled_busy"]), (3, 0))
 
     def test_the_check_date_is_the_jobs(self):
         self.run_job(self.job(today="2026-10-30"))
@@ -1030,6 +1038,22 @@ class TestClassify(unittest.TestCase):
             self.skipTest("Task A's APP messages are not built")
         for k, msg in have.items():
             self.assertEqual(W.classify_refusal(Exception(msg), "safety")[0], want[k], k)
+
+    def test_a_data_folder_refusal_has_its_own_code(self):
+        """1.0.1 (APP_SPEC R2.10 I28): safety's APP_DATA_OUTSIDE (the cache root, the page texts, a written path
+        with no guard) is DATA_NOT_WRITABLE, as a SafetyError and as engine's InputError; the report folder's
+        refusals keep theirs, also APP_OUT_DATA and the guard's "write outside the app's data folder", which name
+        the data folder too."""
+        from src.verify.runner import safety
+        self.assertEqual(safety.APP_DATA_OUTSIDE, "lies outside the app's data folder")
+        for what, kind in (("the cache root", "safety"), ("a written path", "safety"), ("--page-texts", "input")):
+            msg = f"{what} {safety.APP_DATA_OUTSIDE}: X:\\made-up\\folder"
+            self.assertEqual(W.classify_refusal(Exception(msg), kind), ("DATA_NOT_WRITABLE", {}), what)
+        self.assertEqual(W.classify_refusal(Exception(safety.APP_OUT_DATA), "safety")[0], "REPORT_NOT_WRITABLE")
+        self.assertEqual(W.classify_refusal(Exception("write outside the app's data folder: X:\\m"), "safety")[0],
+                         "REPORT_NOT_WRITABLE")
+        from src.verify.runner.app import messages as M
+        self.assertTrue(M.known("DATA_NOT_WRITABLE"))
 
     def test_unknown_messages(self):
         self.assertEqual(W.classify_refusal(Exception("made-up"), "safety"), ("REPORT_NOT_WRITABLE", {}))

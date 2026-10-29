@@ -3,7 +3,7 @@
 One ASCII JSON line per event on the worker's stdout (the protocol stream is a duplicate of fd 1; fd 1 itself points
 at fd 2, see ``spawn.claim_protocol_stdout``). The window sends one line on the worker's stdin: ``cancel``.
 
-    {"v":1,"ev":"hello","app":"1.0.0","build":"<id>","pid":1234}
+    {"v":1,"ev":"hello","app":"1.0.1","build":"<id>","pid":1234}
     {"v":1,"ev":"stage","key":"ocr","state":"start"}                       (also "card", "firstread"; "end" + seconds)
     {"v":1,"ev":"file","name":"<file>","pages":14,"ocr":12}
     {"v":1,"ev":"page","done":3,"of":14,"seconds":1.2,"where":"card"}       (phase 1; "runner" for the runner's pages)
