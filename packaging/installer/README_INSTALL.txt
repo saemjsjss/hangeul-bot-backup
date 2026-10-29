@@ -2,7 +2,6 @@ HANGEUL DOCUMENT CHECKER {APP_VERSION} (GPU) - build {BUILD_ID}
 
 WHAT IS IN THIS FOLDER
   - Hangeul Document Checker Setup {APP_VERSION} GPU.exe: the installer, {SETUP_GB} GB ({SETUP_BYTES} bytes).
-    If there are also files ending in "-1.bin", "-2.bin" and so on, they belong to it: keep them in the same folder.
   - This text file.
   - SHA256SUMS.txt: checksums, to confirm that a copy is complete and unchanged.
 
@@ -12,9 +11,10 @@ WHAT THE PC NEEDS
     The checker reads documents only on this card. It does not work on a PC without one.
   - A recent NVIDIA driver: version 570 or newer. If the checker says the driver is too old, update it with the
     NVIDIA app (or from nvidia.com), restart the PC and open the checker again.
-  - About {DISK_GB} GB of free disk space: {SETUP_GB} GB for the Setup file and {INSTALLED_GB} GB for the installed
-    checker. After installing, the Setup file can be deleted from the PC (keep a copy on the USB stick).
-  - No internet connection and no administrator rights.
+  - About {DISK_GB} GB of free disk space: {SETUP_GB} GB for the Setup file, {INSTALLED_GB} GB for the installed
+    checker, and some room for reports. After installing, the Setup file can be deleted from the PC (keep a copy
+    on the USB stick).
+  - The checker needs no internet connection and no administrator rights.
 
 HOW TO INSTALL
   1. Copy the Setup file to the PC, for example with a USB stick.
@@ -22,6 +22,10 @@ HOW TO INSTALL
   3. Windows may show a blue box: "Windows protected your PC". This happens because the installer is
      not digitally signed (signing needs a paid certificate), not because something is wrong with it.
      Click "More info", then "Run anyway". Your antivirus may also take a few minutes to scan the file.
+     On some Windows 11 PCs "Smart App Control" is switched on. It blocks unsigned installers and shows no
+     "Run anyway" button. On such a PC the checker cannot be installed unless Smart App Control is switched off
+     (Windows Security > App & browser control). Once switched off it cannot be switched on again without
+     resetting Windows, so ask whoever looks after that PC before you change it.
   4. If the PC has no NVIDIA driver, Setup asks "Install anyway?". Choose No, install the NVIDIA driver, then run
      Setup again.
   5. Click "Next" and "Install". Setup installs the checker for your Windows user only. "Create a desktop shortcut"
@@ -40,11 +44,12 @@ THE FIRST START
 
 CHECK THAT IT WORKS (once on every new PC)
   1. Open "Hangeul Document Checker" from the desktop shortcut or the Start menu.
-  2. Click the "Self-test" button at the bottom of the window and wait: about 2 minutes, longer while the
-     graphics card is busy. The self-test uses only the test pages that come with the checker, never student
-     documents.
-  3. If it says "every part is OK", the PC is ready. If it says "finished with problems", send the file
-     SELFTEST.txt from the report folder (see "Reports go to" above). SELFTEST.txt holds no student data.
+  2. Click the "Self-test" button at the bottom of the window and wait: usually under a minute, longer the very
+     first time and while the graphics card is busy. The self-test uses only the test pages that come with the
+     checker, never student documents.
+  3. If it says "every part is OK", the PC is ready. If it says "finished with problems", send the newest file
+     whose name starts with "SELFTEST" from the report folder (see "Reports go to" above) to the person who set
+     up the checker. That file holds no student data.
   Never send summary.txt, report.xlsx or run.json to anyone: they hold student data.
 
 ON THE OFFICE PC (where the Telegram bot runs)
@@ -58,6 +63,6 @@ HOW TO UNINSTALL
   need them.
 
 CHECKING A COPY (optional)
-  In PowerShell, in this folder:
+  Open this folder in File Explorer, click the address bar, type powershell and press Enter. Then type:
       Get-FileHash -Algorithm SHA256 "Hangeul Document Checker Setup {APP_VERSION} GPU.exe"
   The hash must equal the one in SHA256SUMS.txt (upper or lower case does not matter).

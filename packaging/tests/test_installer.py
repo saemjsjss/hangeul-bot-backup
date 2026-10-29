@@ -317,8 +317,8 @@ class TestReadme(unittest.TestCase):
         flat = " ".join(text.split())
         self.assertIn("Hangeul Document Checker Setup 1.0.1 GPU.exe: the installer, 1.8 GB (1,939,911,235 bytes).",
                       flat)
-        self.assertIn("About 7 GB of free disk space: 1.8 GB for the Setup file and 4.4 GB for the installed "
-                      "checker.", flat)
+        self.assertIn("About 7 GB of free disk space: 1.8 GB for the Setup file, 4.4 GB for the installed "
+                      "checker, and some room for reports.", flat)
         self.assertIn('Get-FileHash -Algorithm SHA256 "Hangeul Document Checker Setup 1.0.1 GPU.exe"', flat)
 
     def test_the_release_readme_says_what_the_owner_needs(self):
@@ -332,7 +332,8 @@ class TestReadme(unittest.TestCase):
                      "A recent NVIDIA driver: version 570 or newer",
                      '"Windows protected your PC"', 'Click "More info", then "Run anyway".',
                      "not digitally signed", "THE FIRST START", 'Click the "Self-test" button',
-                     '"every part is OK"', '"finished with problems"', "SELFTEST.txt holds no student data",
+                     '"every part is OK"', '"finished with problems"', 'send the newest file whose name starts with "SELFTEST"', "That file holds no student data",
+                     "Smart App Control", "The checker needs no internet connection",
                      "HOW TO UNINSTALL", '"Hangeul Document Checker (GPU)"', "Waiting for the graphics card",
                      "SHA256SUMS.txt"):
             self.assertIn(want, flat)
@@ -605,7 +606,7 @@ class TestBuildMain(unittest.TestCase):
         readme = readme_path.read_bytes().decode("ascii")
         size = exe.stat().st_size
         self.assertIn("the installer, %s GB (%s bytes)." % (bi.setup_gb(size), bi.bytes_text(size)), readme)
-        self.assertIn("About %s GB of free disk space: %s GB for the Setup file and %s GB for the installed"
+        self.assertIn("About %s GB of free disk space: %s GB for the Setup file, %s GB for the installed"
                       % (bi.disk_gb(size, info["app_bytes"]), bi.setup_gb(size), bi.setup_gb(info["app_bytes"])),
                       readme)
         self.assertTrue(readme.startswith("HANGEUL DOCUMENT CHECKER 1.0.0 (GPU) - build %s\r\n" % BID))
