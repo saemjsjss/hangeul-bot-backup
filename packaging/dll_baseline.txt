@@ -45,6 +45,7 @@ iphlpapi.dll        | system | IP helper (_socket, libuv)
 userenv.dll         | system | user profile API (libuv in torch\lib)
 psapi.dll           | system | process status API (libuv, torch)
 dbghelp.dll         | system | stack walking (torch, libuv)
+imagehlp.dll        | system | image help API (PE images, symbols); imported by torch\lib\libiomp5md.dll (Intel OpenMP)
 crypt32.dll         | system | certificates (_ssl, libcrypto)
 bcrypt.dll          | system | CNG random numbers and hashes (Python, libcrypto)
 bcryptprimitives.dll| system | CNG primitives behind bcrypt

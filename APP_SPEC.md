@@ -104,7 +104,8 @@ stage "firstread": fr = gpuengine.first_read(card, bot, src, gate, store=<cache_
 reader = gpuengine.light_reader(card, gate, places.current().glue_data, places.current().models_dir)  (strict fp32)
 engine.READER_FACTORY = lambda threads=0: reader
 r = pipeline.run(input, program, out, today=..., cache_root=..., page_texts=store,
-                 reading_note=gpuengine.reading_note(fr))
+                 reading_note=gpuengine.reading_note(fr))     # the Recorder asks gate.wait_turn("stage") at every
+                                                              # runner stage start while it runs (R2.1.5)
 the input snapshot compared again (INPUT_CHANGED); resultcode, summary.pdf, checkfacts (+ "gpu" block) -> done
 ```
 
@@ -128,9 +129,14 @@ same guard a second time with the same arguments (R2.1.6). When the process ends
 
 `gpuengine.first_read(card, bot, src, gate, store, emit=hooks.emit) -> dict`:
 - `done = gpuread.load_done(store, src)`: pages read by an earlier check of the same input (same file names, sha256
-  values and page counts) are reused. When `gpuread.pending_pages(src, done) == 0`, no reader is loaded:
-  `read_all(src, None, never, done, save)` only rebuilds the file.
-- `checkpoint = lambda: gate.wait_turn("page")`. `save(d)` sets `d["engine"] = APP_ENGINE_LABEL`, writes
+  values and page counts) are reused, through `usable_done(done, build_id)` (G1 review, I13): nothing is reused from
+  a file whose engine label is not `APP_ENGINE_LABEL` or whose `"app_build"` is not this build's `BUILD_ID` (a later
+  build reads every page again), and a page marked `"downscaled"` is never reused: it is read again at full size, and
+  when it is cut down again its new record carries the mark itself (`gpuread._previous` rebuilds reused pages without
+  that key). `first_read` reports `reread_downscaled` and `stale_store`. When `gpuread.pending_pages(src, done) == 0`,
+  no reader is loaded: `read_all(src, None, never, done, save)` only rebuilds the file.
+- `checkpoint = lambda: gate.wait_turn("page")`. `save(d)` sets `d["engine"] = APP_ENGINE_LABEL` and
+  `d["app_build"] = <BUILD_ID>`, writes
   `<store>.tmp` and then `os.replace`, and emits
   `hooks.emit("page", done=<pages read>, of=<pages to read>, seconds=<last page>, where="card")`. `free = card.free`
   (gc + `torch.cuda.empty_cache()`, as gpuread's `run_session`).
@@ -146,8 +152,9 @@ same guard a second time with the same arguments (R2.1.6). When the process ends
 1. `gate.wait_turn("read")`;
 2. `image = ascii_path(image, ascii_dir)`;
 3. `inner.readtext(image, *a, **kw)`;
-4. on a card OOM (`gpuread.is_oom`), ONCE: `card.pause()`, `gate.wait_turn("oom")`, the same call again at full size.
-   A second OOM is raised, and gpuread's ladder or the bot's own handling acts as in DEV.
+4. on a card OOM (`gpuread.is_oom`), ONCE: `card.pause()`, `gate.wait_turn("oom")`, `gate.wait_room("oom")` (R2.2),
+   the same call again at full size. A second OOM is raised, and gpuread's ladder or the bot's own handling acts as
+   in DEV.
 
 Every other attribute comes from `inner` (`__getattr__`). Why the single retry: an OOM caused by another program (the
 bot starting) must not make a page be read smaller, while an OOM that the page itself causes repeats and reaches the
@@ -178,9 +185,14 @@ decode. The copies are removed at job end and by rev 1's start-up housekeeping. 
      first.
   2. `gate.wait_turn(kind)`.
   3. On the card: `with torch.inference_mode(): y = cuda_module(torch.from_numpy(x).to("cuda"))`, then
-     `out = y.contiguous().cpu().numpy()` (gpu_worker's `Nets`).
-  4. On an OOM: `card.pause()`, `gate.wait_turn("oom")`, once more on the card. A second OOM runs THIS call on
-     `cpu_module` (torch CPU, fp32) and counts it (`calls_cpu`, reason "oom").
+     `out = y.contiguous().cpu().numpy()` (gpu_worker's `Nets`). Then `card.release()`: when torch reserves more
+     than `CACHE_KEEP_MB` = 256 MB, `torch.cuda.empty_cache()` (no gc, no synchronize; counted as `releases`).
+     So between two calls this process holds no more card memory than during a wait (R2.1.5). Freeing changes no
+     number: the next call allocates again.
+  4. On an OOM: `card.pause()`, `gate.wait_turn("oom")`, `gate.wait_room("oom")`, once more on the card, the
+     detector this time through `lean_detector_scores` (I20: CRAFT.forward's operations in the same order with each
+     skip feature dropped after its last use; counted as `calls_lean`). A second OOM runs THIS call on `cpu_module`
+     (torch CPU, fp32, the detector lean there too) and counts it (`calls_cpu`, reason "oom").
   5. Any other CUDA error is raised; the worker maps it to CARD_FAILED.
   6. The output must be float32 with the input's batch size: det rank 4 with 2 score maps, rec rank 3 with 97
      classes. Otherwise `RuntimeError`.
@@ -198,8 +210,9 @@ decode. The copies are removed at job end and by rev 1's start-up housekeeping. 
   memory and go to the processor: slower, and fp32 like ONNX on the CPU. Test P1 counts them.
 - `reading_note(fr) -> str` (≤ 200 characters, no personal data): `"app GPU build: first read on the graphics card
   (bot EasyOCR, 3.0 GB cap); light reader on the card"`, plus `"; <k> page(s) left to the light reader (too large
-  for the cap)"` when the first read skipped pages. The runner's READING line keeps its wording ("CPU light engine
-  <n>" counts the pages the first read left to the light reader).
+  for the cap)"` when the first read skipped pages and `"; <d> page(s) read smaller (card memory)"` when it read
+  pages smaller (a shorter wording when both do not fit). The runner's READING line keeps its wording ("CPU light
+  engine <n>" counts the pages the first read left to the light reader).
 
 ### R2.1.4 No usable card
 
@@ -216,10 +229,12 @@ decode. The copies are removed at job end and by rev 1's start-up housekeeping. 
 | Situation | Behaviour |
 |---|---|
 | The bot's lock is present before the check | Wait before CUDA starts, so no context is made while the bot works (`wait_turn("start")`). |
-| The lock appears during a check | The current model call finishes; then `card.pause()` (synchronize, gc, `empty_cache`) and wait. During the wait the process holds its CUDA context and the weights (target: torch reserved ≤ 256 MB, test P4). |
+| Between two model calls (phase 2) | After every light-reader call on the card, `card.release()` empties torch's cache when it reserves more than 256 MB. Through the runner's processor stretches (the `bot` stage, 17-76 s on r8; the QR and TIN ladders; cut, bank, report) the process holds only its CUDA context, the two networks' weights (about 100 MB) and at most 256 MB of cache, as during a wait. (G1 review finding 1.) |
+| The lock appears during a check | The current model call finishes. The lock is seen at the next model call (checked at most every 0.25 s) or at the next runner stage start (the worker's Recorder asks `gate.wait_turn("stage")` after each stage-start event while `pipeline.run` runs), whichever comes first; then `card.pause()` (synchronize, gc, `empty_cache`) and wait. During the wait the process holds its CUDA context and the weights (target: torch reserved ≤ 256 MB, test P4). Phase 1 keeps gpuread's allocator behaviour (no release between its back-to-back reads). |
+| The lock is gone | `gate.wait_room(where)`: wait until NVML free memory ≥ what this process may still take up to its cap plus 512 MB (`card.room_mb()`), because the bot's process keeps its card memory while it sends its messages and writes its reports. At most 15 min; then the check goes on (never fails; counted as `room_short`). |
 | Free memory below 4.0 GB at the start | Wait up to 15 min with the "memory" banner; then LOW_CARD_MEMORY (exit 6). |
-| An OOM in phase 1 | GatedReader: pause, wait for the bot if its lock is there, one retry at full size; then gpuread's ladder (2000 / 1600 px); then the page is left to phase 2. |
-| An OOM in phase 2 | TorchSession: pause, wait, one retry on the card; then that one call runs on the processor (G4). |
+| An OOM in phase 1 | GatedReader: pause, wait for the bot if its lock is there, wait for room, one retry at full size; then gpuread's ladder (2000 / 1600 px); then the page is left to phase 2. Pages read smaller or left are counted, shown as result notes and in the READING line, and read again at full size by the next check of the same input. |
+| An OOM in phase 2 | TorchSession: pause, wait, wait for room, one retry on the card (the detector through the lean pass, I20: a 2560-pixel detection then fits the cap); then that one call runs on the processor (G4, Q4 (a)), counted and shown as a result note. |
 | Any other CUDA error | CARD_FAILED (exit 6). "no kernel image is available" maps to CARD_NOT_SUPPORTED, and "driver version is insufficient" to DRIVER_TOO_OLD (`gpuengine.card_error_code(e)`, which walks `__cause__` and `__context__`). |
 
 ### R2.1.6 Runner changes (Task A; DEV behaviour unchanged)
@@ -276,25 +291,36 @@ class CardGate:
                  free_mb: Callable[[], Optional[int]] = lambda: None,
                  clock=time.monotonic, wall=time.time, sleep=time.sleep)
     on_pause: Callable[[], int]            # set by gpuengine.start_card: card.pause (returns torch reserved MB); default 0
+    on_room: Callable[[], Optional[int]]   # set by gpuengine.start_card: card.room_mb; default None (no room check)
     def wait_turn(self, where: str) -> None
-    def wait_memory(self, need_mb: int, limit_s: float = MEMORY_WAIT_S) -> int
-    def stats(self) -> Dict[str, Any]      # waits, waited_s, by why and where, last free_mb; no paths
+    def wait_memory(self, need_mb: int, limit_s: float = MEMORY_WAIT_S, *, fatal=True, where="memory") -> int
+    def wait_room(self, where: str) -> Optional[int]
+    def stats(self) -> Dict[str, Any]      # waits, waited_s, by why and where, last free_mb, lock_checks,
+                                           # room_checks, room_short; no paths
 ```
 
-**`wait_turn(where)`**, where `where` is "start", "page", "read", "det", "rec" or "oom":
+**`wait_turn(where)`**, where `where` is "start", "page", "read", "det", "rec", "oom" or "stage" (the worker, at each
+runner stage start):
 1. If the last check was less than `CHECK_EVERY_S` ago and found no lock, return at once.
 2. Otherwise stat every lock path. With none active, return.
 3. With one active: `reserved = on_pause()`, then `emit("gpu_wait", state="start", why="lock", lock=<kind>,
    where=where, reserved_mb=reserved)`.
 4. Every `POLL_S`: `emit("gpu_wait", state="tick", why="lock", lock=<kind>, waited_s=...)`. A `Cancelled` raised by the
    listener passes through; the gate never catches it.
-5. When no lock is active: `emit("gpu_wait", state="end", why="lock", waited_s=...)`, then return.
+5. When no lock is active: `emit("gpu_wait", state="end", why="lock", waited_s=...)`, then `wait_room(where)` (not
+   inside a memory wait), then return.
 
 There is no time limit: the bot's check ends by itself, and a lock older than 4 h is stale.
 
 **`wait_memory(need_mb)`**: `free_mb()` is None (unknown) or at least `need_mb` → return. Otherwise `gpu_wait`
 start / tick / end with `why="memory"`, `free_mb` and `need_mb`, re-reading every 5 s. A lock that appears meanwhile
-is waited for too. After `limit_s` it raises `CardMemoryShort`.
+is waited for too. After `limit_s` it raises `CardMemoryShort`; with `fatal=False` it returns instead and its end event
+carries `short: true`.
+
+**`wait_room(where)`** (G1 review finding 2): `need = on_room()`; None (the card is not started) → return None.
+Otherwise `wait_memory(need, MEMORY_WAIT_S, fatal=False, where=where)`. Called by the gate after every lock wait and by
+GatedReader / TorchSession before their OOM retry. It never fails a check: the program that held the lock may hold its
+memory a little longer, and after 15 min the OOM handling of R2.1.5 takes over (counted and reported).
 
 **Settings and job:** settings.json `"gpu_lock_path"` (a string or null). The Options row reads "Graphics card: wait
 while this file exists [path] [Change…] [Off]"; under the default it adds "(the Telegram bot's document check)".
@@ -376,12 +402,24 @@ page k of N on the graphics card — about X s left" (initially 3.0 s per page, 
 {"v":1,"ev":"card","state":"ready","torch":"2.11.0+cu128","cuda":"12.8","seconds":14.2}
 {"v":1,"ev":"page","done":3,"of":14,"seconds":1.2,"where":"card"}                        (phase 1)
 {"v":1,"ev":"stage","key":"firstread","state":"start"}                                   (also "card")
-{"v":1,"ev":"done", ..., "gpu":{"card":"<card>","peak_alloc_gb":2.41,"peak_reserved_gb":2.80,
-                                "cpu_calls":0,"waits":1,"waited_s":180.5}}
+{"v":1,"ev":"done", ..., "budget_hits":0,"check_date":"2026-10-28",
+                        "gpu":{"card":"<card>","peak_alloc_gb":2.41,"peak_reserved_gb":2.80,
+                                "cpu_calls":0,"waits":1,"waited_s":180.5,"downscaled":0,"skipped":0}}
+{"v":1,"ev":"gpu_wait","state":"end","why":"memory","free_mb":2000,"need_mb":3474,"waited_s":900.0,"short":true}
 {"v":1,"ev":"error","code":"DRIVER_TOO_OLD","values":{"driver":"000.00"},"text":"<scrubbed>"}
 ```
 
-- **job.json** adds `"gpu": {"lock_paths": ["<abs>", ...], "index": 0, "cap_gb": 3.0, "need_free_mb": 4096}`.
+- **job.json** adds `"gpu": {"lock_paths": ["<abs>", ...], "index": 0, "cap_gb": 3.0, "need_free_mb": 4096}`. The
+  window ALWAYS writes `"today"`: in "today" mode it is the window's date at the moment Check was pressed (G1 review
+  finding 6), so the window, the result code, the summary's RESULT CODE line and the date rules use one date. The
+  done event's `check_date` is the worker's; the window shows that one. `--cli` without `--today` still lets the
+  worker take its own date (one process).
+- **The done event** adds `budget_hits` (the runner's wall-clock budget events), `check_date`, and in `gpu` the first
+  read's `downscaled` and `skipped` page counts. The window turns them into result notes (`messages.budget_note`,
+  `downscaled_note`, `skipped_note`): "<n> QR or barcode reading step(s) ran out of time ... Check again when the PC
+  is idle; the result may then differ", "<n> page(s) were read at a smaller size because the graphics card ran out of
+  memory ...", "<n> page(s) were too large for the graphics card's memory and were read by the light reader
+  instead ...", next to rev 2's notes for waits and processor calls (G1 review finding 4).
 - **Worker exit code 6**: a card problem (the six codes of R2.3.1), sent with an error event first. The other codes are
   as in rev 1.
 - **The window's controller** treats `gpu_wait` as the state "waiting": the banner of R2.3.2, the progress bar paused,
@@ -577,7 +615,8 @@ datas += [(str(STAGE / "engine/easyocr/model"), "engine/easyocr/model"),
 a = Analysis(..., hooksconfig={"easyocr": {"lang_codes": ["en"]}}, excludes=EXCLUDES, ...)
 DROP_WORDS = ("directml", "onnxruntime", "opencv_videoio_ffmpeg")
 DROP_DATA = lambda dest: dest.endswith((".lib", ".h", ".hpp", ".cuh")) or "/include/" in dest or "/share/cmake/" in dest
-# after Analysis: drop those; then assert (the build stops otherwise):
+# after Analysis: drop those, and every TOP-LEVEL binary whose same source file is also collected into a sub-folder
+# (I17); then assert (the build stops otherwise):
 #   no binary base name twice (case-insensitive; a 774 MB DLL collected twice would double the size);
 #   {basename of every torch\lib\*.dll in the build env} == {the collected torch/lib DLLs};
 #   no onnxruntime module or DLL, no PySide6.
@@ -760,8 +799,8 @@ check (2-4 min), which is why this needs approval.
 | **P1 Parity with r8** (`parity.py`) | Frozen app, `--cli` with a fresh `--data-dir` per case, on the four r8 cases: owner folder 3, owner folder 9, the EAP folder (`runs\owner_*_r8`) and CHECK_0001 = test 1 (`runs\test1_r8`). The input, program and `today` are read from each r8 `run.json`. One extra `--auto` run of CHECK_0001 covers the window → worker path. | (a) Page texts: the app's `pagetexts\<case_id>.json` equals the r8 `page_texts.json` in file names, sha256, page counts, and every page's text, kind and sideways flag. Differing pages are listed by number with character counts. (b) summary.txt lines equal, except the READING line, the new RESULT CODE line and the output-path line. (c) In run.json: equal `overall`; `docs[*]` unit pages, verdict and `findings[*].(verdict, rule, pages)`; the cross findings; `missing_lines`; `notices`. (d) Every closer look's decision, best candidate and dot equal to r8's look log. (e) The result code printed per case: CHECK_0001's is THIS_PC_CODE; `--auto` gives the same. **The build passes only when (b)-(d) hold for all four cases.** A page-text difference with equal verdicts is explained in the report before hand-over. Also reported: calls on the processor and waits. |
 | **P2 Self-test** | `--selftest` of the frozen dist (`build.py check`, via cardrun) and of the installed app (P3). | 9 of 9 OK. READ CODE recorded with the card name. |
 | **P3 Install cycle** (`install_cycle.py`) | Runs only when neither the HKCU key `{AppId}_is1` nor `%LOCALAPPDATA%\Hangeul Document Checker` exists (never touches an install or data of the owner; otherwise it reports SKIPPED). Steps: `Setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR="%LOCALAPPDATA%\Temp\HDC install test" /TASKS="" /LOG=<reports>\install.log`; checks; installs again over it (upgrade path, `[InstallDelete]`); checks; `unins000.exe /VERYSILENT /SUPPRESSMSGBOXES`. | After each install: every file matches MANIFEST.json (size and sha256, none extra); the HKCU uninstall key with DisplayVersion 1.0.0; the Start-menu `.lnk` points at the exe; BUILD.json `build_id` = the Setup's; the installed `--selftest` (via cardrun) exits 0. After the uninstall: the folder, the key, the shortcut and the DATA folder made by the test are gone. |
-| **P4 Politeness** (`politeness.py`) | Frozen `--cli` on CHECK_0001 via cardrun, with `--gpu-lock-extra <apptest>\fakelock\auto_verify.lock`. Scenarios: (1) lock there before the start; (2) lock made after the 3rd phase-1 page event; (3) lock made after the `names` stage starts (phase 2); (4) Cancel (stdin `cancel` under `--worker`) during a wait; (5) a stale lock (mtime set 5 h back); (6) none (the reference). | (1) `gpu_wait` start with `where` "start" within 3 s and no `card ready` event for 60 s; after removal the check finishes. (2) and (3): `gpu_wait` start within 3 s, `reserved_mb` ≤ 256, no page or stage event during 60 s, resumed within 10 s of removal. (4) a `cancelled` event and exit 4 within 10 s; the worker process is gone; the saved page texts make the next run skip the pages already read. (5) no wait. (1), (2), (3) and (5) give the same result code as (6) and P1. When the REAL bot lock was active during a scenario, its timing checks are reported as "bot active" and not failed. |
-| **P5 Timing and memory** (`timing.py`) | The four cases (fresh DATA), then CHECK_0001 again with saved page texts. | Reported: worker start (torch import, CUDA, readers), phase-1 seconds per page against the r8 `page_texts.json` seconds, phase-2 seconds, calls on the card and on the processor, peak working set and commit of the worker, peak card allocated and reserved, waits. Targets: worker peak commit ≤ 4.5 GB; card peak reserved ≤ 3.0 GB; each case's total ≤ r8's `run_case.log` total + 60 s; the re-check loads no first-read model. |
+| **P4 Politeness** (`politeness.py`) | Frozen `--cli` on CHECK_0001 via cardrun, with `--gpu-lock-extra <apptest>\fakelock\auto_verify.lock`. Scenarios: (1) lock there before the start; (2) lock made after the 3rd phase-1 page event; (3) lock made after the `names` stage starts (phase 2); (4) Cancel (stdin `cancel` under `--worker`) during a wait; (5) a stale lock (mtime set 5 h back); (6) none (the reference); (7) lock made when the runner's `bot` stage starts (processor work, maybe no model call), held 60 s, with NVML free memory read every 2 s and again after the app ended (G1 review finding 1). Order 6, 1, 2, 3, 7, 5, 4. | (1) `gpu_wait` start with `where` "start" within 3 s and no `card ready` event for 60 s; after removal the check finishes. (2) and (3): `gpu_wait` start within 3 s, `reserved_mb` ≤ 256, no page or stage event during 60 s, resumed within 10 s of removal. (4) a `cancelled` event and exit 4 within 10 s; the worker process is gone; the saved page texts make the next run skip the pages already read. (5) no wait. (7) the app's card memory during the hold (free after the end − the least free during the hold) ≤ 1024 MB (context, weights, ≤ 256 MB cache), every wait in the hold with `reserved_mb` ≤ 256, the check finishes. (1), (2), (3), (5) and (7) give the same result code as (6) and P1. When the REAL bot lock was active during a scenario, its timing checks (and 7's memory check) are reported as "bot active" and not failed. |
+| **P5 Timing and memory** (`timing.py`) | The four cases (fresh DATA), then CHECK_0001 again with saved page texts. | Reported: worker start (torch import, CUDA, readers), phase-1 seconds per page against the r8 `page_texts.json` seconds, phase-2 seconds, calls on the card and on the processor, peak working set and commit of the worker, peak card allocated and reserved, waits. Targets: worker peak working set ≤ 3.5 GB and peak commit ≤ 6.0 GB (the orchestrator's decision, I21; was commit ≤ 4.5 GB); card peak reserved ≤ 3.0 GB; each case's total ≤ r8's `run_case.log` total + 60 s; the re-check loads no first-read model. |
 | **8 b Static scan** (amended) | As rev 1, over the 4.6 GB dist (the raw files, base_library.zip, the CArchive, the PYZ). | Zero hits of the forbidden strings except the lines of `packaging\scan_allow.txt` (`module or file \| string \| reason`). For our code it allows exactly ONE line: `src.verify.runner.app.cardgate \| c:\hangeul\bot\data\verification\auto_verify.lock \| the default lock path, used only when its folder exists (R2.2)`. Third-party hits (for example ".venv" in torch's own code) are reviewed and listed with a reason before the build passes. The `src.*` module set equals `STAGE_LIST.txt`; no onnxruntime, PySide6 or `DirectML.dll`. |
 | **8 c Runtime trace** (amended) | As rev 1 on one case (CHECK_0001, `--auto`). | The allowed set adds `%WINDIR%` (nvml.dll; nvcuda.dll and the DriverStore) and `<DATA>\tmp\<job>\ascii`. No access under `C:\Hangeul\BOT`: the lock is only stat'ed, which raises no audit event. Native NVIDIA driver files (`%APPDATA%\NVIDIA\ComputeCache`, ProgramData) are outside the trace's reach; this is listed as a limit. |
 | **8 g Frozen smoke** (amended) | `--selftest-part imports` imports every bundled `src.*` module (gpuread included), torch, torchvision, easyocr, `scipy.ndimage` and `skimage.io` without CUDA work. | No error. |
@@ -831,7 +870,10 @@ most about half the threads and 6 GB, no process left behind, never stopping a p
 
 1. **The bot's 15-minute check on this PC.**
    - The overlap with a starting bot check is at most one model call (about 1.5 s for the largest detection). In
-     that window this process may hold up to 3 GB plus its CUDA context, while the bot runs uncapped.
+     that window this process may hold up to 3 GB plus its CUDA context, while the bot runs uncapped. Between calls
+     it holds at most its context, the weights and 256 MB of cache (R2.1.5; P4 scenario 7). Phase 1's reads follow
+     each other closely and keep gpuread's allocator behaviour: a lock that appears between two of them is seen at
+     the next read (≤ 0.25 s of checks), with up to 3 GB still cached until then.
    - During a wait the app keeps its CUDA context and the weights (target reserved ≤ 256 MB, plus a context of about
      0.3-0.5 GB that torch does not count).
    - If the bot keeps a large idle cache, free memory may stay under 4.0 GB, so checks on this PC would wait and then
@@ -872,16 +914,20 @@ most about half the threads and 6 GB, no process left behind, never stopping a p
 14. **The one C:\Hangeul string.** The default lock path is a literal in the bundle (one scan allow-list line). It is
     only stat'ed, and only when its folder exists.
 
-## R2.9 Questions (recommended answer first)
+## R2.9 Questions (decided 29 Oct 2026)
 
-| # | For | Question | Recommended |
+The owner handed control to the orchestrator, which answered the owner's questions with the recommended answers below
+(the owner will be told). Every answer is what the built code already does.
+
+| # | For | Question | Decided |
 |---|---|---|---|
-| Q4 | owner | A single model call too large for the card's 3 GB cap: (a) run that one call on the processor with the same weights, or (b) stop the check with "a page is too large for the graphics card"? | **(a)**: the verdict stays the tested one; it is rare and reported. |
-| Q5 | owner | Bigger cards (12 GB and more): keep the 3 GB cap, or use more? | **Keep 3 GB**: the same pages are read the same way as on this PC. |
-| Q6 | owner | Desktop shortcut ticked by default? | Yes. |
-| Q2, Q3 | owner | Rev 1's OneDrive question and the 30-day cache. | As rev 1 recommends; page texts now live in `DATA\cache\pagetexts` too. |
-| Q-O1 | orchestrator | Frozen-app card runs on this PC go through `cardrun.py` (gpu_guard's dev lock held and refreshed for the whole run; the app's own gate for the bot and the 3 GB cap) instead of ≤ 90 s gpu_guard slots. | Approve before G2. Without it, the app cannot be tested on the card here. |
-| Q-O2 | orchestrator | If PyInstaller keeps the build path in code objects, may the build root move to `%LOCALAPPDATA%\HDCBuild` (rev 1) while the venv stays in app-build? | Yes; the scan decides. |
+| Q4 | owner | A single model call too large for the card's 3 GB cap: (a) run that one call on the processor with the same weights, or (b) stop the check with "a page is too large for the graphics card"? | **(a), decided.** That one call runs on the processor with the same weights (torch fp32; `TorchSession(allow_cpu=True)`), counted (`calls_cpu`, checkfacts `gpu.cpu_calls`) and shown in the result notes ("<n> large reading step(s) ran on the processor ..."). |
+| Q5 | owner | Bigger cards (12 GB and more): keep the 3 GB cap, or use more? | **Keep 3 GB on every card, decided** (`gpuengine.CAP_GB`; the same pages are read the same way as on this PC). |
+| Q6 | owner | Desktop shortcut ticked by default? | **Yes, decided** (`hdc.iss` task `desktopicon` without `unchecked`). |
+| Q2 | owner | Rev 1's OneDrive question: the default report folder when Documents is synced by OneDrive. | **Decided as rev 1 recommends**: detect the OneDrive-synced Documents and use `C:\Users\<name>\Hangeul Document Checks` (not synced) instead; otherwise Documents (`userdirs`). |
+| Q3 | owner | Rev 1's saved page texts: how long to keep them? | **Decided as rev 1 recommends**: delete them after 30 days (start-up housekeeping, `DATA\cache` including `pagetexts`), and offer their deletion on uninstall with Yes as the default (a silent uninstall takes Yes). |
+| Q-O1 | orchestrator | Frozen-app card runs on this PC go through `cardrun.py` (gpu_guard's dev lock held and refreshed for the whole run; the app's own gate for the bot and the 3 GB cap) instead of ≤ 90 s gpu_guard slots. | **Approved.** `HDC_CARDRUN_APPROVAL=Q-O1` is set only for those runs and unset afterwards. |
+| Q-O2 | orchestrator | If PyInstaller keeps the build path in code objects, may the build root move to `%LOCALAPPDATA%\HDCBuild` (rev 1) while the venv stays in app-build? | **Yes**, when the scan shows build paths kept in code objects. |
 
 ## R2.10 Integration notes (29 Oct; G1 integrated, nothing frozen yet)
 
@@ -900,6 +946,17 @@ Where the built code differs from the text above, the code is right and these no
 | I8 | R2.3.4 part `card` | Waits at most 300 s for free card memory (inside the 900 s child); CER over A-Z and 0-9 only; READ CODE over four texts (page 1, page 2, photo, light reader page 1); no QR on page 2; the photo is read inside the first read. | Fit the child timeout; spacing is not reading; a QR's blocks would count as stray characters. |
 | I9 | R2.6 Q-O1 | `cardrun.run` refuses (NotApproved) unless `HDC_CARDRUN_APPROVAL=Q-O1` is set. | The approval is enforced in code, not only in a docstring. |
 | I10 | rev 1 §2 `done` | `done.lines` and `done.out` hold student data; P1 / P4 / P5 print counts and codes only, and cardrun writes the child's stdout only to `apptest\...\stdout.log`. | S9. |
+| I11 | R2.1.3, R2.1.5 (G1 review finding 1, major) | `TorchSession.run` calls `Card.release()` after every call on the card (empty_cache when torch reserves > 256 MB); the worker's `Recorder` asks `gate.wait_turn("stage")` after every runner stage-start event while `pipeline.run` runs (never at a stage end, which runs in the runner's `finally`). P4 scenario 7 measures NVML free memory during a lock made at the `bot` stage. | The worker kept torch's cache (up to the 3 GB cap) through the runner's processor stretches, and the lock was seen only at the next model call, up to a minute later. |
+| I12 | R2.2 (finding 2) | `CardGate.on_room` / `wait_room`; `wait_memory(fatal=False)`. After a lock wait and before every OOM retry the gate waits (≤ 15 min, never failing) until free memory ≥ cap − torch reserved + 512 MB. | The bot's process keeps its card memory after its lock is gone (messages, reports, publishing). |
+| I13 | R2.1.2 (finding 3) | `usable_done`: the page-texts file carries `"app_build"`; another build's or engine's file is not reused; a `"downscaled"` page is read again. | `gpuread._previous` drops the mark of a reused page, and a re-check on an idle card should read it at full size. |
+| I14 | R2.3.3 (finding 4) | The done event's `budget_hits` and `gpu.downscaled` / `gpu.skipped` become result notes; `reading_note` also counts pages read smaller. | Both can change a verdict against an idle PC and were only in checkfacts.json. |
+| I15 | rev 1 §2 exit codes (finding 5) | `map_error` checks LOW_MEMORY (MemoryError, "not enough memory", WinError 8 / 14 / 1455, "the paging file is too small") before STARTUP_FAILED (ImportError, WinError 126 / 127 / 193 / 1114) and before CUDA errors; `cuda_marked` never reads the text of an OSError or ImportError. | A DLL load that fails for lack of memory names `cublasLt64_12.dll`; it was reported as CARD_FAILED. |
+| I16 | R2.3.3 job.json (finding 6) | The window always writes `today` (its date at Check); the done event carries the worker's `check_date`, which the window shows; `auto.json` records it. | One check date for the window, the worker and the result code (a check started just before midnight). |
+| I17 | R2.4.5 spec (G2 first freeze) | `hdc.spec`'s `filter_toc` ends with `drop_top_level_copies`: a top-level binary whose source file (normcase, absolute) is also collected into a sub-folder is dropped and listed in `toc_checks.json` `dropped`. A same-named DLL from another source still stops the build. | PyInstaller 6.22.3 keeps a dependency's package folder only for DLLs under `site.getsitepackages()`; the build env's packages come through `hdc_build.pth`, so the dependency scan collected 24 DLLs a second time at the top level (20 of `torch\lib`, the two of `numpy.libs`, the one of `scipy.libs` and `pyzbar\libiconv.dll`), next to their package-folder copies, and the first freeze stopped. torch loads every `torch\lib` DLL by full path after adding the folder, numpy and scipy add their `*.libs` folder, and pyzbar falls back to its own folder, as in DEV. |
+| I18 | R2.6 8 b / 8 h, R2.4.6 `check` (G2 first check) | `scan_bundle` reads a PyInstaller archive only from an exe that holds PyInstaller's cookie; any other exe (`_internal\torch\bin\protoc.exe`) is scanned raw and noted, and the app's own top-level exe without an archive is a FAIL. `scan_allow.txt` gained two reviewed third-party lines (`networkx.algorithms.dag` "jarvis": a literature reference in a docstring; `setuptools.command.sdist` ".venv": setuptools' default exclude pattern). `dll_baseline.txt` gained `imagehlp.dll` (system; imported by `torch\lib\libiomp5md.dll`). `build.load_module` puts the module in `sys.modules` before running it. | The first real check: `CArchiveReader` raised ArchiveReadError on protoc.exe; the two hits are package text, not this PC's folders (no build path was kept in any code object, so Q-O2's move of the build root was not needed); imagehlp.dll is in System32 of every Windows 10 and 11; cardrun's `@dataclass` failed without its module in `sys.modules`. |
+| I19 | rev 1 §2 Cancel, `protocol.watch_stdin` (G2 P1 `--auto`) | On Windows the stdin watcher reads a PRIVATE duplicate of the stdin pipe's handle with kernel32 `ReadFile` (`protocol.private_stdin`), after fd 0, `sys.stdin` and `STD_INPUT_HANDLE` were pointed at NUL; it never reads fd 0. Test: `test_protocol.StdinPipeChild` (a child with a stdin pipe imports numpy, reads NUL on fd 0 and still gets `cancel`). | P1's `--auto` run hung: the window's worker stopped right after numpy's DLLs loaded, before its first log line, with no card work (0 bytes in its log, 0.3 s of CPU, one thread in a pipe read). The C runtime's `_read` holds fd 0's lock while it waits, and the window writes nothing until Cancel; `import numpy` takes that lock (reproduced in a plain child: `import numpy` and `msvcrt.setmode(0, ...)` hang while another thread waits on a stdin pipe, `GetFileType`, `os.fstat` and `import pymupdf` do not). `--cli` has no stdin pipe, which is why P1's four `--cli` cases and the self-test ran. Every Check from the window would have hung. |
+| I20 | R2.1.3 step 4, R2.1.5 (G2 P5) | `gpuengine.lean_detector_scores`: the OOM retry runs the detector through CRAFT.forward's operations in the same order with each VGG skip feature dropped after its last use (and the unused `feature` not kept); the processor call is lean too. `TorchSession.stats()["calls_lean"]`, checkfacts `light_reader.lean_calls`. Tests: fakes for the order (first attempt plain, retry lean, processor lean) and a real-torch child (lab\onnx\.venv, CPU, random CRAFT weights, odd sizes, batch 2): bit-identical to `DetectorOut(CRAFT)`. | P1/P5: owner folder 9 sent 2 detections (2560 x 1856 and 2560 x 1952) and the EAP folder 1 (2560 x 1824) to the processor; each torch-CPU detection took 10-18 s and lifted the worker to a 4.8-5.2 GB working set and 6.3-10.2 GB commit (f3 and CHECK_0001, with none: 1.9-2.0 GB and 5.4 GB). On this PC's card (one gpu_guard slot, 3 GB cap, strict fp32) CRAFT's own forward ran out of memory at both 2560 sizes and the lean pass ran (peak allocated 2455 and 2579 MiB); at 1600 x 1216 both ran and gave bit-identical outputs. |
+| I21 | R2.6 P1 / P5 inputs and targets (G2) | `parity.py` and `timing.py` take `--input LABEL=PATH` for a case whose r8 input is gone (the owner removed Desktop folders 3 and 9): G2 read them from the owner's zips into `private-runner\tmp\zipsrc` (deleted afterwards), each file's sha256 and size checked against r8's page texts and each mtime set to the zip entry's (= the r8 staged copy's), so the case id equals r8's (P1 (c) fails otherwise). One file of folder 3 differed in the zip from what r8 checked; it was taken from r8's staged copy (`runs\owner_f3_r8\docs`, same bytes and mtime). P5's memory target is the orchestrator's: worker peak WORKING SET ≤ 3.5 GB; commit reported, > 6 GB is a miss to be fixed. | Without the case id the r8 comparison is not the same input. Commit on this PC includes WDDM's charge for the card memory torch reserves (about 3 GB during the first read, measured: commit 5.3 GB with 2.4-2.7 GB of host-visible private memory), so commit is not RAM in use. |
 
 **G1 smoke (29 Oct, from source on this PC's card, made-up self-test pages, one gpu_guard slot):** `worker.run_job`
 with places in APP mode through the test overrides: exit 0 in 56 s; first read CER 0.0 on both PDF pages and the photo,

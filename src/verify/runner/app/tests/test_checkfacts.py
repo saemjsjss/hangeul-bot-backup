@@ -223,9 +223,10 @@ class TestGpuBlock(unittest.TestCase):
     def test_full_block(self):
         fr = {"pages": {"total": 14, "read": 13, "ocr": 12, "layer": 1, "image": 0, "skipped": 1},
               "seconds_total": 18.2, "model_load_s": 2.1, "downscaled": [{"page": 3}], "skipped": 1,
-              "oom_retries": 2, "peak_alloc_gb": 2.41, "peak_reserved_gb": 2.8}
+              "oom_retries": 2, "peak_alloc_gb": 2.41, "peak_reserved_gb": 2.8, "reread_downscaled": 1,
+              "stale_store": False}
         sessions = {"det": {"calls_card": 10, "seconds_card": 3.5, "calls_cpu": 1, "seconds_cpu": 9.0,
-                            "oom_retries": 1},
+                            "oom_retries": 3, "calls_lean": 2, "releases": 9},
                     "rec": {"card_calls": 200, "card_seconds": 1.5, "cpu_calls": 0, "ooms": 0}}
         gate = {"waits": 2, "waited_s": 181.5, "by_why": {"lock": 1, "memory": 1}, "lock": "C:\\Hangeul\\x.lock",
                 "last_free_mb": 6000}
@@ -237,9 +238,14 @@ class TestGpuBlock(unittest.TestCase):
         self.assertEqual((b["first_read"]["downscaled"], b["first_read"]["skipped"], b["first_read"]["oom_retries"]),
                          (1, 1, 2))
         self.assertEqual(b["light_reader"]["calls"]["det"], {"card_calls": 10, "card_s": 3.5, "cpu_calls": 1,
-                                                             "cpu_s": 9.0, "oom_retries": 1})
+                                                             "cpu_s": 9.0, "oom_retries": 3, "lean_calls": 2,
+                                                             "releases": 9})
+        self.assertEqual(b["light_reader"]["calls"]["rec"]["releases"], 0)
+        self.assertEqual(b["light_reader"]["calls"]["rec"]["lean_calls"], 0)
+        self.assertEqual(b["light_reader"]["lean_calls"], 2)               # G2: the lean detector retries
+        self.assertEqual((b["first_read"]["reread_downscaled"], b["first_read"]["stale_store"]), (1, False))
         self.assertEqual(b["light_reader"]["calls"]["rec"]["card_calls"], 200)
-        self.assertEqual((b["cpu_calls"], b["oom_retries"]), (1, 3))
+        self.assertEqual((b["cpu_calls"], b["oom_retries"]), (1, 5))
         self.assertEqual(b["model_load_s"], {"card_start": 14.2, "first_read": 2.1, "light_reader": 1.1})
         self.assertEqual(b["waits"], {"count": 2, "seconds": 181.5,
                                       "detail": {"by_why": {"lock": 1, "memory": 1}, "last_free_mb": 6000}})
@@ -248,14 +254,15 @@ class TestGpuBlock(unittest.TestCase):
         self.assertEqual(b["peaks"]["first_read_alloc_gb"], 2.41)
         self.assertNotIn("Hangeul", json.dumps(b))
         self.assertEqual(CF.done_gpu(b), {"card": "NVIDIA GeForce RTX 0000", "peak_alloc_gb": 2.6,
-                                          "peak_reserved_gb": 2.9, "cpu_calls": 1, "waits": 2, "waited_s": 181.5})
+                                          "peak_reserved_gb": 2.9, "cpu_calls": 1, "waits": 2, "waited_s": 181.5,
+                                          "downscaled": 1, "skipped": 1})
 
     def test_empty_block(self):
         b = CF.gpu_block()
         self.assertEqual(b["card"], {})
         self.assertEqual(b["cpu_calls"], 0)
         self.assertEqual(CF.done_gpu(b), {"card": None, "peak_alloc_gb": None, "peak_reserved_gb": None,
-                                          "cpu_calls": 0, "waits": 0, "waited_s": 0.0})
+                                          "cpu_calls": 0, "waits": 0, "waited_s": 0.0, "downscaled": 0, "skipped": 0})
         self.assertEqual(CF.done_gpu(None)["waits"], 0)
 
 

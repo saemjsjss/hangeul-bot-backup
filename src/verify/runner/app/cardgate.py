@@ -8,6 +8,13 @@ works. When a lock is active the gate frees this process's card cache (``on_paus
 Waiting never fails a check, and there is no time limit for a lock (a lock older than ``LOCK_STALE_S``
 is a leftover of a crashed check and is ignored).
 
+After a lock wait the gate also waits for ROOM (``wait_room``): free card memory of at least what this process may
+still take up to its cap, plus headroom (``on_room``, set by ``gpuengine.start_card``). The program that held the
+lock may keep its card memory for a while after its lock is gone (the bot's check sends its messages and writes its
+reports first). ``wait_room`` never fails a check: after ``MEMORY_WAIT_S`` it gives up and the check goes on (an
+out-of-memory error is then handled, counted and reported). GatedReader and TorchSession call it before their
+out-of-memory retry too.
+
 Standard library only: no torch and no ``hooks`` import (``emit`` is passed in). A ``Cancelled`` (or any
 other exception) raised by ``emit`` or ``on_pause`` passes through untouched; the gate never catches it.
 
@@ -17,7 +24,8 @@ Events (``emit("gpu_wait", **fields)``; R2.3.3):
     state="end",   why="lock",   waited_s=<s>
     state="start", why="memory", free_mb=<MiB>, need_mb=<MiB>
     state="tick",  why="memory", free_mb=<MiB>, need_mb=<MiB>, waited_s=<s>             (every <= POLL_S)
-    state="end",   why="memory", free_mb=<MiB>, need_mb=<MiB>, waited_s=<s>   (also just before a timeout)
+    state="end",   why="memory", free_mb=<MiB>, need_mb=<MiB>, waited_s=<s>   (also just before a timeout;
+                   short=True when a room wait gave up)
 No event and no stat holds a path. No personal data.
 """
 from __future__ import annotations
@@ -83,9 +91,15 @@ def _no_pause() -> int:
     return 0
 
 
+def _no_room() -> Optional[int]:
+    return None
+
+
 class CardGate:
     """Ask ``wait_turn(where)`` before every model call (``where``: "start", "page", "read", "det", "rec"
-    or "oom") and ``wait_memory(need_mb)`` once before the card is started."""
+    or "oom"; the worker also asks "stage" at the start of every runner stage) and ``wait_memory(need_mb)``
+    once before the card is started. ``wait_room(where)`` waits for free card memory after a lock wait (the
+    gate does it itself) and before an out-of-memory retry (the readers do it)."""
 
     def __init__(self, lock_paths: Sequence[Optional[str]], emit: Callable[..., None], *,
                  free_mb: Callable[[], Optional[int]] = lambda: None,
@@ -108,6 +122,12 @@ class CardGate:
         self._sleep = sleep
         #: set by gpuengine.start_card: card.pause (synchronize, gc, empty_cache; returns torch reserved MB)
         self.on_pause: Callable[[], int] = _no_pause
+        #: set by gpuengine.start_card: card.room_mb (the free MiB this process needs before it resumes after a
+        #: wait: what it may still take up to its cap, plus headroom); the default None = no room check
+        self.on_room: Callable[[], Optional[int]] = _no_room
+        self._in_memory_wait = False
+        self._room_checks = 0
+        self._room_short = 0
         self._clear_at: Optional[float] = None     # clock time of the last lock check that found none
         self._checks = 0
         self._waits = 0
@@ -144,7 +164,9 @@ class CardGate:
             return 0
 
     def _wait_lock(self, path: str, where: str) -> float:
-        """Pause the card, then wait until no watched lock is active. Returns the seconds waited."""
+        """Pause the card, then wait until no watched lock is active; then wait for room on the card
+        (``wait_room``; not inside a memory wait, which reads free memory again itself). Returns the
+        seconds of the lock wait."""
         reserved = self._pause()
         start = self._clock()
         try:
@@ -162,6 +184,8 @@ class CardGate:
             self._record("lock", where, seconds)
         self._clear_at = self._clock()
         self._emit("gpu_wait", state="end", why="lock", waited_s=round(seconds, 1))
+        if not self._in_memory_wait:
+            self.wait_room(where)
         return seconds
 
     # -------------------------------------------------------------------------------------- the API
@@ -190,11 +214,13 @@ class CardGate:
         self._last_free = value
         return value
 
-    def wait_memory(self, need_mb: int, limit_s: float = MEMORY_WAIT_S) -> Optional[int]:
+    def wait_memory(self, need_mb: int, limit_s: float = MEMORY_WAIT_S, *, fatal: bool = True,
+                    where: str = "memory") -> Optional[int]:
         """Return the free card memory (MiB) once it is at least ``need_mb``, or None at once when it is
         unknown. Otherwise wait with ``gpu_wait`` why="memory" events, reading free memory again every
         MEMORY_POLL_S; a lock that appears meanwhile is waited for too (that time does not count
-        against ``limit_s``). After ``limit_s`` seconds of memory wait: CardMemoryShort."""
+        against ``limit_s``). After ``limit_s`` seconds of memory wait: CardMemoryShort, or with
+        ``fatal=False`` the last free MiB read (its end event then says short=True)."""
         need = int(need_mb)
         free = self._read_free()
         if free is None or free >= need:
@@ -204,6 +230,8 @@ class CardGate:
         lock_s = 0.0
         next_read = start + MEMORY_POLL_S
         finished = False
+        outer = self._in_memory_wait
+        self._in_memory_wait = True
         try:
             self._emit("gpu_wait", state="start", why="memory", free_mb=free, need_mb=need)
             while True:
@@ -226,16 +254,35 @@ class CardGate:
                 self._emit("gpu_wait", state="tick", why="memory", free_mb=free, need_mb=need,
                            waited_s=round(now - start - lock_s, 1))
         finally:
+            self._in_memory_wait = outer
             seconds = max(0.0, self._clock() - start - lock_s)
-            self._record("memory", "memory", seconds)
-        self._emit("gpu_wait", state="end", why="memory", free_mb=free, need_mb=need, waited_s=round(seconds, 1))
-        if not finished:
-            raise CardMemoryShort(free, need, seconds)
+            self._record("memory", where, seconds)
+        if finished or fatal:
+            self._emit("gpu_wait", state="end", why="memory", free_mb=free, need_mb=need,
+                       waited_s=round(seconds, 1))
+            if not finished:
+                raise CardMemoryShort(free, need, seconds)
+            return free
+        self._room_short += 1
+        self._emit("gpu_wait", state="end", why="memory", free_mb=free, need_mb=need, waited_s=round(seconds, 1),
+                   short=True)
         return free
+
+    def wait_room(self, where: str) -> Optional[int]:
+        """Wait until free card memory is at least ``on_room()`` MiB (what this process may still take up to
+        its cap, plus headroom), so that it does not resume into memory another program still holds. Called
+        by the gate after every lock wait and by the readers before an out-of-memory retry. Never fails the
+        check: after MEMORY_WAIT_S it returns and the check goes on (counted as "room_short"). Returns the
+        free MiB read, or None when nothing was checked (no ``on_room`` yet: the card is not started)."""
+        need = self.on_room()
+        if need is None:
+            return None
+        self._room_checks += 1
+        return self.wait_memory(max(0, int(need)), MEMORY_WAIT_S, fatal=False, where=where)
 
     def stats(self) -> Dict[str, Any]:
         """Counts only, no paths: waits, waited_s, by why and by where, the last free MiB read, the number
-        of lock checks, and the kinds of the watched locks."""
+        of lock checks and room checks, the room waits that gave up, and the kinds of the watched locks."""
         return {
             "waits": self._waits,
             "waited_s": round(self._waited_s, 1),
@@ -243,5 +290,7 @@ class CardGate:
             "by_where": {k: dict(v) for k, v in self._by_where.items()},
             "free_mb": self._last_free,
             "lock_checks": self._checks,
+            "room_checks": self._room_checks,
+            "room_short": self._room_short,
             "locks": [lock_kind(p) for p in self._paths],
         }

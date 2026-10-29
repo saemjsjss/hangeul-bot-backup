@@ -1,11 +1,12 @@
-"""Task C: protocol.py (APP_SPEC rev 1 section 2, revision 2 R2.3.3). Made-up data only; no card and no child
-process; job.json files go under Task C's scratch folder."""
+"""Task C: protocol.py (APP_SPEC rev 1 section 2, revision 2 R2.3.3). Made-up data only; no card; one child process
+(StdinPipeChild, G2: this Python with a stdin pipe); job.json files go under Task C's scratch folder."""
 from __future__ import annotations
 
 import io
 import json
 import math
 import os
+import sys
 import time
 import unittest
 from pathlib import Path
@@ -317,6 +318,62 @@ class StdinWatcher(unittest.TestCase):
         os.close(w)
         t.join(5.0)
         self.assertTrue(flag.is_set())
+
+
+_CHILD = r"""
+import os, sys
+sys.path.insert(0, sys.argv[1])
+from src.verify.runner.app import protocol as P
+flag = P.CancelFlag()
+t = P.watch_stdin(flag)
+print("watching", t is not None, flush=True)
+import numpy                                  # took fd 0's runtime lock while a stdin read waited: the G2 hang
+print("imported", flush=True)
+print("fd0 is NUL", os.read(0, 8) == b"", flush=True)
+print("cancelled" if flag.wait(20.0) else "no cancel", flush=True)
+"""
+
+
+@unittest.skipUnless(os.name == "nt", "the Windows stdin pipe")
+class StdinPipeChild(unittest.TestCase):
+    """G2 (P1's --auto run): a worker whose stdin is the window's pipe (nothing written until Cancel) must not hang:
+    its watcher reads a private handle, fd 0 is NUL, ``import numpy`` passes, and ``cancel`` still arrives. A child
+    process of this Python (-I -B), made-up nothing; the child is always ended."""
+
+    def test_the_worker_side_never_blocks_fd_0(self):
+        import subprocess
+        import threading
+        worktree = Path(__file__).resolve().parents[5]
+        p = subprocess.Popen([sys.executable, "-I", "-B", "-c", _CHILD, str(worktree)], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=0x08000000)
+        lines = []
+
+        def read():
+            for raw in iter(p.stdout.readline, b""):
+                lines.append(raw.decode("ascii", "replace").strip())
+        th = threading.Thread(target=read, daemon=True)
+        th.start()
+        try:
+            deadline = time.monotonic() + 60
+            while "imported" not in lines and p.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertIn("imported", lines, f"the child hung or failed: {lines[-3:]}")
+            p.stdin.write(b"cancel\n")
+            p.stdin.flush()
+            self.assertEqual(p.wait(30), 0)
+            th.join(5)
+            self.assertEqual(lines[0], "watching True")
+            self.assertIn("fd0 is NUL True", lines)
+            self.assertEqual(lines[-1], "cancelled")
+        finally:
+            if p.poll() is None:
+                p.kill()
+                p.wait(10)
+            for s in (p.stdin, p.stdout):
+                try:
+                    s.close()
+                except OSError:
+                    pass
 
 
 if __name__ == "__main__":

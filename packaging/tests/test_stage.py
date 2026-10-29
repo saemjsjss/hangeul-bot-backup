@@ -752,11 +752,45 @@ class SpecTests(unittest.TestCase):
 
     def test_a_dll_twice_stops(self) -> None:
         pure, b, d = self.good_toc()
-        b.append(("cudnn64_9.dll", str(self.f.torch_lib / "cudnn64_9.dll"), "BINARY"))
+        other = fresh("spec_other_dll") / "cudnn64_9.dll"           # the same name from ANOTHER source
+        b.append(("cudnn64_9.dll", str(other), "BINARY"))
         self._stops((pure, b, d), r"DLL collected twice: cudnn64_9\.dll")
         pure, b, d = self.good_toc()
         d.append((os.path.join("torch", "lib", "torch_cuda.dll"), "x", "DATA"))      # once more, as data
         self._stops((pure, b, d), r"DLL collected twice: torch_cuda\.dll")
+
+    def test_top_level_copies_of_folder_dlls_are_dropped(self) -> None:
+        """PyInstaller's dependency scan collects a DLL of a .pth site dir (and of the staged vendor folder) a second
+        time at the top level; the top-level entry with the SAME source is dropped, the package-folder one kept."""
+        pure, b, d = self.good_toc()
+        iconv = str(self.st / "vendor" / "pyzbar" / "libiconv.dll")
+        delve = "msvcp140-" + "a" * 32 + ".dll"
+        b += [("cudnn64_9.dll", str(self.f.torch_lib / "cudnn64_9.dll"), "BINARY"),
+              ("torch_cpu.dll", str(self.f.torch_lib / "torch_cpu.dll").upper(), "BINARY"),   # case of the path
+              (os.path.join("pyzbar", "libiconv.dll"), iconv, "BINARY"),
+              ("libiconv.dll", iconv, "BINARY"),
+              (delve, "n.dll", "BINARY")]                                                  # numpy.libs' source
+        self.exec_spec((pure, b, d))
+        a = FakeAnalysis.last
+        dests = [x.replace("\\", "/").lower() for x, _, _ in a.binaries]
+        for top in ("cudnn64_9.dll", "torch_cpu.dll", "libiconv.dll", delve):
+            self.assertNotIn(top, dests)
+        for kept in ("torch/lib/cudnn64_9.dll", "torch/lib/torch_cpu.dll", "pyzbar/libiconv.dll",
+                     "numpy.libs/" + delve, "python312.dll", "vcruntime140.dll"):
+            self.assertIn(kept, dests)
+        rep = json.loads((self.reports / "toc_checks.json").read_text(encoding="utf-8"))
+        self.assertEqual(rep["problems"], [])
+        for top in ("cudnn64_9.dll", "torch_cpu.dll", "libiconv.dll", delve):
+            self.assertIn(top, rep["dropped"])
+        self.assertEqual(list(rep["delvewheel_pairs"]), [delve])          # the two *.libs copies stay a pair
+
+    def test_drop_top_level_copies_rule(self) -> None:
+        ns = self.exec_spec()
+        keep, dropped = ns["drop_top_level_copies"]([("a.dll", "x/a.dll", "BINARY"), ("p/a.dll", "x/a.dll", "BINARY"),
+                                                     ("b.dll", "y/b.dll", "BINARY"), ("q/b.dll", "z/b.dll", "BINARY"),
+                                                     ("c.dll", "x/c.dll", "BINARY")])
+        self.assertEqual(dropped, ["a.dll"])
+        self.assertEqual([e[0] for e in keep], ["p/a.dll", "b.dll", "q/b.dll", "c.dll"])
 
     def test_torch_lib_set_must_equal(self) -> None:
         pure, b, d = self.good_toc()

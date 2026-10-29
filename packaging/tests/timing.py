@@ -1,6 +1,7 @@
 """P5 timing and memory (APP_SPEC rev 2, R2.6): the frozen app's speed and memory on THIS PC, via cardrun.
 
     <runner python> -I -B packaging\\tests\\timing.py --build-id <id> [--cases ...] [--app-dir DIR]
+                    [--input LABEL=PATH ...]
 
 Runs the four r8 cases with a FRESH DATA folder each, then CHECK_0001 again on its DATA (the saved page texts).
 NEEDS ORCHESTRATOR APPROVAL Q-O1 (cardrun). Reported per run (counts and seconds only):
@@ -11,7 +12,10 @@ NEEDS ORCHESTRATOR APPROVAL Q-O1 (cardrun). Reported per run (counts and seconds
   - peak working set and commit of the worker (cardrun's job and process counters);
   - peak card memory allocated and reserved (the ``done`` event's gpu block).
 Targets (a miss fails P5):
-  - worker peak commit <= 4.5 GB; card peak reserved <= 3.0 GB;
+  - worker peak WORKING SET <= 3.5 GB; card peak reserved <= 3.0 GB (the orchestrator's P5 decision of 29 Oct,
+    replacing R2.6's "commit <= 4.5 GB": G1's smoke worker committed 5.4 GB with a 1.8 GB working set, most of it
+    CUDA and torch host reservations that are never touched);
+  - worker peak commit <= 6.0 GB (reported; above it the cause is to be found and fixed before the installer);
   - each case's total <= r8's total + 60 s. r8's run_case.log total covers only the runner when its first read
     was reused (all four r8 logs: "gpuread: exit 0 after 0.4 s"), so for a FRESH run r8's first-read seconds
     (page_texts.json ``seconds_total``) are added; the re-check is compared with run_case.log's total as it is;
@@ -37,7 +41,8 @@ import cardrun  # noqa: E402
 import parity  # noqa: E402
 
 GB = 2 ** 30
-COMMIT_MAX_GB = 4.5
+WORKING_SET_MAX_GB = 3.5
+COMMIT_MAX_GB = 6.0
 RESERVED_MAX_GB = 3.0
 TOTAL_SLACK_S = 60.0
 REUSED_READ_S = 5.0          # an r8 first read this short reused saved page texts
@@ -71,7 +76,18 @@ def r8_facts(case: parity.R8Case) -> Dict[str, Any]:
     f["page_texts_s"] = store.get("seconds_total")
     f["per_page"] = stats(secs)
     f["reused"] = f["first_read_s"] is not None and f["first_read_s"] < REUSED_READ_S
+    f["engine"] = engine_stats(parity._read_json_or_none(case.dir / "run.json"))
     return f
+
+
+def engine_stats(run: Any) -> Dict[str, Any]:
+    """The runner's own reading counts in a run.json (reading.engine_stats) and its 'bot' stage seconds: the bot
+    stage's verification-text cache hits make a run much shorter (G2: every r8 run reused 1-2 cached bot-stage
+    reads from earlier runs; a fresh app DATA folder has none)."""
+    es = ((run or {}).get("reading") or {}).get("engine_stats") or {} if isinstance(run, dict) else {}
+    bot = ((run or {}).get("timings") or {}).get("bot") if isinstance(run, dict) else None
+    return {"ocr_calls": es.get("ocr_calls"), "ocr_s": es.get("ocr_seconds"), "cache_hits": es.get("cache_hits"),
+            "bot_stage_s": round(bot, 1) if isinstance(bot, (int, float)) else None}
 
 
 def _find(obj: Any, *names: str) -> Optional[Any]:
@@ -124,6 +140,7 @@ def summarize(events: Events, res_stats: Dict[str, Any], out_dir: Optional[Path]
         "calls": {"card": _find(fg, "card_calls", "calls_card", "calls_gpu"),
                   "processor": g.get("cpu_calls", _find(fg, "cpu_calls", "calls_cpu"))},
         "first_read_model_load_s": model_load,
+        "engine": engine_stats(run),
         "memory": {"peak_working_set_mb": res_stats.get("peak_working_set_mb"), "peak_commit_mb": commit},
         "card": {"peak_alloc_gb": g.get("peak_alloc_gb", _find(fg, "peak_alloc_gb")),
                  "peak_reserved_gb": g.get("peak_reserved_gb", _find(fg, "peak_reserved_gb"))},
@@ -133,10 +150,12 @@ def summarize(events: Events, res_stats: Dict[str, Any], out_dir: Optional[Path]
 
 
 def targets(s: Dict[str, Any], r8: Dict[str, Any], recheck: bool) -> List[Tuple[str, bool, str]]:
+    """[0] working set, [1] card reserved, [2] total, [3] (re-check only) no first-read model, last: commit."""
     out: List[Tuple[str, bool, str]] = []
-    commit = s["memory"]["peak_commit_mb"]
-    out.append((f"worker peak commit <= {COMMIT_MAX_GB} GB", commit is not None and commit <= COMMIT_MAX_GB * 1024,
-                f"{commit} MB" if commit is not None else "not measured"))
+    ws = s["memory"]["peak_working_set_mb"]
+    out.append((f"worker peak working set <= {WORKING_SET_MAX_GB} GB",
+                isinstance(ws, (int, float)) and ws <= WORKING_SET_MAX_GB * 1024,
+                f"{ws} MB" if ws is not None else "not measured"))
     res = s["card"]["peak_reserved_gb"]
     out.append((f"card peak reserved <= {RESERVED_MAX_GB} GB", isinstance(res, (int, float))
                 and res <= RESERVED_MAX_GB, f"{res} GB"))
@@ -154,6 +173,9 @@ def targets(s: Dict[str, Any], r8: Dict[str, Any], recheck: bool) -> List[Tuple[
         ok = s["phase1"]["pages"] == 0 and (ml is None or float(ml) == 0.0)
         out.append(("the re-check loads no first-read model", ok,
                     f"{s['phase1']['pages']} phase-1 page(s), model load {ml}"))
+    commit = s["memory"]["peak_commit_mb"]
+    out.append((f"worker peak commit <= {COMMIT_MAX_GB} GB", isinstance(commit, (int, float))
+                and commit <= COMMIT_MAX_GB * 1024, f"{commit} MB" if commit is not None else "not measured"))
     return out
 
 
@@ -186,6 +208,8 @@ def main(argv: Optional[Sequence[str]] = None, run_fn: Any = None, runs: Path = 
     ap.add_argument("--app-dir", default="")
     ap.add_argument("--cases", default=",".join(c for c, _ in parity.CASES))
     ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
+    ap.add_argument("--input", action="append", default=[], metavar="LABEL=PATH",
+                    help="check PATH instead of r8's input for that case (as parity.py)")
     a = ap.parse_args(argv)
     try:
         app = cardrun.app_dir_for(a.build_id or None, a.app_dir or None)
@@ -194,6 +218,7 @@ def main(argv: Optional[Sequence[str]] = None, run_fn: Any = None, runs: Path = 
         if any(c not in known for c in wanted):
             raise ValueError("unknown case")
         cases = [parity.load_r8(c, runs, known[c]) for c in wanted]
+        parity.apply_inputs(cases, parity.parse_inputs(a.input, list(known)))
     except (ValueError, OSError, KeyError) as exc:
         print(f"P5: cannot start: {type(exc).__name__}: {exc}")
         return 2
@@ -223,6 +248,9 @@ def main(argv: Optional[Sequence[str]] = None, run_fn: Any = None, runs: Path = 
         print(f"  r8: total {r8['total_s']} s, first read {r8['page_texts_s']} s"
               f"{' (reused in run_case)' if r8['reused'] else ''}, per page mean {r8['per_page']['mean']} s,"
               f" median {r8['per_page']['median']} s")
+        ea, er = s.get("engine") or {}, r8.get("engine") or {}
+        print(f"  bot stage: app {ea.get('bot_stage_s')} s ({ea.get('ocr_calls')} reads, {ea.get('cache_hits')} cached),"
+              f" r8 {er.get('bot_stage_s')} s ({er.get('ocr_calls')} reads, {er.get('cache_hits')} cached)")
         results.append({"label": label, "app": s, "r8": r8,
                         "targets": [{"name": n, "ok": ok, "detail": det} for n, ok, det in checks]})
     passed = all(t["ok"] for r in results for t in r["targets"])

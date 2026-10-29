@@ -1,7 +1,7 @@
 """P1 parity with r8 (APP_SPEC rev 2, R2.6): the frozen app against the r8 runs, on THIS PC's graphics card.
 
     <runner python> -I -B packaging\\tests\\parity.py --build-id <id> [--cases owner_f3_r8,test1_r8] [--no-auto]
-                    [--app-dir <app folder>] [--timeout 3600]
+                    [--app-dir <app folder>] [--timeout 3600] [--input LABEL=PATH ...]
 
 For each r8 case (owner folder 3, owner folder 9, the EAP folder, CHECK_0001 = test 1) it reads the input, program
 and ``today`` from ``private-runner\\runs\\<case>\\run.json``, runs the frozen app ``--cli`` with a FRESH
@@ -73,6 +73,36 @@ def load_r8(label: str, runs: Path = RUNS, desc: str = "") -> R8Case:
     r = cardrun.read_json(d / "run.json")
     return R8Case(label=label, desc=desc or label, dir=d, input=str(r["input"]), program=str(r["program"]),
                   today=r.get("today") or None, case_id=str(r.get("case_id") or ""), mode=str(r.get("mode") or ""))
+
+
+def parse_inputs(specs: Sequence[str], known: Sequence[str]) -> Dict[str, str]:
+    """``--input LABEL=PATH`` (repeatable): check PATH instead of the input r8's run.json names, for a case whose
+    original input is gone (the owner removed Desktop folders 3 and 9; G2 read them from the owner's zips into a
+    private test folder). The stand-in must be the SAME input: (a) compares the file names, sha256 values and page
+    counts, and (c) fails when the app's case id (names, sizes and modification times) differs from r8's. The path
+    is never printed."""
+    out: Dict[str, str] = {}
+    for spec in specs or ():
+        label, sep, path = str(spec).partition("=")
+        label, path = label.strip(), path.strip()
+        if not sep or not label or not path:
+            raise ValueError("--input takes LABEL=PATH")
+        if label not in known:
+            raise ValueError("--input: unknown case; known: " + ", ".join(known))
+        if not Path(path).is_absolute() or not Path(path).exists():
+            raise ValueError(f"--input {label}: the path must be absolute and exist")
+        out[label] = path
+    return out
+
+
+def apply_inputs(cases: Sequence[R8Case], inputs: Dict[str, str]) -> List[str]:
+    """Replaces the inputs of the named cases; returns the labels whose input was replaced."""
+    done = []
+    for c in cases:
+        if c.label in inputs:
+            c.input = inputs[c.label]
+            done.append(c.label)
+    return done
 
 
 # ------------------------------------------------------------------------------------------------ (a) page texts
@@ -455,6 +485,8 @@ def main(argv: Optional[Sequence[str]] = None, run_fn: Optional[RunFn] = None, r
     ap.add_argument("--cases", default=",".join(c for c, _ in CASES))
     ap.add_argument("--no-auto", action="store_true", help="skip the --auto run of CHECK_0001")
     ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
+    ap.add_argument("--input", action="append", default=[], metavar="LABEL=PATH",
+                    help="check PATH instead of r8's input for that case (r8's input is gone; same files)")
     a = ap.parse_args(argv)
     try:
         app = cardrun.app_dir_for(a.build_id or None, a.app_dir or None)
@@ -463,6 +495,7 @@ def main(argv: Optional[Sequence[str]] = None, run_fn: Optional[RunFn] = None, r
         if any(c not in known for c in wanted):
             raise ValueError("unknown case; known: " + ", ".join(known))
         cases = [load_r8(c, runs, known[c]) for c in wanted]
+        replaced = apply_inputs(cases, parse_inputs(a.input, list(known)))
     except (ValueError, OSError, KeyError) as exc:
         print(f"P1: cannot start: {type(exc).__name__}: {exc}")
         return 2
@@ -473,7 +506,8 @@ def main(argv: Optional[Sequence[str]] = None, run_fn: Optional[RunFn] = None, r
     run_fn = run_fn or cardrun.run
     apptest = cardrun.apptest_dir(a.build_id or None)
     root = cardrun.new_run_dir(apptest, "p1")
-    print(f"P1 parity with r8 | build {a.build_id or '-'} | run folder {root.name}")
+    print(f"P1 parity with r8 | build {a.build_id or '-'} | run folder {root.name}"
+          + (f" | stand-in input for {', '.join(replaced)}" if replaced else ""))
     reports: List[Dict[str, Any]] = []
     for case in cases:
         try:
@@ -481,6 +515,7 @@ def main(argv: Optional[Sequence[str]] = None, run_fn: Optional[RunFn] = None, r
         except cardrun.STOP_ERRORS as exc:
             print(f"P1: stopped: {type(exc).__name__}: {exc}")
             return 2
+        rep["stand_in_input"] = case.label in replaced
         reports.append(rep)
         print(case_line(rep))
         for line in detail_lines(rep):
@@ -524,7 +559,7 @@ def main(argv: Optional[Sequence[str]] = None, run_fn: Optional[RunFn] = None, r
     print(f"P1 {verdict}")
     report = {"schema": "hdc-p1/1", "build_id": a.build_id or None, "run_folder": root.name,
               "this_pc_code": this_pc, "passed": passed, "all_four": all_four, "cases": reports, "auto": auto_rep,
-              "page_text_differences": text_pages}
+              "page_text_differences": text_pages, "stand_in_inputs": replaced}
     cardrun.write_json(root / "parity.json", report)
     cardrun.write_json(apptest / "p1-latest.json", report)
     rdir = cardrun.reports_dir_for(a.build_id or None)

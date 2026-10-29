@@ -508,6 +508,33 @@ class ParityTests(TmpCase):
         self.assertEqual(rc, 1)
         self.assertIn("not all four were run", out)
 
+    def test_main_input_stand_in_for_a_gone_input(self):
+        """r8's own input folder is gone: --input LABEL=PATH checks a stand-in; the path is never printed."""
+        stand_in = self.tmp / "zipsrc" / "made-up folder"
+        stand_in.mkdir(parents=True)
+        run_fn, calls = self._fake_run_fn()
+        rc, out = self._main(run_fn, "--input", f"owner_f3_r8={stand_in}")
+        self.assertEqual(rc, 0, out)
+        cli_inputs = {Path(c[c.index("--out") + 1]).parent.name: c[c.index("--cli") + 1] for c in calls if "--cli" in c}
+        self.assertEqual(cli_inputs["owner_f3_r8"], str(stand_in))
+        self.assertNotEqual(cli_inputs["owner_f9_r8"], str(stand_in))
+        self.assertIn("stand-in input for owner_f3_r8", out)
+        self.assertNotIn("made-up folder", out)
+        latest = json.loads((self.tmp / "apptest" / "local" / "p1-latest.json").read_text(encoding="utf-8"))
+        self.assertEqual(latest["stand_in_inputs"], ["owner_f3_r8"])
+        self.assertTrue(next(c for c in latest["cases"] if c["label"] == "owner_f3_r8")["stand_in_input"])
+        self.assertNotIn("made-up folder", json.dumps(latest))
+        for bad in (["--input", "owner_f3_r8"], ["--input", f"nope={stand_in}"],
+                    ["--input", "owner_f3_r8=relative\\x"], ["--input", f"owner_f3_r8={stand_in / 'gone'}"]):
+            rc, out = self._main(run_fn, *bad)
+            self.assertEqual(rc, 2, (bad, out))
+            self.assertIn("P1: cannot start: ValueError", out)
+
+    def test_a_stand_in_with_another_case_id_fails_run_json(self):
+        rep = self._case(run_app=make_run(case_id="F-00000000000000ff"))
+        self.assertFalse(rep["ok"])
+        self.assertIn("case id differs", rep["run"]["diffs"])
+
     def test_main_stops_cleanly_without_a_card_slot_or_approval(self):
         for exc in (TimeoutError("GPU not available"), cardrun.NotApproved("Q-O1"), cardrun.Busy("one")):
             def run_fn(cmd, timeout, **kw):
@@ -629,6 +656,69 @@ class PolitenessTests(TmpCase):
         self.assertFalse(politeness.judge(6, evs, {}, 0, "EEEE-0000", {"P1": "ABCD-1234"}).passed)
         self.assertTrue(politeness.judge(6, evs, {}, 0, "EEEE-0000", {"P1": None}).passed)
 
+    # -- scenario 7 (G1 review finding 1): the lock during the runner's processor-only "bot" stage
+    def s7_events(self, reserved=110):
+        return [(0.5, {"v": 1, "ev": "hello"}), (5.0, {"v": 1, "ev": "card", "state": "ready"}),
+                (40.0, {"v": 1, "ev": "stage", "key": "names", "state": "start"}),
+                (49.0, {"v": 1, "ev": "stage", "key": "names", "state": "end", "seconds": 9.0}),
+                (50.0, {"v": 1, "ev": "stage", "key": "bot", "state": "start"}),
+                (80.0, {"v": 1, "ev": "stage", "key": "bot", "state": "end", "seconds": 30.0}),
+                (80.1, {"v": 1, "ev": "stage", "key": "bank", "state": "start"}),
+                (80.2, wait_ev("start", lock="other", where="stage", reserved_mb=reserved)),
+                (82.2, wait_ev("tick", waited_s=2.0)), (110.5, wait_ev("end", waited_s=30.3)), (200.0, DONE)]
+
+    MARKS7 = {"t_lock": 50.2, "t_ws": 80.2, "t_rm": 110.2, "t_cancel": None, "bot_seen": 0, "gave_up": False,
+              "free_hold": [5600, 5550, None, 5580], "free_after": 6100}
+
+    def test_scenario_7(self):
+        o = politeness.judge(7, self.s7_events(), dict(self.MARKS7), 0, "ABCD-1234", self.refs)
+        self.assertTrue(o.passed, [(c.name, c.ok, c.detail) for c in o.checks])
+        self.assertEqual((o.facts["footprint_mb"], o.facts["free_hold_min"], o.facts["free_after"]), (550, 5550, 6100))
+        cached = dict(self.MARKS7, free_hold=[3000, 2900, 2950])         # the old app: about 3 GB cached
+        o = politeness.judge(7, self.s7_events(), cached, 0, "ABCD-1234", self.refs)
+        self.assertFalse(o.passed)
+        self.assertEqual([c.name for c in o.checks if not c.ok],
+                         [f"the app held <= {politeness.APP_IDLE_MAX_MB} MB of card memory while the lock existed"])
+        bot = politeness.judge(7, self.s7_events(), dict(cached, bot_seen=2), 0, "ABCD-1234", self.refs)
+        self.assertTrue(bot.passed, "the real bot changes free memory: reported, not failed")
+        unread = politeness.judge(7, self.s7_events(), dict(self.MARKS7, free_hold=[None], free_after=None), 0,
+                                  "ABCD-1234", self.refs)
+        self.assertFalse(unread.passed)
+        self.assertIn("not measured", [c.detail for c in unread.checks if not c.ok])
+        self.assertFalse(politeness.judge(7, self.s7_events(reserved=900), dict(self.MARKS7), 0, "ABCD-1234",
+                                          self.refs).passed)
+        self.assertFalse(politeness.judge(7, self.s7_events(), dict(self.MARKS7, t_lock=None), 0, "ABCD-1234",
+                                          self.refs).passed)
+        self.assertFalse(politeness.judge(7, self.s7_events(), dict(self.MARKS7), 0, "EEEE-0000", self.refs).passed)
+        self.assertEqual(politeness.card_footprint({"free_hold": [True, 4000], "free_after": 4500}), 500)
+        self.assertIsNone(politeness.card_footprint({"free_hold": [4000], "free_after": None}))
+
+    def test_controller_bot_stage_samples_free_memory(self):
+        lock = politeness.FakeLock(self.tmp / "fakelock" / "auto_verify.lock")
+        reads = iter([5600, 5550, 5580, 5590, 6000, 6100, None])
+        slept = []
+        c = politeness.Controller(7, lock, hold_s=6.0, bot_active=lambda: False, free_fn=lambda: next(reads),
+                                  sleep=slept.append)
+        ctl = FakeCtl()
+        c.before_start()
+        c.on_line(1.0, json.dumps({"v": 1, "ev": "stage", "key": "names", "state": "start"}), ctl)
+        self.assertFalse(lock.exists())
+        ctl.t = 2.05
+        c.on_line(2.0, json.dumps({"v": 1, "ev": "stage", "key": "bot", "state": "start"}), ctl)
+        self.assertTrue(lock.exists())
+        self.assertEqual(c.marks["t_lock"], 2.05)
+        for t in (2.5, 3.0, 4.5, 6.5, 8.0):
+            c.on_tick(t, ctl)
+        self.assertTrue(lock.exists())
+        c.on_tick(8.1, ctl)
+        self.assertFalse(lock.exists())
+        self.assertEqual((c.marks["t_rm"], c.marks["free_hold"]), (8.1, [5600, 5550, 5580]))
+        c.finish()
+        self.assertEqual(c.marks["free_after"], 6100)                      # the most of three reads after the end
+        self.assertEqual(slept, [politeness.SETTLE_S] * 2)
+        self.assertFalse(c.marks["gave_up"])
+        self.assertEqual(politeness.ORDER, (6, 1, 2, 3, 7, 5, 4))
+
     def test_controller_page3_hold_and_removal(self):
         lock = politeness.FakeLock(self.tmp / "fakelock" / "auto_verify.lock")
         c = politeness.Controller(2, lock, hold_s=5.0, bot_active=lambda: False)
@@ -719,7 +809,9 @@ class TimingTests(TmpCase):
     def test_summarize_and_targets(self):
         out = self.tmp / "out"
         write_json(out / "checkfacts.json", {"gpu": {"card_calls": 120, "first_read": {"model_load_s": 3.0}}})
-        write_json(out / "run.json", {"timings": {"a": 1.5, "b": 2.5}})
+        write_json(out / "run.json", {"timings": {"a": 1.5, "b": 2.5, "bot": 1.0},
+                                      "reading": {"engine_stats": {"ocr_calls": 44, "ocr_seconds": 151.5,
+                                                                   "cache_hits": 0}}})
         st = {"returncode": 0, "seconds": 131.0, "peak_working_set_mb": 3000.0, "peak_commit_mb": 4000.0,
               "job_peak_process_commit_mb": 4100.0}
         s = timing.summarize(self._events(), st, out)
@@ -728,11 +820,23 @@ class TimingTests(TmpCase):
         self.assertEqual(s["start"]["card_ready"], {"seconds": 14.2, "torch_s": 6.1})
         self.assertEqual(s["calls"], {"card": 120, "processor": 0})
         self.assertEqual(s["memory"]["peak_commit_mb"], 4100.0)
-        self.assertEqual(s["runner_timings_s"], 4.0)
+        self.assertEqual(s["runner_timings_s"], 5.0)
+        self.assertEqual(s["engine"], {"ocr_calls": 44, "ocr_s": 151.5, "cache_hits": 0, "bot_stage_s": 1.0})
+        self.assertEqual(timing.engine_stats(None), {"ocr_calls": None, "ocr_s": None, "cache_hits": None,
+                                                     "bot_stage_s": None})
         r8 = {"total_s": 100.0, "reused": True, "page_texts_s": 200.0}
         self.assertTrue(all(ok for _, ok, _ in timing.targets(s, r8, recheck=False)))
-        heavy = dict(s, memory={"peak_working_set_mb": 1, "peak_commit_mb": 4700.0})
+        # the orchestrator's P5 target: working set <= 3.5 GB fails; commit up to 6 GB passes (G1: 5.4 GB commit)
+        committed = dict(s, memory={"peak_working_set_mb": 1900.0, "peak_commit_mb": 5500.0})
+        self.assertTrue(all(ok for _, ok, _ in timing.targets(committed, r8, False)))
+        heavy = dict(s, memory={"peak_working_set_mb": 3700.0, "peak_commit_mb": 4700.0})
         self.assertFalse(timing.targets(heavy, r8, False)[0][1])
+        self.assertIn("working set", timing.targets(heavy, r8, False)[0][0])
+        over = dict(s, memory={"peak_working_set_mb": 1900.0, "peak_commit_mb": 6200.0})
+        self.assertFalse(timing.targets(over, r8, False)[-1][1])
+        self.assertIn("commit <= 6.0 GB", timing.targets(over, r8, False)[-1][0])
+        unmeasured = dict(s, memory={"peak_working_set_mb": None, "peak_commit_mb": None})
+        self.assertFalse(timing.targets(unmeasured, r8, False)[0][1])
         hot = dict(s, card={"peak_alloc_gb": 2.9, "peak_reserved_gb": 3.1})
         self.assertFalse(timing.targets(hot, r8, False)[1][1])
         slow = dict(s, total_s=400.0)
@@ -770,6 +874,28 @@ class TimingTests(TmpCase):
         self.assertEqual(seen[4], seen[3], "the re-check reuses CHECK_0001's DATA")
         self.assertEqual(rc, 0, buf.getvalue())
         self.assertIn("test1_r8 re-check", buf.getvalue())
+
+    def test_main_input_stand_in(self):
+        runs = self.tmp / "runs"
+        for label, _ in parity.CASES:
+            write_r8(runs, label)
+        app = self.tmp / "app"
+        app.mkdir()
+        (app / "Hangeul Document Checker.exe").write_bytes(b"MZ")
+        stand_in = self.tmp / "stand-in"
+        stand_in.mkdir()
+        inputs = []
+
+        def run_fn(cmd, timeout, *, what=None, env=None, log_dir=None, **kw):
+            inputs.append(cmd[cmd.index("--cli") + 1])
+            return FakeRes([json.dumps(e) for _, e in self._events(p1=len(inputs) <= 4)], seconds=120.0)
+        buf = io.StringIO()
+        with mock.patch.object(cardrun, "APPTEST", self.tmp / "apptest"), contextlib.redirect_stdout(buf):
+            rc = timing.main(["--app-dir", str(app), "--cases", "owner_f9_r8", "--input",
+                              f"owner_f9_r8={stand_in}"], run_fn=run_fn, runs=runs)
+        self.assertEqual(rc, 0, buf.getvalue())
+        self.assertEqual(inputs, [str(stand_in)])
+        self.assertNotIn(str(stand_in), buf.getvalue())
 
 
 # ================================================================================================== 8 b scan
@@ -928,6 +1054,37 @@ class ScanBundleTests(TmpCase):
             f"vendor/openpyxl/x.py\topenpyxl.x\tvendor\t10\t{sha}", f"engine/glue_data.json\t-\tglue\t10\t{sha}"]) + "\n")
         self.assertEqual(scan_bundle.stage_modules(p), {"src", "src.verify.runner.engine"})
 
+    def test_an_exe_without_pyinstaller_cookie_has_no_archive(self):
+        """torch\\bin\\protoc.exe is not a PyInstaller exe: no archive (CArchiveReader would raise
+        ArchiveReadError), a note, no failure. Found without importing PyInstaller."""
+        app = self.make_tree()
+        protoc = app / "_internal" / "torch" / "bin" / "protoc.exe"
+        protoc.parent.mkdir(parents=True)
+        protoc.write_bytes(b"MZ" + b"\0" * 300)
+        self.assertIsNone(scan_bundle.ArchiveSource().pkg_entries(protoc))
+        self.assertFalse(scan_bundle.has_pyi_cookie(protoc, chunk=64))
+        cut = self.tmp / "cookie.bin"                      # the cookie across a chunk boundary is still found
+        cut.write_bytes(b"\1" * 60 + scan_bundle.PYI_COOKIE + b"\2" * 60)
+        self.assertTrue(scan_bundle.has_pyi_cookie(cut, chunk=64))
+
+        class SomeHaveNone(FakeArchives):
+            def __init__(self, pyz, none_for):
+                super().__init__(pyz)
+                self.none_for = none_for
+
+            def pkg_entries(self, exe):
+                return None if Path(exe).name in self.none_for else super().pkg_entries(exe)
+
+        rep = scan_bundle.scan(app, self.tmp / "scan_allow.txt", self.tmp / "STAGE_LIST.txt",
+                               source=SomeHaveNone(base_pyz(), {"protoc.exe"}), chunk=64)
+        self.assertTrue(rep.passed, rep.failures)
+        self.assertIn("_internal/torch/bin/protoc.exe: no PyInstaller archive (scanned raw only)", rep.notes)
+        rep = scan_bundle.scan(app, self.tmp / "scan_allow.txt", self.tmp / "STAGE_LIST.txt",
+                               source=SomeHaveNone(base_pyz(), {"protoc.exe", "Hangeul Document Checker.exe"}),
+                               chunk=64)
+        self.assertIn("Hangeul Document Checker.exe: the app's exe has no PyInstaller archive", rep.failures)
+        self.assertFalse(rep.passed)
+
     def test_main_writes_json(self):
         app = self.make_tree()
         out = self.tmp / "r" / "scan.json"
@@ -1049,6 +1206,22 @@ class DllCheckTests(TmpCase):
         rep = self.make(baseline=F_BASELINE + ["nvrtc64_120_0.dll | driver | made-up driver line"],
                         extra_files=["_internal/torch/lib/nvrtc64_120_0.dll"], env_extra=["nvrtc64_120_0.dll"])
         self.assertIn("nvrtc64_120_0.dll is bundled; it is driver-provided and must come from Windows", rep.failures)
+
+    def test_the_real_baseline_and_allow_files_load(self):
+        """packaging\\dll_baseline.txt and scan_allow.txt as shipped: no format errors; imagehlp.dll (imported by
+        torch\\lib\\libiomp5md.dll, found by the first frozen build) is a system line; the two reviewed third-party
+        scan lines are there."""
+        pkg = Path(dll_check.__file__).resolve().parent.parent
+        lines, errors = dll_check.load_baseline(pkg / "dll_baseline.txt")
+        self.assertEqual(errors, [])
+        hit = dll_check._match("imagehlp.dll", lines, delay=False)
+        self.assertIsNotNone(hit)
+        self.assertFalse(hit.driver or hit.bundle_only or hit.delay_only)
+        allow, errors = scan_bundle.load_allow(pkg / "scan_allow.txt")
+        self.assertEqual(errors, [])
+        keys = {(a.key, a.string) for a in allow}
+        self.assertIn(("networkx.algorithms.dag", "jarvis"), keys)
+        self.assertIn(("setuptools.command.sdist", ".venv"), keys)
 
     def test_real_pefile_reads_a_windows_dll(self):
         target = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "version.dll"

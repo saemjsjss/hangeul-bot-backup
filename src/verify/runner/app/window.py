@@ -558,10 +558,12 @@ class WindowModel:
         except OSError:
             return self._refuse(M.REPORT_NOT_WRITABLE)
         self._reset_run()
+        # ONE check date for the window and the worker: "today" is fixed here, at Check, and written into the job
+        # (the worker would otherwise read its own clock seconds later, after midnight perhaps)
         self.check_date = today or when.date().isoformat()
         self.job = {
             "schema": "hdc-job/1", "job": job_id, "input": os.path.abspath(inp), "program": self.program,
-            "out": str(folder), "today": today, "cache_root": str(self.data_dir / "cache"),
+            "out": str(folder), "today": self.check_date, "cache_root": str(self.data_dir / "cache"),
             "trace_dir": os.path.abspath(self.trace_dir) if self.trace_dir else None,
             "gpu": {"lock_paths": self.lock_paths(), "index": int(_get(self.card_info, "index", 0) or 0),
                     "cap_gb": float(self.d.cap_gb), "need_free_mb": int(self.d.need_free_mb)},
@@ -768,8 +770,22 @@ class WindowModel:
         if isinstance(cpu_calls, int) and cpu_calls > 0:
             notes.append(f"{cpu_calls} large reading step(s) ran on the processor (too large for the graphics "
                          f"card's {float(self.d.cap_gb):.1f} GB cap).")
+        # what can change a verdict against an idle PC: pages read smaller or left to the light reader (card
+        # memory), and time-boxed QR / barcode steps that ran out of time (the done event's counts; the window's
+        # own count of budget events when an older worker sends none)
+        for note in (M.downscaled_note(gpu.get("downscaled") if gpu else 0),
+                     M.skipped_note(gpu.get("skipped") if gpu else 0)):
+            if note:
+                notes.append(note)
+        hits = ev.get("budget_hits")
+        hits = hits if isinstance(hits, int) and not isinstance(hits, bool) else self.budget_hits
+        if M.budget_note(hits):
+            notes.append(M.budget_note(hits))
         if self.progress_note:
             notes.append(self.progress_note)
+        date = ev.get("check_date")                    # the worker's check date (the one in the result code)
+        if isinstance(date, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+            self.check_date = date
         overall = str(ev.get("overall") or "")
         try:
             exit_ = int(ev.get("exit", 0) or 0)
@@ -1058,6 +1074,7 @@ class WindowModel:
         data = {"schema": "hdc-auto/1", "state": state, "error": code if state != "done" else None,
                 "overall": r.overall if (r and state == "done") else None,
                 "code": r.code if (r and state == "done") else None,
+                "check_date": (r.check_date if (r and state == "done") else self.check_date) or None,
                 "exit": self.exit_code, "waits": self.waits, "waited_s": round(self.waited_s, 1),
                 "pages_read_on_card": len(self.page_seconds)}
         path = self.auto.result_path

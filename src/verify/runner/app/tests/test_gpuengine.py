@@ -53,14 +53,22 @@ class Cancelled(BaseException):
 
 class FakeGate:
     """cardgate.CardGate's surface: wait_turn(where) (recorded; raises `exc` on the n-th call with `where` when
-    asked) and on_pause (set by start_card)."""
+    asked), wait_room(where) (recorded in `rooms`; `on_call` sees it as "room:<where>"), on_pause and on_room (set
+    by start_card)."""
 
     def __init__(self, raise_at=None, exc=Cancelled, on_call=None):
         self.calls = []
+        self.rooms = []
         self.raise_at = raise_at
         self.exc = exc
         self.on_call = on_call
         self.on_pause = lambda: 0
+        self.on_room = lambda: None
+
+    def wait_room(self, where):
+        self.rooms.append(where)
+        if self.on_call is not None:
+            self.on_call("room:" + where)
 
     def wait_turn(self, where):
         self.calls.append(where)
@@ -323,7 +331,7 @@ class FirstReadTests(_Dir):
         self.assertEqual(len(self.made), 1)
         self.assertIsNone(self.made[0]())                                 # the reader is gone
         self.assertEqual(GE.reading_note(fr), GE.NOTE_BASE + "; 1 page(s) left to the light reader (too large for "
-                         "the cap)")
+                         "the cap); 1 page(s) read smaller (card memory)")
 
     def test_folder_with_a_non_ascii_picture(self):
         folder = self.dir / NON_ASCII
@@ -466,6 +474,100 @@ class FirstReadTests(_Dir):
         self.assertFalse(Path(str(self.store(src)) + ".tmp").exists())
 
 
+    # -- G1 review finding 3: what an earlier check's page-texts file may give this check
+    def pages_of(self, src) -> dict:
+        return {p["page"]: p for p in self.load(src)["files"][0]["pages"]}
+
+    def test_a_page_read_smaller_is_read_again_at_full_size(self):
+        pdf = make_pdf(self.dir / "bundle.pdf", 4, layer_pages=(1,))
+        src = source("bundle", [pdf])
+        dv = FakeDV(shapes={4: (2100, 30)})
+        fr = self.run_fr(src, dv, FakeGate(), self.factory(oom={4: 2}), build_id="b1")   # retry, then 2000 px
+        self.assertEqual(fr["downscaled"], 1)
+        self.assertEqual(self.pages_of(src)[4]["downscaled"], 2000)
+        self.assertEqual(self.load(src)[GE.BUILD_KEY], "b1")
+        log = []
+        fr = self.run_fr(src, dv, FakeGate(), self.factory(log=log), build_id="b1")      # the card is free now
+        self.assertEqual(log, [(4, (2100, 30))])                          # only page 4, at full size
+        self.assertEqual((fr["pending"], fr["reused"], fr["reread_downscaled"], fr["downscaled"]), (1, 3, 1, 0))
+        pages = self.pages_of(src)
+        self.assertNotIn("downscaled", pages[4])
+        self.assertEqual(pages[4]["text"], "MADE-UP PAGE 4 filler filler filler filler")
+        self.assertTrue(self.load(src)["complete"])
+        self.assertEqual(GE.reading_note(fr), GE.NOTE_BASE)
+
+    def test_a_page_cut_down_again_keeps_its_mark(self):
+        pdf = make_pdf(self.dir / "bundle.pdf", 3, layer_pages=(1,))
+        src = source("bundle", [pdf])
+        dv = FakeDV(shapes={3: (2100, 30)})
+        self.run_fr(src, dv, FakeGate(), self.factory(oom={3: 2}), build_id="b1")
+        log = []
+        fr = self.run_fr(src, dv, FakeGate(), self.factory(log=log, oom={3: 2}), build_id="b1")  # still too large
+        self.assertEqual(log, [(3, (2100, 30)), (3, (2100, 30)), (3, (2000, 29))])
+        self.assertEqual((fr["reread_downscaled"], fr["downscaled"]), (1, 1))
+        self.assertEqual(self.pages_of(src)[3]["downscaled"], 2000)        # the mark is never lost
+        self.assertEqual(GE.reading_note(fr), GE.NOTE_BASE + "; 1 page(s) read smaller (card memory)")
+
+    def test_a_skipped_picture_or_page_is_read_again(self):
+        pdf = make_pdf(self.dir / "bundle.pdf", 2, layer_pages=(1,))
+        src = source("bundle", [pdf])
+        dv = FakeDV()
+        fr = self.run_fr(src, dv, FakeGate(), self.factory(oom={2: -1}), build_id="b1")
+        self.assertEqual(fr["skipped"], 1)
+        log = []
+        fr = self.run_fr(src, dv, FakeGate(), self.factory(log=log), build_id="b1")
+        self.assertEqual(log, [(2, (40, 30))])
+        self.assertEqual((fr["skipped"], fr["complete"]), (0, True))
+
+    def test_another_build_or_engine_reads_every_page_again(self):
+        pdf = make_pdf(self.dir / "bundle.pdf", 3, layer_pages=(1,))
+        src = source("bundle", [pdf])
+        dv = FakeDV()
+        self.run_fr(src, dv, FakeGate(), self.factory(), build_id="b1")
+        log = []
+        fr = self.run_fr(src, dv, FakeGate(), self.factory(log=log), build_id="b2")
+        self.assertEqual(log, [(2, (40, 30)), (3, (40, 30))])
+        self.assertEqual((fr["pending"], fr["reused"], fr["stale_store"]), (3, 0, True))
+        self.assertEqual(self.load(src)[GE.BUILD_KEY], "b2")
+        d = self.load(src)                                                # gpuread's own engine label
+        d["engine"] = GR.ENGINE_LABEL
+        self.store(src).write_text(json.dumps(d), encoding="utf-8")
+        log.clear()
+        fr = self.run_fr(src, dv, FakeGate(), self.factory(log=log), build_id="b2")
+        self.assertEqual((len(log), fr["stale_store"]), (2, True))
+        log.clear()
+        fr = self.run_fr(src, dv, FakeGate(), self.factory(log=log), build_id="b2")   # same build: nothing read
+        self.assertEqual((log, fr["pending"], fr["stale_store"], fr["model_loaded"]), ([], 0, False, False))
+
+    def test_the_default_build_id_is_this_builds(self):
+        from src.verify.runner.app import version
+        src = source("bundle", [make_pdf(self.dir / "bundle.pdf", 2, layer_pages=(1,))])
+        self.run_fr(src, FakeDV(), FakeGate(), self.factory())
+        self.assertEqual(GE.current_build_id(), str(version.BUILD_ID))
+        self.assertEqual(self.load(src)[GE.BUILD_KEY], str(version.BUILD_ID))
+
+
+class UsableDoneTests(unittest.TestCase):
+    def test_rules(self):
+        def page(n, **kw):
+            return {"page": n, "text": "made-up", "kind": "ocr", "sideways": False, "seconds": 1.0, **kw}
+        done = {"schema": GR.SCHEMA, "engine": GE.APP_ENGINE_LABEL, GE.BUILD_KEY: "b1", "case_id": "B-x",
+                "files": [{"name": "a.pdf", "n_pages": 3,
+                           "pages": [page(1), page(2, downscaled=2000), page(3, downscaled=1600)]},
+                          {"name": "b.png", "n_pages": 1, "pages": [page(1)]}]}
+        out, left = GE.usable_done(done, "b1")
+        self.assertEqual([[p["page"] for p in e["pages"]] for e in out["files"]], [[1], [1]])
+        self.assertEqual(left, {"stale": 0, "downscaled": 2})
+        self.assertEqual((out["case_id"], out["engine"]), ("B-x", GE.APP_ENGINE_LABEL))
+        self.assertEqual(len(done["files"][0]["pages"]), 3)                # the loaded dict is not changed
+        self.assertEqual(GE.usable_done(done, "b2"), ({}, {"stale": 1, "downscaled": 0}))
+        self.assertEqual(GE.usable_done({**done, "engine": GR.ENGINE_LABEL}, "b1"), ({}, {"stale": 1,
+                                                                                          "downscaled": 0}))
+        no_build = {k: v for k, v in done.items() if k != GE.BUILD_KEY}  # a file from before this rule
+        self.assertEqual(GE.usable_done(no_build, "b1")[1]["stale"], 1)
+        self.assertEqual(GE.usable_done({}, "b1"), ({}, {"stale": 0, "downscaled": 0}))
+
+
 class GatedReaderTests(_Dir):
     def setUp(self):
         super().setUp()
@@ -489,6 +591,22 @@ class GatedReaderTests(_Dir):
         self.assertEqual(log, [(7, (40, 30)), (7, (40, 30))])
         self.assertEqual(gate.calls, ["read", "oom"])
         self.assertEqual((g.oom_retries, self.card.pauses, self.torch.cuda.syncs), (1, 1, 1))
+
+    def test_room_on_the_card_before_the_retry(self):
+        order = []
+        gate = FakeGate(on_call=order.append)
+        g = GE.GatedReader(FakePageReader(oom={7: 1}), gate, self.card, None)
+        self.assertEqual(g.readtext(page_array(7), detail=0)[0], "MADE-UP PAGE 7")
+        self.assertEqual(order, ["read", "oom", "room:oom"])              # pause, the bot's turn, room, retry
+        self.assertEqual(gate.rooms, ["oom"])
+        g = GE.GatedReader(FakePageReader(), gate, self.card, None)
+        g.readtext(page_array(8), detail=0)
+        self.assertEqual(gate.rooms, ["oom"])                             # no room check without an OOM
+
+    def test_a_gate_without_wait_room(self):
+        g = GE.GatedReader(FakePageReader(oom={7: 1}), SimpleNamespace(wait_turn=lambda where: None), self.card,
+                           None)
+        self.assertEqual(g.readtext(page_array(7), detail=0)[0], "MADE-UP PAGE 7")
 
     def test_a_second_oom_goes_on(self):
         g = GE.GatedReader(FakePageReader(oom={7: 2}), FakeGate(), self.card, None)
@@ -644,6 +762,8 @@ class StartCardTests(unittest.TestCase):
         self.assertEqual(device, 0)
         self.assertEqual(torch.flag_sets, [])                             # torch's defaults, never set
         self.assertIs(gate.on_pause.__self__, card)
+        self.assertIs(gate.on_room.__self__, card)
+        self.assertEqual(gate.on_room(), 3072 - 180 + GE.ROOM_HEADROOM_MB)
         self.assertEqual(gate.on_pause(), 180)
         self.assertEqual(torch.cuda.calls[-2:], ["synchronize", "empty_cache"])
         self.assertEqual(card.notes, [])
@@ -788,6 +908,14 @@ class TorchSessionTests(unittest.TestCase):
         st = s.stats()
         self.assertEqual((st["calls_card"], st["calls_cpu"], st["oom_retries"]), (1, 0, 1))
 
+    def test_room_on_the_card_before_the_retry(self):
+        order = []
+        self.gate.on_call = order.append
+        s = self.session(fn=det_fn(None, {"oom": 1}))
+        s.run(None, {"image": np.zeros((1, 3, 8, 8), dtype=np.float32)})
+        self.assertEqual(order, ["det", "det", "oom", "room:oom"])
+        self.assertEqual(self.gate.rooms, ["oom"])
+
     def test_a_second_oom_runs_that_call_on_the_processor(self):
         log, state = [], {"oom": 2}
         s = self.session(fn=det_fn(log, state))
@@ -799,6 +927,52 @@ class TorchSessionTests(unittest.TestCase):
         self.assertEqual((st["calls_card"], st["calls_cpu"], st["cpu_reasons"]), (0, 1, {"oom": 1}))
         s.run(None, {"image": np.zeros((1, 3, 8, 8), dtype=np.float32)})   # the next call is on the card again
         self.assertEqual(log[-1], "cuda")
+
+    def test_the_oom_retry_runs_the_detector_lean(self):
+        """G2 (P5): the retry after an out-of-memory runs the detector through lean_detector_scores (the same
+        numbers with less card memory at the peak: f9's and the EAP folder's 2560-pixel detections fit the cap),
+        counted as calls_lean; the first attempt is the module itself."""
+        log, state, lean = [], {"oom": 1}, []
+
+        def fake_lean(torch, module, xt):
+            lean.append((torch is self.torch, xt.device))
+            return module(xt)
+        s = self.session(fn=det_fn(log, state))
+        with mock.patch.object(GE, "lean_detector_scores", fake_lean):
+            out = s.run(None, {"image": np.zeros((1, 3, 8, 8), dtype=np.float32)})
+            self.assertTrue((out[0] == 0.25).all())
+            self.assertEqual(log, ["cuda", "cuda"])
+            self.assertEqual(lean, [(True, "cuda")])
+            st = s.stats()
+            self.assertEqual((st["calls_card"], st["calls_lean"], st["calls_cpu"], st["oom_retries"]), (1, 1, 0, 1))
+            s.run(None, {"image": np.zeros((1, 3, 8, 8), dtype=np.float32)})     # no OOM: the module itself
+            self.assertEqual(len(lean), 1)
+            r = self.session("rec", fn=lambda a, d: (state.update(oom=0), rec_fn(a, d))[1])
+            r.run(None, {"image": np.zeros((1, 1, 64, 40), dtype=np.float32)})
+            self.assertEqual(r.stats()["calls_lean"], 0)
+
+    def test_a_lean_retry_that_runs_out_too_goes_to_the_processor_lean(self):
+        log, state, lean = [], {"oom": 2}, []
+
+        def fake_lean(torch, module, xt):
+            lean.append(xt.device)
+            return module(xt)
+        s = self.session(fn=det_fn(log, state))
+        with mock.patch.object(GE, "lean_detector_scores", fake_lean), self.assertLogs(GE.LOG, "WARNING"):
+            out = s.run(None, {"image": np.zeros((1, 3, 8, 8), dtype=np.float32)})
+        self.assertTrue((out[0] == 0.5).all())
+        self.assertEqual(log, ["cuda", "cuda", "cpu"])
+        self.assertEqual(lean, ["cuda", "cpu"])                 # the processor's detector pass is lean as well
+        st = s.stats()
+        self.assertEqual((st["calls_card"], st["calls_lean"], st["calls_cpu"]), (0, 0, 1))
+
+    def test_lean_applies_only_to_a_detector_over_craft(self):
+        self.assertIsNone(GE.lean_detector_scores(self.torch, FT.FakeNet(det_fn()), None))
+        self.assertIsNone(GE.lean_detector_scores(self.torch, SimpleNamespace(net=FT.FakeNet(det_fn())), None))
+        log, state = [], {"oom": 1}
+        s = self.session(fn=det_fn(log, state))                 # a FakeNet: the retry runs the module itself
+        s.run(None, {"image": np.zeros((1, 3, 8, 8), dtype=np.float32)})
+        self.assertEqual((log, s.stats()["calls_lean"]), (["cuda", "cuda"], 0))
 
     def test_the_processor_can_be_turned_off(self):
         s = self.session(fn=det_fn(None, {"oom": 2}), allow_cpu=False)
@@ -839,6 +1013,105 @@ class TorchSessionTests(unittest.TestCase):
     def test_kind(self):
         with self.assertRaises(ValueError):
             GE.TorchSession("cls", FT.FakeNet(rec_fn), self.card, self.gate)
+
+
+class CardMemoryBetweenCallsTests(unittest.TestCase):
+    """G1 review finding 1 (R2.1.5): after every call on the card torch's cache is given back above CACHE_KEEP_MB,
+    so the app never sits on cached card memory between two light-reader calls (the runner's processor stretches
+    last up to a minute, and the bot's check may start in one)."""
+
+    def test_release_only_above_the_keep_size(self):
+        torch = FT.FakeTorch(reserved_mb=GE.CACHE_KEEP_MB)
+        card = GE.Card(torch)
+        self.assertFalse(card.release())
+        self.assertEqual(torch.cuda.calls, [])
+        torch.cuda.reserved = (GE.CACHE_KEEP_MB + 1) * FT.MIB
+        self.assertTrue(card.release())
+        self.assertEqual(torch.cuda.calls, ["empty_cache"])               # no synchronize, no gc pause
+        self.assertEqual((card.releases, card.pauses), (1, 0))
+
+    def test_room(self):
+        self.assertEqual(GE.Card(FT.FakeTorch(reserved_mb=180)).room_mb(), 3072 - 180 + GE.ROOM_HEADROOM_MB)
+        self.assertEqual(GE.Card(FT.FakeTorch(reserved_mb=4000)).room_mb(), GE.ROOM_HEADROOM_MB)
+        self.assertEqual(GE.Card(FT.FakeTorch(reserved_mb=0), cap_gb=3.0).room_mb(), 3072 + 512)
+
+    def test_large_calls_leave_nothing_cached(self):
+        torch = FT.FakeTorch(reserved_mb=110)
+        torch.cuda.after_empty_mb = 110                                   # the weights stay
+        card = GE.Card(torch)
+        turns = []
+        gate = FakeGate(on_call=lambda where: turns.append((where, torch.cuda.empties)))
+
+        def fn(arr, device):
+            if device == "cuda":
+                torch.cuda.reserved = 2900 * FT.MIB                       # a page-size detection's activations
+            b, _c, h, w = arr.shape
+            return np.zeros((b, h // 2, w // 2, 2), dtype=np.float32)
+        s = GE.TorchSession("det", FT.FakeNet(fn), card, gate)
+        for _ in range(3):
+            out = s.run(None, {"image": np.zeros((1, 3, 8, 8), dtype=np.float32)})
+            self.assertEqual(out[0].shape, (1, 4, 4, 2))
+            self.assertLessEqual(torch.cuda.memory_reserved(), GE.CACHE_KEEP_MB * FT.MIB)
+        self.assertEqual(turns, [("det", 0), ("det", 0), ("det", 1), ("det", 2)])   # the turn, the call, release
+        self.assertEqual((s.stats()["releases"], card.releases, torch.cuda.syncs), (3, 3, 0))
+
+    def test_small_calls_keep_their_small_cache(self):
+        torch = FT.FakeTorch(reserved_mb=180)
+        card = GE.Card(torch)
+        s = GE.TorchSession("rec", FT.FakeNet(rec_fn), card, FakeGate())
+        s.run(None, {"image": np.zeros((2, 1, 64, 40), dtype=np.float32)})
+        self.assertEqual((s.stats()["releases"], torch.cuda.empties), (0, 0))
+
+    def test_the_light_reader_reports_its_releases(self):
+        torch = FT.FakeTorch(reserved_mb=2900)
+        torch.cuda.after_empty_mb = 2900                                  # stays high: every call releases
+        card = GE.Card(torch)
+        det = GE.TorchSession("det", FT.FakeNet(det_fn()), card, FakeGate())
+        det.run(None, {"image": np.zeros((1, 3, 8, 8), dtype=np.float32)})
+        reader = SimpleNamespace(det=det, rec=GE.TorchSession("rec", FT.FakeNet(rec_fn), card, FakeGate()))
+        st = GE.card_light_reader_class().stats(reader)
+        self.assertEqual((st["releases"], st["det"]["releases"], st["rec"]["releases"]), (1, 1, 0))
+
+
+class RealGateTests(_Dir):
+    """G1 review findings 1 and 2 across modules: the REAL card gate (a made-up lock file, a fake clock) with a Card
+    from start_card (fake torch) and a TorchSession."""
+
+    def test_a_lock_between_two_calls_then_room_then_the_call(self):
+        from src.verify.runner.app import cardgate as CG
+        lock = self.dir / "made-up.lock"
+        clock = {"t": 1000.0}
+        events, free_reads = [], iter([2500, 3600])
+
+        def sleep(s):
+            clock["t"] += s
+            if lock.exists():
+                lock.unlink()                                             # the made-up bot ends after one poll
+        gate = CG.CardGate([str(lock)], lambda ev, **f: events.append((f.get("why"), f.get("state"))),
+                           free_mb=lambda: next(free_reads), clock=lambda: clock["t"], sleep=sleep)
+        torch = FT.FakeTorch(reserved_mb=110)
+        torch.cuda.after_empty_mb = 110
+        with card_env():
+            card = GE.start_card(StartCardTests.INFO, gate, torch_loader=lambda: torch)
+
+        def fn(arr, device):
+            if device == "cuda":
+                torch.cuda.reserved = 2900 * FT.MIB
+            b, _c, h, w = arr.shape
+            return np.zeros((b, h // 2, w // 2, 2), dtype=np.float32)
+        s = GE.TorchSession("det", FT.FakeNet(fn), card, gate)
+        x = {"image": np.zeros((1, 3, 8, 8), dtype=np.float32)}
+        s.run(None, x)
+        self.assertEqual(torch.cuda.memory_reserved(), 110 * FT.MIB)       # nothing cached after the call
+        lock.write_bytes(b"")                                             # the made-up bot starts between calls
+        clock["t"] += 1.0
+        s.run(None, x)
+        self.assertEqual(events[:2], [("lock", "start"), ("lock", "end")])
+        self.assertEqual((events[2], events[-1]), (("memory", "start"), ("memory", "end")))
+        st = gate.stats()
+        self.assertEqual((st["room_checks"], st["room_short"], st["free_mb"]), (1, 0, 3600))
+        self.assertEqual((s.stats()["calls_card"], s.stats()["releases"]), (2, 2))
+        self.assertEqual(card.room_mb(), 3072 - 110 + GE.ROOM_HEADROOM_MB)
 
 
 class _StubbornFlags:
@@ -1010,6 +1283,15 @@ class ErrorCodeTests(unittest.TestCase):
         self.assertEqual((e.code, e.values, str(e)), (GE.CARD_NOT_SUPPORTED, {"name": FT.CARD_NAME, "which": "old"},
                                                       GE.CARD_NOT_SUPPORTED))
 
+    def test_reading_note_counts_pages_read_smaller(self):
+        self.assertEqual(GE.reading_note({"downscaled": 2}), GE.NOTE_BASE + "; 2 page(s) read smaller (card memory)")
+        self.assertEqual(GE.reading_note({"skipped": 1, "downscaled": 2}),
+                         GE.NOTE_BASE + "; 1 page(s) left to the light reader (too large for the cap)"
+                         "; 2 page(s) read smaller (card memory)")
+        big = GE.reading_note({"skipped": 12345, "downscaled": 67890})
+        self.assertLessEqual(len(big), GE.NOTE_MAX)
+        self.assertTrue(big.endswith("; 12345 page(s) left to the light reader; 67890 read smaller"))
+
     def test_reading_note(self):
         self.assertEqual(GE.reading_note({"skipped": 0}), GE.NOTE_BASE)
         self.assertEqual(GE.reading_note(None), GE.NOTE_BASE)
@@ -1078,6 +1360,50 @@ class SourceParityTests(unittest.TestCase):
         for line in ("with torch.inference_mode():", "xt = torch.from_numpy(x).to(self.device)",
                      "out = y.contiguous().cpu().numpy()"):
             self.assertIn(line, src)
+
+
+ONNX_PY = Path(r"C:\Hangeul\DOCCHECK\lab\onnx\.venv\Scripts\python.exe")
+_LEAN_CHECK = r"""
+import sys
+sys.dont_write_bytecode = True
+sys.path.insert(0, sys.argv[1])                      # -I: the worktree is not on the path by itself
+import torch
+from easyocr.craft import CRAFT
+from src.verify.runner.app import gpuengine as GE
+assert not torch.cuda.is_initialized()
+torch.manual_seed(3)
+net = CRAFT(pretrained=False).eval()
+MeanPool, DetectorOut, RecognizerOut, load_reader = GE.export_modules(torch, None, "unused")
+det = DetectorOut(net).eval()
+res = []
+for shape in ((1, 3, 96, 128), (1, 3, 100, 70), (2, 3, 64, 96)):
+    x = torch.rand(shape) * 4 - 2
+    with torch.inference_mode():
+        a = det(x)
+        b = GE.lean_detector_scores(torch, det, x)
+    res.append(bool(a.shape == b.shape and torch.equal(a, b)))
+class Other(torch.nn.Module):
+    def forward(self, x):
+        return x
+res.append(GE.lean_detector_scores(torch, DetectorOut(Other()), x) is None)
+res.append(not torch.cuda.is_initialized())
+print(res)
+"""
+
+
+@unittest.skipUnless(ONNX_PY.is_file(), "lab\\onnx\\.venv (real torch and easyocr) is not on this PC")
+class LeanDetectorRealTorchTests(unittest.TestCase):
+    """lean_detector_scores against DetectorOut(CRAFT) itself, on the PROCESSOR with real torch and easyocr (a
+    child of lab\\onnx\\.venv's Python, -I -B: read-only, no CUDA (CUDA_VISIBLE_DEVICES=-1), random weights, made-up
+    inputs, odd sizes so the decoder's interpolations are not exact halvings): bit for bit equal."""
+
+    def test_lean_is_the_same_forward(self):
+        env = dict(os.environ, **{GE.NO_CARD_ENV: "1", "CUDA_VISIBLE_DEVICES": "-1", "PYTHONDONTWRITEBYTECODE": "1"})
+        r = subprocess.run([str(ONNX_PY), "-I", "-B", "-c", _LEAN_CHECK, str(WORKTREE)], cwd=str(WORKTREE), env=env,
+                           capture_output=True, text=True, timeout=600,
+                           creationflags=0x00004000 if os.name == "nt" else 0)
+        self.assertEqual(r.returncode, 0, r.stderr[-800:])
+        self.assertEqual(r.stdout.strip().splitlines()[-1], "[True, True, True, True, True]")
 
 
 class HygieneTests(unittest.TestCase):

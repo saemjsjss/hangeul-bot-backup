@@ -12,7 +12,9 @@ Two phases of one worker process use the card:
   modules on the card in strict float32 (``light_reader`` -> ``CardLightReader`` over two ``TorchSession``s), loaded
   exactly as the lab GPU worker loaded them (``load_models``: gpu_worker's / export_onnx.py's definitions verbatim).
   One model call that does not fit the cap even after waiting and freeing runs on the processor with the same
-  weights (G4, owner question Q4); it is counted.
+  weights (G4, owner question Q4); it is counted. After every call on the card the session gives torch's card cache
+  back when torch reserves more than ``CACHE_KEEP_MB`` (``Card.release``), so between two calls (and through the
+  runner's long processor stretches) this process holds no more card memory than during a wait for the bot.
 
 torch and easyocr are imported only inside functions, through injectable loaders (the unit tests pass fakes; the
 default loaders refuse under ``HDC_TEST_NO_CARD``). No CPU OCR engine: onnxruntime is never imported here.
@@ -24,11 +26,13 @@ Contract for the other tasks (T defines it; W and D use it):
     CAP_GB, APP_ENGINE_LABEL, NO_CARD_ENV
     CardRefused(code, values)                                  .code, .values (names, GB numbers; never paths)
     start_card(info, gate, cap_gb=3.0, torch_loader=None, easyocr_loader=None) -> Card     (sets gate.on_pause)
-    Card: .torch, .pause() -> reserved MB, .free(), .peaks() -> (alloc GB, reserved GB), .facts() -> dict
+    Card: .torch, .pause() -> reserved MB, .free(), .release() -> bool, .room_mb() -> MB,
+          .peaks() -> (alloc GB, reserved GB), .facts() -> dict                       (sets gate.on_room too)
     first_read(card, bot, src, gate, store, emit=None, *, model_dir=None, user_dir=None, ascii_dir=None,
-               reader_factory=None) -> dict (counts only)
+               reader_factory=None, build_id=None) -> dict (counts only)
     light_reader(card, gate, glue_data, model_dir, *, user_dir=None, ascii_dir=None) -> CardLightReader
-        (.stats() -> {"card_calls", "cpu_calls", "oom_retries", "det": {...}, "rec": {...}}, .flags, .facts)
+        (.stats() -> {"card_calls", "cpu_calls", "oom_retries", "releases", "det": {...}, "rec": {...}},
+         .flags, .facts)
     TorchSession(kind, cpu_module, card, gate).run(None, {"image": x}) -> [np.ndarray]; .stats()
     card_error_code(e) -> Optional[str];  reading_note(fr) -> str (<= 200 characters)
     ascii_path(image, ascii_dir) -> image or an ASCII path (relative to the working folder when it can be)
@@ -88,6 +92,15 @@ INPUT_NAME = "image"
 NOTE_BASE = (f"app GPU build: first read on the graphics card (bot EasyOCR, {CAP_GB:.1f} GB cap); "
              "light reader on the card")
 NOTE_MAX = 200
+# R2.1.5: after a model call in phase 2 torch's card cache is given back when torch reserves more than this (the
+# weights of the light reader's two networks are about 100 MB; this is also P4's target during a wait)
+CACHE_KEEP_MB = 256
+# R2.2 wait_room: before it resumes after a wait, this process wants free card memory of what it may still take up
+# to its cap plus this much (the start needs 4.0 GB = the 3.0 GB cap + the CUDA context + headroom)
+ROOM_HEADROOM_MB = 512
+# the page-texts file (DATA\cache\pagetexts\<case_id>.json) names the build that wrote it; a file of another build
+# or engine label is not reused (R2.1.2)
+BUILD_KEY = "app_build"
 _MIB = 1024 * 1024
 _GIB = 1024 ** 3
 
@@ -230,6 +243,7 @@ class Card:
         self.notes = list(notes)
         self.easyocr_loader = easyocr_loader or _import_easyocr
         self.pauses = 0
+        self.releases = 0
 
     def import_easyocr(self):
         return self.easyocr_loader()
@@ -250,6 +264,24 @@ class Card:
         empty = getattr(self.torch.cuda, "empty_cache", None)
         if callable(empty):
             empty()
+
+    def release(self) -> bool:
+        """After a model call in phase 2 (TorchSession): when torch reserves more than CACHE_KEEP_MB, give its card
+        cache back (``empty_cache``; no gc and no synchronize: the call's ``.cpu()`` waited for the card and the
+        call's tensors are gone). The weights stay. Freeing changes no number: the next call allocates again.
+        Returns True when the cache was emptied."""
+        cuda = self.torch.cuda
+        if int(cuda.memory_reserved()) <= CACHE_KEEP_MB * _MIB:
+            return False
+        cuda.empty_cache()
+        self.releases += 1
+        return True
+
+    def room_mb(self) -> int:
+        """The gate's on_room: the free card memory (MB) this process wants before it resumes after a wait, i.e.
+        what it may still take up to its cap (cap minus what torch reserves now) plus ROOM_HEADROOM_MB."""
+        reserved = int(self.torch.cuda.memory_reserved()) // _MIB
+        return max(0, int(round(self.cap_gb * 1024)) - reserved) + ROOM_HEADROOM_MB
 
     def peaks(self) -> Tuple[float, float]:
         cuda = self.torch.cuda
@@ -321,7 +353,7 @@ def start_card(info: Any, gate: Any, cap_gb: float = CAP_GB, torch_loader: Optio
     "which" old/new); ``set_per_process_memory_fraction(cap GiB / total * 0.999, 0)``; the allocator backend
     "native" (only it enforces the fraction; else CARD_FAILED); torch's precision flags at their defaults (asserted,
     never set: RuntimeError otherwise). A card name, total or capability that differs from NVML's is noted, not fatal.
-    Sets ``gate.on_pause = card.pause``."""
+    Sets ``gate.on_pause = card.pause`` and ``gate.on_room = card.room_mb``."""
     if _no_card():                                              # before any torch import
         raise CardRefused(NO_NVIDIA_CARD, {})
     names = _env_names(os.environ)
@@ -378,7 +410,15 @@ def start_card(info: Any, gate: Any, cap_gb: float = CAP_GB, torch_loader: Optio
                 nvml_index=int(getattr(info, "index", 0) or 0), backend=backend, arch_list=arch_list,
                 import_s=import_s, cuda_s=cuda_s, notes=notes, easyocr_loader=easyocr_loader)
     gate.on_pause = card.pause
+    gate.on_room = card.room_mb
     return card
+
+
+def _wait_room(gate: Any, where: str) -> None:
+    """gate.wait_room(where) when the gate has it (cardgate.CardGate does; a plain test gate may not)."""
+    fn = getattr(gate, "wait_room", None)
+    if callable(fn):
+        fn(where)
 
 
 # ----------------------------------------------------------------------------------------- non-ASCII paths
@@ -437,9 +477,10 @@ def ascii_path(image: Any, ascii_dir: Optional[str] = None) -> Any:
 # ---------------------------------------------------------------------------------- phase 1: the first read
 class GatedReader:
     """The bot's EasyOCR reader inside the card gate (phase 1). ``readtext``: the gate's turn ("read"), the image
-    path made ASCII, the call; on a card out-of-memory, ONCE: ``card.pause()``, the gate's turn ("oom"), the same
-    call again at full size. A second out-of-memory error goes on to gpuread's ladder or the bot's own handling, as
-    in DEV. Every other attribute is the inner reader's."""
+    path made ASCII, the call; on a card out-of-memory, ONCE: ``card.pause()``, the gate's turn ("oom"), room on the
+    card (``gate.wait_room("oom")``: another program may still hold memory), the same call again at full size. A
+    second out-of-memory error goes on to gpuread's ladder or the bot's own handling, as in DEV. Every other
+    attribute is the inner reader's."""
 
     def __init__(self, inner: Any, gate: Any, card: Any, ascii_dir: Optional[str] = None) -> None:
         self.inner = inner
@@ -462,6 +503,7 @@ class GatedReader:
         self.oom_retries += 1
         self.card.pause()
         self.gate.wait_turn("oom")
+        _wait_room(self.gate, "oom")
         self.calls += 1
         return self.inner.readtext(image, *args, **kw)
 
@@ -537,25 +579,62 @@ def _reused_keys(done: Mapping[str, Any], src: Any) -> set:
     return keys
 
 
+def current_build_id() -> str:
+    """This build's id (version.BUILD_ID; "dev" when it cannot be read)."""
+    try:
+        from . import version
+        return str(version.BUILD_ID or "dev")
+    except Exception:
+        return "dev"
+
+
+def usable_done(done: Mapping[str, Any], build_id: str) -> Tuple[Dict[str, Any], Dict[str, int]]:
+    """The part of an earlier check's page-texts file that this check may reuse, and what was left out (counts).
+
+    Nothing is reused from a file another engine or another build wrote (its engine label or ``app_build`` differ):
+    a later build with a corrected first read reads every page again. A page that was read SMALLER ("downscaled",
+    after the card ran out of memory) is never reused: it is read again at full size, and when it is cut down again
+    the new record carries the mark itself. (gpuread's _previous rebuilds reused pages without that key, so reusing
+    one would lose it.) The other pages and the file's other fields are kept as they were."""
+    if not isinstance(done, Mapping) or not done:
+        return {}, {"stale": 0, "downscaled": 0}
+    if done.get("engine") != APP_ENGINE_LABEL or done.get(BUILD_KEY) != build_id:
+        return {}, {"stale": 1, "downscaled": 0}
+    out = dict(done)
+    files = []
+    dropped = 0
+    for e in done.get("files") or []:
+        if isinstance(e, dict):
+            pages = e.get("pages") or []
+            keep = [p for p in pages if not (isinstance(p, dict) and p.get("downscaled"))]
+            dropped += len(pages) - len(keep)
+            e = {**e, "pages": keep}
+        files.append(e)
+    out["files"] = files
+    return out, {"stale": 0, "downscaled": dropped}
+
+
 def first_read(card: Card, bot: Any, src: Any, gate: Any, store: Any, emit: Optional[Callable[..., None]] = None,
                *, model_dir: Any = None, user_dir: Any = None, ascii_dir: Optional[str] = None,
-               reader_factory: Optional[Callable[[], Any]] = None) -> Dict[str, Any]:
+               reader_factory: Optional[Callable[[], Any]] = None, build_id: Optional[str] = None) -> Dict[str, Any]:
     """Phase 1 (R2.1.2): every page of ``src`` read by the bot's EasyOCR on the card through the REAL
     ``gpuread.read_all``, into ``store`` (runner-page-texts/1, engine APP_ENGINE_LABEL, rewritten atomically after
     every page; one ``page`` event per page read).
 
     Pages read by an earlier check of the same input (gpuread.load_done: same names, sha256 and page counts) are
-    reused; with nothing pending no reader is made and read_all only rebuilds the file. Between pages the gate's
+    reused, except what ``usable_done`` leaves out (another build's or engine's file; pages read smaller); with
+    nothing pending no reader is made and read_all only rebuilds the file. Between pages the gate's
     turn ("page"); before every model call GatedReader's. In a ``finally``: ``bot.dv._reader = None``, the reader
     dropped, ``card.free()``. A Cancelled (or any error) leaves the partial file saved (read_all saves, then raises)
     and the next check resumes from it. Returns counts only (no text).
     ``model_dir`` defaults to places' models_dir, ``user_dir`` to the user_network folder beside it,
-    ``reader_factory`` (tests) to make_easyocr_reader."""
+    ``reader_factory`` (tests) to make_easyocr_reader, ``build_id`` to this build's (``current_build_id``)."""
     gr = _gpuread()
     emit = emit if emit is not None else _hooks_emit()
     store = Path(store)
+    build = str(build_id) if build_id is not None else current_build_id()
     t_start = time.perf_counter()
-    done = gr.load_done(store, src)
+    done, left_out = usable_done(gr.load_done(store, src), build)
     pending = int(gr.pending_pages(src, done))
     total = sum(int(sf.n_pages) for sf in src.files)
     base = total - pending
@@ -576,6 +655,7 @@ def first_read(card: Card, bot: Any, src: Any, gate: Any, store: Any, emit: Opti
 
     def save(d: Dict[str, Any]) -> None:
         d["engine"] = APP_ENGINE_LABEL
+        d[BUILD_KEY] = build
         _write_store(store, d)
         if pending:
             report(d)
@@ -613,15 +693,26 @@ def first_read(card: Card, bot: Any, src: Any, gate: Any, store: Any, emit: Opti
             "read_seconds": float(result.get("seconds_total") or 0.0),
             "model_loaded": pending > 0, "model_load_s": round(model_load_s, 2),
             "downscaled": downscaled, "skipped": int(c.get("skipped", 0)), "oom_retries": int(oom_retries),
+            "reread_downscaled": int(left_out["downscaled"]), "stale_store": bool(left_out["stale"]),
             "peak_alloc_gb": alloc_gb, "peak_reserved_gb": reserved_gb}
 
 
 def reading_note(fr: Optional[Mapping[str, Any]]) -> str:
-    """The note on the runner's READING line (<= 200 characters, no personal data)."""
-    note = NOTE_BASE
+    """The note on the runner's READING line (<= 200 characters, no personal data): the base, then the pages the
+    first read left to the light reader and the pages it read smaller (both because of card memory). When both do
+    not fit in full, the shorter wording is used."""
     k = int((fr or {}).get("skipped") or 0)
+    d = int((fr or {}).get("downscaled") or 0)
+    long_parts, short_parts = [], []
     if k:
-        note += f"; {k} page(s) left to the light reader (too large for the cap)"
+        long_parts.append(f"; {k} page(s) left to the light reader (too large for the cap)")
+        short_parts.append(f"; {k} page(s) left to the light reader")
+    if d:
+        long_parts.append(f"; {d} page(s) read smaller (card memory)")
+        short_parts.append(f"; {d} read smaller")
+    note = NOTE_BASE + "".join(long_parts)
+    if len(note) > NOTE_MAX:
+        note = NOTE_BASE + "".join(short_parts)
     return note[:NOTE_MAX]
 
 
@@ -731,15 +822,48 @@ def load_models(torch, easyocr, model_dir: Any, user_dir: Any = None) -> Tuple[A
     return det_m, rec_m, facts
 
 
+_CRAFT_PARTS = ("basenet", "upconv1", "upconv2", "upconv3", "upconv4", "conv_cls")
+
+
+def lean_detector_scores(torch: Any, module: Any, x: Any) -> Any:
+    """``DetectorOut(CRAFT)(x)`` with less memory at its peak (G2, P5): CRAFT.forward's operations in the same
+    order on the same tensors, but each of the VGG base's five skip features is dropped right after its last use
+    (CRAFT.forward keeps all five until it returns, and also returns the 32-channel feature that DetectorOut throws
+    away). The same kernels on the same inputs give the same numbers; only the tensors' lifetimes differ. For a
+    2560 x 1952 detection the skip features are about 1.2 GB on top of the decoder's last stage (about 2.9 GB in all,
+    over the 3 GB cap once the allocator's blocks are counted); without them the peak is the first VGG stage (two
+    64-channel maps at full size, about 2.4 GB). Returns None when ``module`` is not a DetectorOut over a CRAFT (the
+    caller then runs the module itself)."""
+    net = getattr(module, "net", None)
+    if net is None or type(net).__name__ != "CRAFT" or not all(hasattr(net, p) for p in _CRAFT_PARTS):
+        return None
+    interpolate = torch.nn.functional.interpolate
+    s = list(net.basenet(x))          # (fc7, relu5_3, relu4_3, relu3_2, relu2_2), as CRAFT.forward's `sources`
+    y = torch.cat([s[0], s[1]], dim=1)
+    s[0] = s[1] = None
+    y = net.upconv1(y)
+    for k, up in ((2, net.upconv2), (3, net.upconv3), (4, net.upconv4)):
+        y = interpolate(y, size=s[k].size()[2:], mode="bilinear", align_corners=False)
+        y = torch.cat([y, s[k]], dim=1)
+        s[k] = None
+        y = up(y)                     # upconv4's output is CRAFT's `feature`
+    y = net.conv_cls(y)
+    return y.permute(0, 2, 3, 1)
+
+
 class TorchSession:
     """One of the light reader's two networks on the card, with ONNX Runtime's ``run`` surface (``kind`` "det" or
     "rec"). The processor copy of the module is kept for the one exception of G4 (about 100 MB of RAM).
 
     ``run(output_names, feeds)``: the input checked as ONNX Runtime would (float32, rank 4, 3 channels for "det",
     1 channel at height 64 for "rec", no empty axis; else ValueError), a read-only or non-contiguous array copied;
-    the gate's turn (``kind``); one forward pass on the card in inference mode (gpu_worker's Nets). On a card
-    out-of-memory: ``card.pause()``, the gate's turn ("oom"), once more on the card; a second one runs THIS call on
-    the processor module (counted, reason "oom"). Any other error is raised (the worker maps a CUDA error to
+    the gate's turn (``kind``); one forward pass on the card in inference mode (gpu_worker's Nets); then
+    ``card.release()`` (torch's card cache given back above CACHE_KEEP_MB, so this process never sits on cached card
+    memory between calls). On a card out-of-memory: ``card.pause()``, the gate's turn ("oom"), room on the card
+    (``gate.wait_room("oom")``), once more on the card, the detector this time through ``lean_detector_scores``
+    (the same numbers with about 1.2 GB less at the peak: a 2560-pixel page then fits the 3 GB cap; counted as
+    ``calls_lean``); a second one runs THIS call on the processor module (counted, reason "oom"; the detector
+    lean there too, which keeps the worker's RAM down). Any other error is raised (the worker maps a CUDA error to
     CARD_FAILED). The output must be float32 with the input's batch: det rank 4 with 2 score maps, rec rank 3 with
     97 classes (else RuntimeError)."""
 
@@ -761,6 +885,8 @@ class TorchSession:
         self.seconds_card = 0.0
         self.seconds_cpu = 0.0
         self.oom_retries = 0
+        self.releases = 0
+        self.calls_lean = 0
         self.cpu_reasons: Dict[str, int] = {}
 
     # ------------------------------------------------------------------ checks
@@ -796,15 +922,23 @@ class TorchSession:
         return np.ascontiguousarray(out)
 
     # ------------------------------------------------------------------ the passes
-    def _on_card(self, x: np.ndarray) -> np.ndarray:
+    def _forward(self, module: Any, xt: Any, lean: bool) -> Tuple[Any, bool]:
+        """(output, lean used): the detector through lean_detector_scores when ``lean`` and it applies."""
+        if lean and self.kind == DET:
+            y = lean_detector_scores(self.torch, module, xt)
+            if y is not None:
+                return y, True
+        return module(xt), False
+
+    def _on_card(self, x: np.ndarray, lean: bool = False) -> Tuple[np.ndarray, bool]:
         torch = self.torch
         t = time.perf_counter()
         try:
             with torch.inference_mode():
                 xt = torch.from_numpy(x).to(self.device)
-                y = self.cuda_module(xt)
+                y, used = self._forward(self.cuda_module, xt, lean)
                 out = y.contiguous().cpu().numpy()               # .cpu() waits for the card
-            return out
+            return out, used
         finally:
             self.seconds_card += time.perf_counter() - t
 
@@ -813,29 +947,33 @@ class TorchSession:
         t = time.perf_counter()
         try:
             with torch.inference_mode():
-                y = self.cpu_module(torch.from_numpy(x))
+                y, _used = self._forward(self.cpu_module, torch.from_numpy(x), True)
                 out = y.contiguous().numpy()
             return out
         finally:
             self.seconds_cpu += time.perf_counter() - t
 
-    def _attempt(self, x: np.ndarray) -> Tuple[bool, Any]:
+    def _attempt(self, x: np.ndarray, lean: bool = False) -> Tuple[bool, Any, bool]:
         try:
-            return True, self._on_card(x)
+            out, used = self._on_card(x, lean)
+            return True, out, used
         except BaseException as e:                               # Cancelled and CUDA errors go on unchanged
             if not is_oom(e):
                 raise
-        return False, None
+        return False, None, False
 
     def run(self, output_names: Any, feeds: Any, run_options: Any = None) -> List[np.ndarray]:
         x = self._input(output_names, feeds)
         self.gate.wait_turn(self.kind)
-        ok, out = self._attempt(x)
+        ok, out, _ = self._attempt(x)
         if not ok:                                               # outside the handler: the failed frames are gone
             self.oom_retries += 1
             self.card.pause()
             self.gate.wait_turn("oom")
-            ok, out = self._attempt(x)
+            _wait_room(self.gate, "oom")
+            ok, out, lean = self._attempt(x, lean=True)
+            if ok and lean:
+                self.calls_lean += 1
             if not ok:
                 if not self.allow_cpu:
                     raise CardRefused(LOW_CARD_MEMORY, {})
@@ -847,12 +985,15 @@ class TorchSession:
                             self.kind, tuple(x.shape))
                 return [self._output(out, x.shape[0])]
         self.calls_card += 1
+        if self.card.release():                                  # R2.1.5: no cached card memory between calls
+            self.releases += 1
         return [self._output(out, x.shape[0])]
 
     def stats(self) -> Dict[str, Any]:
         return {"kind": self.kind, "calls_card": self.calls_card, "seconds_card": round(self.seconds_card, 3),
                 "calls_cpu": self.calls_cpu, "seconds_cpu": round(self.seconds_cpu, 3),
-                "oom_retries": self.oom_retries, "cpu_reasons": dict(self.cpu_reasons)}
+                "oom_retries": self.oom_retries, "releases": self.releases, "calls_lean": self.calls_lean,
+                "cpu_reasons": dict(self.cpu_reasons)}
 
 
 _CARD_LIGHT_READER: Any = None
@@ -886,7 +1027,8 @@ def card_light_reader_class():
                     parts[name] = st
                 return {"card_calls": sum(int(p.get("calls_card", 0)) for p in parts.values()),
                         "cpu_calls": sum(int(p.get("calls_cpu", 0)) for p in parts.values()),
-                        "oom_retries": sum(int(p.get("oom_retries", 0)) for p in parts.values()), **parts}
+                        "oom_retries": sum(int(p.get("oom_retries", 0)) for p in parts.values()),
+                        "releases": sum(int(p.get("releases", 0)) for p in parts.values()), **parts}
 
         _CARD_LIGHT_READER = CardLightReader
     return _CARD_LIGHT_READER

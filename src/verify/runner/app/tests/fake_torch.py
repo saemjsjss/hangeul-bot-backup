@@ -173,6 +173,7 @@ class FakeCuda:
         self.fraction: Optional[Tuple[float, Any]] = None
         self.empties = 0
         self.syncs = 0
+        self.after_empty_mb: Optional[int] = None      # when set, empty_cache() leaves this much reserved
 
     def is_available(self) -> bool:
         self.calls.append("is_available")
@@ -206,6 +207,8 @@ class FakeCuda:
     def empty_cache(self) -> None:
         self.empties += 1
         self.calls.append("empty_cache")
+        if self.after_empty_mb is not None:
+            self.reserved = int(self.after_empty_mb) * MIB
 
     def memory_reserved(self) -> int:
         return self.reserved

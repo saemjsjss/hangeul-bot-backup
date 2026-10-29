@@ -12,7 +12,9 @@ The order (R2.1.1; nothing touches the card before the guard is armed):
   6. src = ingest.open_input(input); bot = botimport.load(cache_root);
   7. stage "firstread": gpuengine.first_read(card, bot, src, gate, store=<cache_root>\\pagetexts\\<case_id>.json);
   8. reader = gpuengine.light_reader(...); engine.READER_FACTORY = lambda threads=0: reader;
-  9. pipeline.run(..., page_texts=store, reading_note=gpuengine.reading_note(fr));
+  9. pipeline.run(..., page_texts=store, reading_note=gpuengine.reading_note(fr)); during it the Recorder asks the
+     gate for its turn ("stage") at the start of every runner stage, so the app also waits at stage boundaries
+     while the bot's lock exists (its processor work does not compete with the bot's check);
  10. the kept input snapshot compared again (INPUT_CHANGED); resultcode.code(r); summary.pdf; checkfacts.json;
      the done event with its gpu block.
 first_read and light_reader get ascii_dir = <places.temp_dir>\\<job>\\ascii (R2.1.2); the folder is removed at the
@@ -22,7 +24,11 @@ Exit codes (rev 1 section 2 + R2.3.3): 0 done; 3 done with STOP; 2 refused (an e
 input, an unsafe report folder, the input changed, a wrong job = BAD_ARGS); 1 crash (an error event was sent;
 CRASH, LOW_MEMORY or DISK_FULL); 4 cancelled ("cancelled" event); 5 start-up failure (STARTUP_FAILED: a module or
 DLL that cannot be loaded); 6 a card problem (the six codes of R2.3.1). After exit 1 or 6, checkfacts.json holds the
-error's code, stage and exception type plus what is known of the card.
+error's code, stage and exception type plus what is known of the card. The mapping order: refusals and the card
+gate's / engine's own exceptions first, then LOW_MEMORY (MemoryError, "not enough memory", Windows errors 8, 14 and
+1455 "the paging file is too small"), then STARTUP_FAILED (ImportError; Windows errors 126, 127, 193 and 1114 loading
+a DLL), then a CUDA error (whose text is never read off an OSError or ImportError: theirs names a DLL's path, and
+"cublasLt64_12.dll" is not a card failure), then the input / guard refusals, DISK_FULL and CRASH.
 
 Events go through hooks.emit (the listener turns them into protocol lines): stage (card, firstread), card (found,
 ready), error (code, values, text), cancelled, done. No personal data in this file; the error text names no file
@@ -221,23 +227,32 @@ def _is_a(e: BaseException, mod: Any, name: str) -> bool:
 
 
 def cuda_marked(e: BaseException) -> bool:
-    """True when e or anything in its chain is a CUDA / card error (by its type or its text)."""
+    """True when e or anything in its chain is a CUDA / card error (by its type or its text). The text of an
+    OSError or ImportError is not read: it names the DLL that failed to load (torch\\lib\\cublasLt64_12.dll,
+    cudnn64_9.dll ...), which says nothing about the card."""
     for x in chain(e):
         names = " ".join(k.__name__ for k in type(x).__mro__).lower()
         if "outofmemoryerror" in names or "acceleratorerror" in names or "cudaerror" in names:
             return True
+        if isinstance(x, (OSError, ImportError)):
+            continue
         s = str(x).lower()
         if any(m in s for m in _CUDA_MARKS):
             return True
     return False
 
 
+STARTUP_WINERRORS = (126, 127, 193, 1114)     # module not found, procedure not found, bad image, DLL init failed
+LOW_MEMORY_WINERRORS = (8, 14, 1455)          # not enough memory, out of memory, the paging file is too small
+_LOW_MEMORY_TEXTS = ("not enough memory", "paging file is too small", "paging file too small")
+
+
 def _startup_failure(e: BaseException) -> bool:
-    """A module or DLL that cannot be loaded (ImportError, or Windows error 126 / 127 / 193 loading a DLL)."""
+    """A module or DLL that cannot be loaded (ImportError, or Windows error 126 / 127 / 193 / 1114 loading a DLL)."""
     for x in chain(e):
         if isinstance(x, ImportError):
             return True
-        if isinstance(x, OSError) and getattr(x, "winerror", None) in (126, 127, 193):
+        if isinstance(x, OSError) and getattr(x, "winerror", None) in STARTUP_WINERRORS:
             return True
     return False
 
@@ -248,7 +263,18 @@ def _disk_full(e: BaseException) -> bool:
 
 
 def _low_memory(e: BaseException) -> bool:
-    return any(isinstance(x, MemoryError) or "not enough memory" in str(x).lower() for x in chain(e))
+    """The PC ran out of memory (RAM or the paging file): a MemoryError, Windows error 8 / 14 / 1455 (also inside
+    a DLL load: "[WinError 1455] The paging file is too small ... Error loading cublasLt64_12.dll"), or a message
+    saying so."""
+    for x in chain(e):
+        if isinstance(x, MemoryError):
+            return True
+        if isinstance(x, OSError) and getattr(x, "winerror", None) in LOW_MEMORY_WINERRORS:
+            return True
+        s = str(x).lower()
+        if any(t in s for t in _LOW_MEMORY_TEXTS):
+            return True
+    return False
 
 
 # rev 1 section 3.3: the pinned message table of ingest.InputError and safety.SafetyError (first match wins)
@@ -416,25 +442,38 @@ def _event_of(args: Tuple[Any, ...], kw: Mapping[str, Any]) -> Tuple[str, Mappin
 
 class Recorder:
     """hooks.LISTENER: forwards every call to the caller's listener unchanged (a Cancelled it raises goes on) and
-    records the stage that started last and the budget hits (where, page) for checkfacts."""
+    records the stage that started last and the budget hits (where, page) for checkfacts.
+
+    While ``gate`` is set (the worker sets it for ``pipeline.run`` only), every stage START is followed by
+    ``gate.wait_turn("stage")``, after the event went to the listener: while the bot's lock exists the check
+    waits there (its card cache emptied by the gate's pause), also when the stage makes no model call at all (the
+    runner's "bot" stage and the QR and TIN ladders run on the processor for up to a minute). A stage's END is
+    never held up (it runs in the runner's ``finally``, where the listener must not raise)."""
 
     def __init__(self, listener: Optional[Callable[..., Any]]) -> None:
         self.listener = listener
         self.stage = ""
         self.budget: List[Dict[str, Any]] = []
+        self.gate: Any = None
+        self.stage_turns = 0
 
     def __call__(self, *args: Any, **kw: Any) -> Any:
+        started = False
         try:
             ev, data = _event_of(args, kw)
             if ev == "stage" and data.get("state") == "start":
                 self.stage = str(data.get("key") or "")
+                started = True
             elif ev == "budget":
                 self.budget.append({"where": str(data.get("where") or ""), "page": data.get("page")})
         except Exception:
             pass
-        if self.listener is not None:
-            return self.listener(*args, **kw)
-        return None
+        out = self.listener(*args, **kw) if self.listener is not None else None
+        gate = self.gate
+        if started and gate is not None:
+            self.stage_turns += 1
+            gate.wait_turn("stage")
+        return out
 
 
 # ------------------------------------------------------------------------------------------ helpers
@@ -711,8 +750,12 @@ class _Check:
         m.engine.READER_FACTORY = lambda threads=0: reader
         note = m.gpuengine.reading_note(self.fr)
         self.at("runner")
-        r = m.pipeline.run(j.input, self.program, j.out, today=self.today, cache_root=self.cache_root,
-                           page_texts=store, reading_note=note)
+        self.rec.gate = self.gate                           # R2.1.5: the gate's turn at every runner stage start
+        try:
+            r = m.pipeline.run(j.input, self.program, j.out, today=self.today, cache_root=self.cache_root,
+                               page_texts=store, reading_note=note)
+        finally:
+            self.rec.gate = None
         self.at("input")
         try:
             m.safety.finish(self.state)                     # the snapshot kept from before the card work
@@ -736,7 +779,8 @@ class _Check:
         mem = process_memory()
         self.emit_final("done", exit=exit_code, overall=overall, headline=str(getattr(r, "headline", "")),
                         code=code, out=str(j.out), lines=lines, peak_mb=mem.get("peak_working_set_mb"),
-                        summary_pdf=pdf_ok, checkfacts=facts_ok, gpu=m.checkfacts.done_gpu(gpu))
+                        summary_pdf=pdf_ok, checkfacts=facts_ok, gpu=m.checkfacts.done_gpu(gpu),
+                        budget_hits=len(self.rec.budget), check_date=self.today.isoformat() if self.today else None)
         _log(f"done exit {exit_code} | {overall} | code {code}")
         return exit_code
 
@@ -893,6 +937,8 @@ class _Check:
                 vals = self.card_values(code, stage)
                 vals.update({str(k): str(v) for k, v in (getattr(x, "values", None) or {}).items()})
                 return code, vals, EXIT_CARD, f"the graphics card was refused ({code})"
+        if _low_memory(e):                                  # before the DLL and CUDA checks (a DLL's path)
+            return "LOW_MEMORY", {}, EXIT_CRASH, f"out of memory in stage '{stage}'"
         if _startup_failure(e):
             return "STARTUP_FAILED", {}, EXIT_STARTUP, f"{root_type(e)} while starting (stage '{stage}')"
         code = self.card_code(e)
@@ -916,8 +962,6 @@ class _Check:
             if pipeline is not None and _is_a(e, pipeline, "RefusedError"):
                 c, v = classify_refusal(e, "input")
                 return c, v, EXIT_REFUSED, str(e)
-        if _low_memory(e):
-            return "LOW_MEMORY", {}, EXIT_CRASH, f"out of memory in stage '{stage}'"
         if _disk_full(e):
             return "DISK_FULL", {}, EXIT_CRASH, f"disk full in stage '{stage}'"
         return "CRASH", {"stage": stage}, EXIT_CRASH, f"{root_type(e)} in stage '{stage}'"

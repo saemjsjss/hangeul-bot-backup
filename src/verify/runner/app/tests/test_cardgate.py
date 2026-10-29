@@ -426,6 +426,135 @@ class WaitMemoryTests(GateTestCase):
         self.assertEqual(g.stats()["by_why"]["memory"]["waits"], 1)
 
 
+def collapsed(states):
+    """The states with repeated ticks counted once (a memory wait ticks every <= POLL_S between its reads)."""
+    out = []
+    for x in states:
+        if not out or out[-1] != x:
+            out.append(x)
+    return out
+
+
+class RoomTests(GateTestCase):
+    """G1 review finding 2: after a lock wait the gate waits for room on the card (free memory of what this process
+    may still take up to its cap, plus headroom: ``on_room``). The program that held the lock may hold its memory a
+    little longer. The room wait never fails a check."""
+
+    def free_seq(self, values):
+        it = iter(values)
+        reads = []
+
+        def free():
+            reads.append(self.ft.mono)
+            return next(it)
+        free.reads = reads
+        return free
+
+    def test_after_a_lock_wait_the_gate_waits_for_room(self):
+        self.make_lock()
+        free = self.free_seq([2000, 2000, 3600])                          # the bot's process still holds memory
+        rec = Recorder(self.ft)
+        g = self.gate([self.lock], rec, free_mb=free)
+        g.on_pause = mock.Mock(return_value=110)
+        g.on_room = mock.Mock(return_value=3474)
+        self.ft.on_sleep = lambda n: self.lock.unlink() if n == 1 else None
+        g.wait_turn("det")
+        self.assertEqual(collapsed(rec.states()), [("lock", "start"), ("lock", "end"), ("memory", "start"),
+                                                   ("memory", "tick"), ("memory", "end")])
+        self.assertEqual([t - free.reads[0] for t in free.reads], [0.0, 5.0, 10.0])
+        self.assertEqual(rec.events[2][1], {"state": "start", "why": "memory", "free_mb": 2000, "need_mb": 3474})
+        self.assertEqual(rec.events[-1][1], {"state": "end", "why": "memory", "free_mb": 3600, "need_mb": 3474,
+                                             "waited_s": 10.0})
+        g.on_room.assert_called_once_with()
+        st = g.stats()
+        self.assertEqual((st["room_checks"], st["room_short"]), (1, 0))
+        self.assertEqual(st["by_why"], {"lock": {"waits": 1, "waited_s": 2.0}, "memory": {"waits": 1,
+                                                                                          "waited_s": 10.0}})
+        self.assertEqual(st["by_where"], {"det": {"waits": 2, "waited_s": 12.0}})
+
+    def test_enough_room_goes_on_at_once(self):
+        self.make_lock()
+        rec = Recorder(self.ft)
+        g = self.gate([self.lock], rec, free_mb=lambda: 6000)
+        g.on_room = lambda: 3474
+        self.ft.on_sleep = lambda n: self.lock.unlink()
+        g.wait_turn("page")
+        self.assertEqual(rec.states(), [("lock", "start"), ("lock", "end")])
+        self.assertEqual(self.ft.sleeps, [C.POLL_S])
+        self.assertEqual((g.stats()["room_checks"], g.stats()["free_mb"]), (1, 6000))
+
+    def test_the_room_wait_gives_up_without_failing_the_check(self):
+        self.make_lock()
+        rec = Recorder(self.ft)
+        g = self.gate([self.lock], rec, free_mb=lambda: 2000)
+        g.on_room = lambda: 3474
+        self.ft.on_sleep = lambda n: self.lock.unlink() if n == 1 else None
+        g.wait_turn("rec")                                                # no CardMemoryShort
+        self.assertEqual(rec.events[-1][1], {"state": "end", "why": "memory", "free_mb": 2000, "need_mb": 3474,
+                                             "waited_s": 900.0, "short": True})
+        self.assertAlmostEqual(sum(self.ft.sleeps), C.POLL_S + C.MEMORY_WAIT_S)
+        self.assertEqual(g.stats()["room_short"], 1)
+
+    def test_no_room_check_before_the_card_starts(self):
+        self.make_lock()
+        free = mock.Mock(return_value=100)
+        g = self.gate([self.lock], Recorder(self.ft), free_mb=free)       # on_room not set yet: no card
+        self.ft.on_sleep = lambda n: self.lock.unlink()
+        g.wait_turn("start")
+        free.assert_not_called()
+        self.assertEqual(g.stats()["room_checks"], 0)
+        self.assertIsNone(g.wait_room("oom"))
+
+    def test_a_lock_inside_a_memory_wait_asks_for_no_room_of_its_own(self):
+        bot_done = []
+
+        def on_sleep(n):
+            if n == 1:
+                self.make_lock()
+            elif n == 4:
+                self.lock.unlink()
+                bot_done.append(True)
+        self.ft.on_sleep = on_sleep
+        rec = Recorder(self.ft)
+        g = self.gate([self.lock], rec, free_mb=lambda: 5000 if bot_done else 2900)
+        g.on_room = mock.Mock(return_value=3474)
+        self.assertEqual(g.wait_memory(4096, limit_s=5), 5000)
+        self.assertEqual(rec.states(), [("memory", "start"), ("lock", "start"), ("lock", "tick"),
+                                        ("lock", "tick"), ("lock", "end"), ("memory", "end")])
+        g.on_room.assert_not_called()
+
+    def test_wait_room_before_an_oom_retry(self):
+        free = self.free_seq([3000, 3500])
+        rec = Recorder(self.ft)
+        g = self.gate([], rec, free_mb=free)
+        g.on_room = lambda: 3474
+        self.assertEqual(g.wait_room("oom"), 3500)
+        self.assertEqual(collapsed(rec.states()), [("memory", "start"), ("memory", "tick"), ("memory", "end")])
+        self.assertEqual(g.stats()["by_where"], {"oom": {"waits": 1, "waited_s": 5.0}})
+        self.assertEqual(self.gate([], Recorder(self.ft), free_mb=lambda: None).wait_room("oom"), None)
+
+    def test_the_start_memory_wait_still_fails(self):
+        g = self.gate([], Recorder(self.ft), free_mb=lambda: 100)
+        g.on_room = lambda: 3474
+        with self.assertRaises(C.CardMemoryShort):
+            g.wait_memory(4096, limit_s=7)
+        self.assertEqual(g.stats()["room_short"], 0)
+
+    def test_room_events_are_protocol_events(self):
+        try:
+            from src.verify.runner.app import protocol
+        except ImportError:
+            self.skipTest("Task C's protocol is not built")
+        self.make_lock()
+        rec = Recorder(self.ft)
+        g = self.gate([self.lock], rec, free_mb=lambda: 2000)
+        g.on_room = lambda: 3474
+        self.ft.on_sleep = lambda n: self.lock.unlink() if n == 1 else None
+        g.wait_turn("page")
+        for ev, fields, _t in rec.events:
+            self.assertEqual(protocol.validate(protocol.make(ev, **fields)), [], fields)
+
+
 class SourceRuleTests(unittest.TestCase):
     """Standard library only; never torch, never hooks; exactly ONE C:\\Hangeul string (BOT_LOCK_DEFAULT): the line
     the bundle scan allows (R2.6 8 b)."""

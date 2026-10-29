@@ -428,6 +428,45 @@ def waiting(why: str, lock: Optional[str] = None, waited_s: Any = 0, free_mb: An
     return Message("WAIT_OTHER", WAIT_TITLE, text, WAIT)
 
 
+# ------------------------------------------------------------------------------------------------ result notes
+def _count(n: Any) -> int:
+    try:
+        x = int(n)
+    except (TypeError, ValueError):
+        return 0
+    return x if x > 0 else 0
+
+
+def budget_note(n: Any) -> str:
+    """The result note when QR / barcode reading steps ran out of their time limit (they are time-boxed: on a busy
+    or slower PC a code may stay unread, and a document can then be flagged). Empty for 0."""
+    k = _count(n)
+    if not k:
+        return ""
+    return (f"{k} QR or barcode reading step(s) ran out of time, so a code may not have been read. Check again when "
+            "the PC is idle; the result may then differ.")
+
+
+def downscaled_note(n: Any) -> str:
+    """The result note when the first read had to read pages at a smaller size (the graphics card ran out of
+    memory). A new check reads them at full size again. Empty for 0."""
+    k = _count(n)
+    if not k:
+        return ""
+    return (f"{k} page(s) were read at a smaller size because the graphics card ran out of memory. Check again when "
+            "the graphics card is free; the result may then differ.")
+
+
+def skipped_note(n: Any) -> str:
+    """The result note when the first read left pages to the light reader (too large for the graphics card even
+    at a smaller size). Empty for 0."""
+    k = _count(n)
+    if not k:
+        return ""
+    return (f"{k} page(s) were too large for the graphics card's memory and were read by the light reader instead; "
+            "the result may differ from a check where the card read them.")
+
+
 def low_card_memory_note(free_mb: Any, need_mb: Any = NEED_FREE_MB) -> Message:
     """The yellow note when the card has less free memory than a check needs: Check stays enabled (R2.1.4)."""
     return render(LOW_CARD_MEMORY_NOTE, {"free_mb": free_mb, "need_mb": need_mb})

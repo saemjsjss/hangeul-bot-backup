@@ -129,7 +129,9 @@ class Ctx:
 
 
 def load_module(name: str, path: Path) -> Any:
-    """Imports a sibling task's module by its path (H's cardrun, G's build_installer)."""
+    """Imports a sibling task's module by its path (H's cardrun, G's build_installer). The module is put in
+    sys.modules before it runs, as an import does: a @dataclass in it (cardrun's CardRunResult) looks its own
+    module up there."""
     if not Path(path).is_file():
         raise BuildError(f"{Path(path).name} is missing ({Path(path).parent.name})")
     spec = importlib.util.spec_from_file_location(f"hdc_build_{name}", str(path))
@@ -137,7 +139,12 @@ def load_module(name: str, path: Path) -> Any:
     for p in (str(Path(path).parent), str(PKG)):
         if p not in sys.path:
             sys.path.append(p)
-    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    sys.modules[spec.name] = mod
+    try:
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    except BaseException:
+        sys.modules.pop(spec.name, None)
+        raise
     return mod
 
 

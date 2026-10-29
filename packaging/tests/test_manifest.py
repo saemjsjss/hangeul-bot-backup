@@ -462,6 +462,23 @@ class BuildTests(unittest.TestCase):
         self.assertEqual(json.loads(out.read_text(encoding="utf-8")),
                          ["--build-id", BID, "--check-date", "2026-10-29", "--this-pc-code", "51C2-0A7E"])
 
+    def test_load_module_runs_dataclasses_and_the_real_cardrun(self) -> None:
+        """G2's first real check: cardrun.py's @dataclass needs its module in sys.modules while it runs. Loading
+        it defines names only; no guard, no card."""
+        mod = build.load_module("dc_probe", put(self.pkg / "dc_probe.py",
+                                                "from dataclasses import dataclass\n\n@dataclass\nclass R:\n"
+                                                "    n: int = 1\n"))
+        self.assertEqual(mod.R().n, 1)
+        self.assertIs(sys.modules["hdc_build_dc_probe"], mod)
+        real = build.load_module("cardrun_real", PKG / "tests" / "cardrun.py")
+        self.assertEqual(real.CardRunResult(args=[]).returncode, None)
+        self.assertFalse(real.approved(""))
+        with self.assertRaises(ZeroDivisionError):
+            build.load_module("broken", put(self.pkg / "broken.py", "x = 1 / 0\n"))
+        self.assertNotIn("hdc_build_broken", sys.modules)
+        for k in ("hdc_build_dc_probe", "hdc_build_cardrun_real"):
+            sys.modules.pop(k, None)
+
     def test_helpers(self) -> None:
         self.assertEqual(build._rc(0), 0)
         self.assertEqual(build._rc(subprocess.CompletedProcess([], 3)), 3)

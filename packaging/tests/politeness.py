@@ -1,6 +1,6 @@
 """P4 politeness (APP_SPEC rev 2, R2.6): the frozen app waits for a lock file, on THIS PC's card via cardrun.
 
-    <runner python> -I -B packaging\\tests\\politeness.py --build-id <id> [--only 6,1,2,3,5,4] [--app-dir DIR]
+    <runner python> -I -B packaging\\tests\\politeness.py --build-id <id> [--only 6,1,2,3,7,5,4] [--app-dir DIR]
 
 CHECK_0001 (input, program and check date from ``runs\\test1_r8\\run.json``), each scenario with a FRESH DATA folder,
 watching an extra lock ``private-runner\\apptest\\<build-id>\\fakelock\\auto_verify.lock`` (``--gpu-lock-extra``; the
@@ -17,7 +17,12 @@ Scenarios (R2.6 P4) and what passes:
       event and exit 4 within 10 s, the worker gone (nothing left in cardrun's job); then a ``--cli`` run on the
       same DATA skips the pages the cancelled run had saved.
   (5) a stale lock (mtime 5 h back): no wait.
-  (1), (2), (3) and (5) give the same result code as (6) and P1.
+  (7) the lock is made when the runner's ``bot`` stage starts (phase 2; processor work for up to a minute, maybe no
+      model call at all) and held 60 s. NVML free card memory is read every 2 s during the hold and again after the
+      app ended: the app may hold at most APP_IDLE_MAX_MB of card memory while the lock exists (its CUDA context, the
+      light reader's weights and at most 256 MB of torch cache; G1 review finding 1). A wait that starts in the
+      hold has ``reserved_mb`` <= 256. The check finishes.
+  (1), (2), (3), (5) and (7) give the same result code as (6) and P1.
 When the REAL bot lock was active during a scenario (its lock seen by stat, a ``gpu_wait`` with lock "bot", or
 cardrun's SlotInterrupted), the TIMING checks of that scenario are reported as "bot active", not failed.
 
@@ -44,6 +49,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple  # noqa:
 import cardrun  # noqa: E402
 import parity  # noqa: E402
 
+WORKTREE = Path(__file__).resolve().parents[2]
+
 HOLD_S = 60.0
 START_WITHIN_S = 3.0
 RESUME_WITHIN_S = 10.0
@@ -54,9 +61,28 @@ NO_WAIT_GIVEUP_S = 90.0             # the lock is removed when no wait started b
 STALE_AGE_S = 5 * 3600
 BOT_SAMPLE_S = 2.0
 DEFAULT_TIMEOUT_S = 3600.0
-ORDER = (6, 1, 2, 3, 5, 4)
+# scenario 7: the most card memory (MiB) the app may hold while a lock exists between two model calls: its CUDA
+# context (about 0.3-0.5 GB, which torch does not count), the light reader's weights (about 0.1 GB) and at most
+# 256 MB of torch cache. Before G1's fix it held up to the 3 GB cap through the runner's processor stretches.
+APP_IDLE_MAX_MB = 1024
+FREE_SAMPLES_MIN = 3
+SETTLE_S = 0.5                      # after the app ended: free memory is read 3 times, this far apart (the max counts)
+ORDER = (6, 1, 2, 3, 7, 5, 4)
 TITLES = {1: "lock before the start", 2: "lock after the 3rd phase-1 page", 3: "lock after the names stage starts",
-          4: "cancel during a wait (--worker)", 5: "stale lock (5 h old)", 6: "no lock (reference)"}
+          4: "cancel during a wait (--worker)", 5: "stale lock (5 h old)", 6: "no lock (reference)",
+          7: "lock during the bot stage (processor work)"}
+
+
+def nvml_free_mb(index: int = 0) -> Optional[int]:
+    """The card's free memory in MiB by NVML, through the app's own ``gpuinfo`` (ctypes only: no torch, no CUDA
+    context), or None when it cannot be read."""
+    try:
+        if str(WORKTREE) not in sys.path:
+            sys.path.insert(0, str(WORKTREE))
+        from src.verify.runner.app import gpuinfo
+        return gpuinfo.free_mb(index)
+    except Exception:
+        return None
 
 Events = List[Tuple[float, Dict[str, Any]]]
 
@@ -99,7 +125,8 @@ class Controller:
 
     def __init__(self, number: int, lock: FakeLock, *, hold_s: float = HOLD_S, cancel_after_s: float = CANCEL_AFTER_S,
                  giveup_s: float = NO_WAIT_GIVEUP_S, bot_active: Callable[[], bool] = cardrun.bot_lock_active,
-                 bot_sample_s: float = BOT_SAMPLE_S) -> None:
+                 bot_sample_s: float = BOT_SAMPLE_S, free_fn: Callable[[], Optional[int]] = nvml_free_mb,
+                 settle_s: float = SETTLE_S, sleep: Callable[[float], None] = time.sleep) -> None:
         self.n = number
         self.lock = lock
         self.hold_s = hold_s
@@ -107,18 +134,22 @@ class Controller:
         self.giveup_s = giveup_s
         self.bot_active = bot_active
         self.bot_sample_s = bot_sample_s
+        self.free_fn = free_fn
+        self.settle_s = settle_s
+        self.sleep = sleep
         self.events: Events = []
         self.marks: Dict[str, Any] = {"t_lock": None, "t_ws": None, "t_rm": None, "t_cancel": None,
-                                      "bot_seen": 0, "gave_up": False}
+                                      "bot_seen": 0, "gave_up": False, "free_hold": [], "free_after": None}
         self._mu = threading.Lock()
         self._stage: Optional[str] = None
         self._phase1 = 0
         self._waiting = False
         self._last_bot = -1e9
+        self._last_free = -1e9
 
     @property
     def trigger(self) -> Optional[str]:
-        return {2: "page3", 3: "names", 4: "page3"}.get(self.n)
+        return {2: "page3", 3: "names", 4: "page3", 7: "bot"}.get(self.n)
 
     def before_start(self) -> None:
         if self.n == 1:
@@ -139,7 +170,7 @@ class Controller:
             if kind == "page" and (ev.get("where") == "card" or self._stage == "firstread"):
                 self._phase1 += 1
             fire = ((self.trigger == "page3" and kind == "page" and self._phase1 == 3)
-                    or (self.trigger == "names" and kind == "stage" and ev.get("key") == "names"
+                    or (self.trigger in ("names", "bot") and kind == "stage" and ev.get("key") == self.trigger
                         and ev.get("state") == "start"))
             if fire and self.marks["t_lock"] is None:
                 self.lock.make()
@@ -162,6 +193,14 @@ class Controller:
             m = self.marks
             if self.n in (5, 6) or m["t_lock"] is None or m["t_rm"] is not None:
                 return
+            if self.n == 7:                        # free card memory during the hold; the hold counts from the lock
+                if t - self._last_free >= self.bot_sample_s:
+                    self._last_free = t
+                    m["free_hold"].append(self.free_fn())
+                if t >= m["t_lock"] + self.hold_s:
+                    self.lock.remove()
+                    m["t_rm"] = t
+                return
             if self.n == 4:
                 if m["t_ws"] is not None and m["t_cancel"] is None and t >= m["t_ws"] + self.cancel_after_s:
                     if ctl.write("cancel\n"):
@@ -183,9 +222,19 @@ class Controller:
                 m["gave_up"] = True
 
     def finish(self) -> None:
+        """After the run (the app has ended): the lock removed; for scenario 7 free card memory read again (the
+        most of three reads, SETTLE_S apart: the driver gives the ended process's memory back)."""
         with self._mu:
             if self.lock.remove() and self.marks["t_rm"] is None and self.n not in (4, 5):
                 self.marks["gave_up"] = True
+            if self.n == 7:
+                reads = []
+                for k in range(3):
+                    if k:
+                        self.sleep(self.settle_s)
+                    reads.append(self.free_fn())
+                got = [v for v in reads if isinstance(v, (int, float))]
+                self.marks["free_after"] = max(got) if got else None
 
 
 # ------------------------------------------------------------------------------------------------ judging
@@ -319,6 +368,28 @@ def judge(number: int, events: Events, marks: Dict[str, Any], exit_code: Optiona
                                       "not resumed" if t_res is None else f"{t_res - t_rm:.1f} s", timing=True))
         _finish_checks(o, events, exit_code, refs)
         return o
+    if number == 7:
+        hold = [v for v in marks.get("free_hold") or [] if isinstance(v, (int, float))]
+        o.facts.update(free_hold_min=min(hold) if hold else None, free_after=marks.get("free_after"),
+                       footprint_mb=card_footprint(marks))
+        o.checks.append(Check("the lock was made", t_lock is not None, "the bot stage did not start" if t_lock
+                              is None else ""))
+        o.checks.append(Check(f"free card memory read >= {FREE_SAMPLES_MIN} times during the hold",
+                              len(hold) >= FREE_SAMPLES_MIN, f"{len(hold)} read(s)"))
+        fp = card_footprint(marks)
+        o.checks.append(Check(f"the app held <= {APP_IDLE_MAX_MB} MB of card memory while the lock existed",
+                              fp is not None and fp <= APP_IDLE_MAX_MB,
+                              "not measured" if fp is None else f"{fp} MB", timing=True))
+        if t_lock is not None:
+            t_rm = marks.get("t_rm")
+            end = t_rm if t_rm is not None else float("inf")
+            big = [e.get("reserved_mb") for t, e in events if t_lock <= t < end and e.get("ev") == "gpu_wait"
+                   and e.get("state") == "start" and e.get("why") == "lock"
+                   and not (isinstance(e.get("reserved_mb"), (int, float)) and e["reserved_mb"] <= RESERVED_MAX_MB)]
+            o.checks.append(Check(f"every wait in the hold had reserved_mb <= {RESERVED_MAX_MB}", not big,
+                                  f"{len(big)} wait(s) above"))
+        _finish_checks(o, events, exit_code, refs)
+        return o
     if number == 4:
         t_cancel = marks.get("t_cancel")
         o.checks.append(Check("a wait started", ws is not None, "" if ws else "no gpu_wait start after the lock"))
@@ -336,6 +407,16 @@ def judge(number: int, events: Events, marks: Dict[str, Any], exit_code: Optiona
                               f"{leftover} process(es) left in the job"))
         return o
     raise ValueError(f"unknown scenario {number}")
+
+
+def card_footprint(marks: Dict[str, Any]) -> Optional[int]:
+    """Scenario 7: the app's card memory while the lock existed, as NVML saw it: free memory after the app ended
+    minus the least free memory during the hold (MiB). None when it was not read."""
+    hold = [v for v in marks.get("free_hold") or [] if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    after = marks.get("free_after")
+    if not hold or not isinstance(after, (int, float)) or isinstance(after, bool):
+        return None
+    return int(after - min(hold))
 
 
 def phase1_of(events: Events) -> Optional[int]:
@@ -454,7 +535,7 @@ def main(argv: Optional[Sequence[str]] = None, run_fn: Optional[Callable[..., An
         app = cardrun.app_dir_for(a.build_id or None, a.app_dir or None)
         wanted = [int(x) for x in a.only.split(",") if x.strip()]
         if any(n not in TITLES for n in wanted):
-            raise ValueError("scenarios are 1-6")
+            raise ValueError("scenarios are 1-7")
         case = parity.load_r8(parity.CHECK_CASE, runs)
     except (ValueError, OSError, KeyError) as exc:
         print(f"P4: cannot start: {type(exc).__name__}: {exc}")
@@ -483,7 +564,7 @@ def main(argv: Optional[Sequence[str]] = None, run_fn: Optional[Callable[..., An
         events = ctl.events
         code = code_of(out, events)
         refs: Dict[str, Optional[str]] = {"P1": p1_code}
-        if n in (1, 2, 3, 5):
+        if n in (1, 2, 3, 5, 7):
             refs["scenario 6"] = ref6
         o = judge(n, events, ctl.marks, res.returncode, code, refs, interrupted=res.interrupted,
                   seconds=res.seconds, leftover=res.leftover_killed, timed_out=res.timed_out)

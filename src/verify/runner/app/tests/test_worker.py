@@ -336,8 +336,10 @@ class TestOrder(Base):
             "safety.prepare", "gpuinfo.probe", "gpuinfo.problems", "CardGate", "gate.wait_turn",
             "gate.wait_memory", "gpuengine.start_card", "ingest.open_input", "botimport.load",
             "gpuengine.first_read", "gpuengine.light_reader", "gpuengine.reading_note", "pipeline.run",
-            "safety.finish", "resultcode.code", "card.free"])
+            "gate.wait_turn", "safety.finish", "resultcode.code", "card.free"])
         self.assertEqual(self.w.kw("gate.wait_turn"), {"where": "start"})
+        turns = [k["where"] for n, k in self.w.calls if n == "gate.wait_turn"]
+        self.assertEqual(turns, ["start", "stage"])                       # the runner's one stage start
         self.assertEqual(self.w.kw("gate.wait_memory"), {"need": 4096})
 
     def test_guard_before_any_card_work(self):
@@ -444,7 +446,9 @@ class TestEvents(Base):
         self.assertTrue(done["summary_pdf"])
         self.assertTrue(done["checkfacts"])
         self.assertEqual(done["gpu"], {"card": "NVIDIA GeForce RTX 0000", "peak_alloc_gb": 2.6,
-                                       "peak_reserved_gb": 2.9, "cpu_calls": 1, "waits": 1, "waited_s": 2.5})
+                                       "peak_reserved_gb": 2.9, "cpu_calls": 1, "waits": 1, "waited_s": 2.5,
+                                       "downscaled": 0, "skipped": 0})
+        self.assertEqual((done["budget_hits"], done["check_date"]), (1, "2026-10-28"))
         if os.name == "nt":
             self.assertIsInstance(done["peak_mb"], int)
 
@@ -463,6 +467,52 @@ class TestEvents(Base):
         self.w.result = make_result(overall=STOP)
         self.assertEqual(self.run_job(), W.EXIT_STOP)
         self.assertEqual(self.w.ev("done")[0]["exit"], W.EXIT_STOP)
+
+
+class TestReviewFixes(Base):
+    """G1 review findings 1 (the gate's turn at every runner stage start), 4 (what can change a verdict reaches the
+    done event) and 6 (the check date in the done event)."""
+
+    def test_the_stage_turn_only_while_the_runner_runs(self):
+        def run(input_path, program, out, **kw):
+            self.w.call("pipeline.run")
+            self.w.hooks.emit("stage", key="bot", state="start")
+            self.w.hooks.emit("stage", key="bot", state="end", seconds=60.0)
+            self.w.hooks.emit("stage", key="report", state="start")
+            self.w.hooks.emit("stage", key="report", state="end", seconds=0.1)
+            Path(out).mkdir(parents=True, exist_ok=True)
+            return self.w.result
+        pipeline = SimpleNamespace(run=run, RefusedError=self.w.pipeline.RefusedError,
+                                   RunCrashed=self.w.pipeline.RunCrashed)
+        self.assertEqual(self.run_job(pipeline=pipeline), W.EXIT_OK)
+        turns = [(n, k.get("where")) for n, k in self.w.calls if n in ("gate.wait_turn", "pipeline.run")]
+        self.assertEqual(turns, [("gate.wait_turn", "start"), ("pipeline.run", None), ("gate.wait_turn", "stage"),
+                                 ("gate.wait_turn", "stage")])              # two stage starts; no end, no phase
+
+    def test_a_cancel_while_waiting_at_a_stage(self):
+        CardGate = self.w.cardgate.CardGate
+
+        class Waiting(CardGate):
+            def wait_turn(gate, where):
+                super().wait_turn(where)
+                if where == "stage":
+                    raise Cancelled()                                     # the listener raised on a gpu_wait tick
+        cardgate = SimpleNamespace(CardGate=Waiting, CardMemoryShort=self.w.cardgate.CardMemoryShort)
+        self.assertEqual(self.run_job(cardgate=cardgate), W.EXIT_CANCELLED)
+        self.assertEqual(self.w.events[-1], ("cancelled", {}))
+        self.assertIsNone(self.w.engine.READER_FACTORY)
+        self.assertIn("card.free", self.w.names())
+
+    def test_pages_read_smaller_or_left_and_budget_hits_reach_the_done_event(self):
+        self.w.fr.update(downscaled=2, skipped=1)
+        self.run_job()
+        done = self.w.ev("done")[0]
+        self.assertEqual((done["gpu"]["downscaled"], done["gpu"]["skipped"], done["budget_hits"]), (2, 1, 1))
+
+    def test_the_check_date_is_the_jobs(self):
+        self.run_job(self.job(today="2026-10-30"))
+        self.assertEqual(self.w.ev("done")[0]["check_date"], "2026-10-30")
+        self.assertEqual(str(self.w.kw("pipeline.run")["today"]), "2026-10-30")
 
 
 class TestOutputs(Base):
@@ -757,6 +807,43 @@ class TestCrash(Base):
         self.assertEqual((err["code"], err["values"]), ("CRASH", {"stage": "ingest"}))
         self.assertNotIn(NAME, json.dumps(err))
 
+    def test_dll_failures_from_low_memory_are_low_memory(self):
+        # G1 review finding 5: the DLL's path holds "cublas" / "cudnn"; the cause is the paging file
+        path = "C:\\made-up\\torch\\lib\\cublasLt64_12.dll"
+        e1455 = OSError(0, "The paging file is too small for this operation to complete", None, 1455)
+        if getattr(e1455, "winerror", None) != 1455:
+            self.skipTest("winerror needs Windows")
+        e1455.strerror = f'{e1455.strerror}. Error loading "{path}" or one of its dependencies.'
+        cases = [e1455,
+                 ImportError("DLL load failed while importing _C: The paging file is too small for this operation "
+                             "to complete."),
+                 OSError(0, f'Not enough memory resources are available. Error loading "{path}"', None, 8)]
+        for exc in cases:
+            with self.subTest(exc=type(exc).__name__):
+                self.w = World(self.root)
+                self.w.raise_at["gpuengine.start_card"] = exc
+                self.assertEqual(self.run_job(), W.EXIT_CRASH)
+                self.assertEqual(self.error()["code"], "LOW_MEMORY")
+
+    def test_dll_failures_are_never_card_failures_by_their_path(self):
+        cudnn = "C:\\made-up\\torch\\lib\\cudnn_graph64_9.dll"
+        init = OSError(0, f'A dynamic link library (DLL) initialization routine failed. Error loading "{cudnn}"',
+                       None, 1114)
+        if getattr(init, "winerror", None) != 1114:
+            self.skipTest("winerror needs Windows")
+        self.w.raise_at["gpuengine.start_card"] = init
+        self.assertEqual(self.run_job(), W.EXIT_STARTUP)
+        self.assertEqual(self.error()["code"], "STARTUP_FAILED")
+        self.w = World(self.root)
+        self.w.raise_at["gpuengine.start_card"] = OSError(0, f'Access is denied. Error loading "{cudnn}"', None, 5)
+        self.assertEqual(self.run_job(), W.EXIT_CRASH)
+        err = self.error()
+        self.assertEqual((err["code"], err["values"]), ("CRASH", {"stage": "card"}))
+        self.w = World(self.root)                                         # a real CUDA error is still one
+        self.w.raise_at["gpuengine.start_card"] = RuntimeError("CUDA error: unspecified launch failure")
+        self.assertEqual(self.run_job(), W.EXIT_CARD)
+        self.assertEqual(self.error()["code"], "CARD_FAILED")
+
     def test_keyboard_interrupt_is_not_mapped(self):
         self.w.raise_at["pipeline.run.late"] = KeyboardInterrupt()
         with self.assertRaises(KeyboardInterrupt):
@@ -964,6 +1051,55 @@ class TestHelpers(unittest.TestCase):
                 raise ValueError("made-up") from inner
         except ValueError as outer:
             self.assertTrue(W.cuda_marked(outer))
+
+    def test_cuda_marked_ignores_dll_paths(self):
+        path = "C:\\made-up\\torch\\lib\\cublasLt64_12.dll"
+        self.assertFalse(W.cuda_marked(OSError(f'Error loading "{path}" or one of its dependencies.')))
+        self.assertFalse(W.cuda_marked(ImportError("DLL load failed while importing torch_cuda")))
+        try:
+            try:
+                raise OSError(f'Error loading "{path}"')
+            except OSError as inner:
+                raise RuntimeError("CUDA error: made-up") from inner
+        except RuntimeError as outer:
+            self.assertTrue(W.cuda_marked(outer))                          # the CUDA error itself still counts
+
+    def test_low_memory_and_startup_rules(self):
+        self.assertTrue(W._low_memory(MemoryError()))
+        self.assertTrue(W._low_memory(RuntimeError("DefaultCPUAllocator: not enough memory: you tried ...")))
+        self.assertTrue(W._low_memory(ImportError("DLL load failed: The paging file is too small for this "
+                                                  "operation to complete.")))
+        self.assertFalse(W._low_memory(RuntimeError("CUDA out of memory. Tried to allocate 1.00 GiB")))
+        self.assertFalse(W._low_memory(RuntimeError("CUDNN_STATUS_NOT_ENOUGH_MEMORY")))
+        self.assertEqual(W.STARTUP_WINERRORS, (126, 127, 193, 1114))
+        self.assertEqual(W.LOW_MEMORY_WINERRORS, (8, 14, 1455))
+
+    def test_recorder_waits_for_the_gate_at_a_stage_start(self):
+        order = []
+        gate = SimpleNamespace(wait_turn=lambda where: order.append(("turn", where)))
+        rec = W.Recorder(lambda ev, **k: order.append((ev, k.get("state"))))
+        rec("stage", key="bot", state="start")                            # no gate yet: no turn
+        rec.gate = gate
+        rec("stage", key="bot", state="start")
+        rec("stage", key="bot", state="end", seconds=1.0)
+        rec("page", done=1, of=2)
+        rec("budget", where="birth.qr", page=None)
+        rec.gate = None
+        rec("stage", key="report", state="start")
+        self.assertEqual(order, [("stage", "start"), ("stage", "start"), ("turn", "stage"), ("stage", "end"),
+                                 ("page", None), ("budget", None), ("stage", "start")])
+        self.assertEqual(rec.stage_turns, 1)
+
+    def test_recorder_no_turn_after_a_cancel(self):
+        turns = []
+
+        def listener(*a, **k):
+            raise Cancelled()
+        rec = W.Recorder(listener)
+        rec.gate = SimpleNamespace(wait_turn=turns.append)
+        with self.assertRaises(Cancelled):
+            rec("stage", key="bot", state="start")
+        self.assertEqual(turns, [])
 
     def test_redact(self):
         self.assertEqual(W.redact(f"refused: C:\\Users\\{NAME}\\x.pdf"), "refused: <path>")

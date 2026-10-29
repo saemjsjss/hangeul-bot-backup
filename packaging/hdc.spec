@@ -1,8 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
 # hdc.spec - PyInstaller 6.22.3, one folder, windowed: Hangeul Document Checker, the GPU build.
 # APP_SPEC r2 R2.4.5 over r1 6.2. Run only through `build.py freeze`, which sets HDC_STAGE (the staged, scrubbed
-# copy: PyInstaller never sees the worktree) and HDC_REPORTS. After Analysis the TOC is filtered and then checked;
-# the build stops when a check fails:
+# copy: PyInstaller never sees the worktree) and HDC_REPORTS. After Analysis the TOC is filtered (a top-level copy of
+# a DLL whose same source file is also collected into its package folder is dropped: see drop_top_level_copies) and
+# then checked; the build stops when a check fails:
 #   - no DLL base name twice (case-insensitive; a 774 MB DLL collected twice would double the size). The one
 #     exception is a delvewheel copy "<name>-<32 hex>.dll" in two "*.libs" folders: same name = same content, each
 #     loaded by its own package; such pairs are reported;
@@ -89,9 +90,32 @@ def our_runtime(stage):
     return out
 
 
+def _src_key(entry):
+    return os.path.normcase(os.path.abspath(str(entry[1])))
+
+
+def drop_top_level_copies(binaries):
+    """(binaries, dropped dests): a TOP-LEVEL entry whose source file is also collected into a sub-folder is dropped.
+    PyInstaller 6 keeps a dependency's package folder only for DLLs under site.getsitepackages(); the build env's
+    packages come through hdc_build.pth (R2.4.3), so its dependency scan collects torch\\lib, numpy.libs,
+    scipy.libs and the vendored pyzbar DLLs a second time at the top level, next to the copy in their own folder.
+    The packages load them from their own folders (torch adds torch\\lib and loads every DLL in it by full path,
+    numpy and scipy add their *.libs folder, pyzbar falls back to its own folder), as in DEV. A top-level DLL from
+    ANOTHER source with the same name is not touched: check_toc still stops the build on it."""
+    in_folder = {_src_key(e) for e in binaries if "/" in _dest(e)}
+    keep, dropped = [], []
+    for e in binaries:
+        if "/" not in _dest(e) and _src_key(e) in in_folder:
+            dropped.append(_dest(e))
+        else:
+            keep.append(e)
+    return keep, dropped
+
+
 def filter_toc(binaries, datas, stage):
     """(binaries, datas, dropped dests): DROP_WORDS and DROP_DATA removed; every VC++ runtime copy that is not
-    ours removed and ours put back where it belongs (our copies win, r1 6.2)."""
+    ours removed and ours put back where it belongs (our copies win, r1 6.2). Top-level copies of a file that is
+    also collected into a package folder are dropped last (drop_top_level_copies)."""
     ours = our_runtime(stage)
     runtime_names = {_base(k) for k in ours}
     keep_b, keep_d, dropped = [], [], []
@@ -118,7 +142,8 @@ def filter_toc(binaries, datas, stage):
             dropped.append(_dest(e))
             continue
         keep_d.append(e)
-    return keep_b, keep_d, dropped
+    keep_b, copies = drop_top_level_copies(keep_b)
+    return keep_b, keep_d, dropped + copies
 
 
 def check_toc(pure, binaries, datas, stage, torch_lib):

@@ -7,3 +7,6 @@
 # For our own code there is exactly ONE line. Third-party hits found by scan_bundle.py are reviewed and added below
 # it, each with its reason, before a build passes.
 src.verify.runner.app.cardgate | c:\hangeul\bot\data\verification\auto_verify.lock | the default lock path, used only when its folder exists (R2.2)
+# --- third-party hits, reviewed 29 Oct (G2, build 20261029.1): text inside the packages themselves, not this PC's folders
+networkx.algorithms.dag | jarvis | a literature reference in networkx's own is_aperiodic docstring (Jarvis and Shier, 1996); networkx comes with torch
+setuptools.command.sdist | .venv | setuptools' own default exclude pattern for source distributions (the .tox, .nox and .venv folders); setuptools comes with torch.utils.cpp_extension

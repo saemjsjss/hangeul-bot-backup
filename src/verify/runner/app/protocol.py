@@ -492,10 +492,83 @@ class CancelFlag:
         return self._ev.wait(timeout)
 
 
+class _PrivateStdin:
+    """Windows: the worker's stdin pipe read through a PRIVATE duplicate of its handle with kernel32's ReadFile, after
+    fd 0 and the process's standard input were pointed at NUL.
+
+    Why (G2, found by P1's --auto run): the C runtime's ``_read`` holds fd 0's lock for as long as it waits, and the
+    window writes nothing until Cancel. Any other thread that then takes fd 0's lock waits with it: ``import numpy``
+    does (seen in a child with a blocked stdin read; the frozen worker hung right after numpy's DLLs loaded, before
+    its first log line, so the window -> worker path never got past the start). With the pipe moved off fd 0 the
+    runtime and every library see NUL, and the watcher's ReadFile holds no lock of the runtime."""
+
+    def __init__(self, handle: int, kernel32: Any) -> None:
+        self._h = handle
+        self._k = kernel32
+
+    def read(self, n: int) -> bytes:
+        import ctypes
+        from ctypes import wintypes
+        buf = ctypes.create_string_buffer(int(n))
+        got = wintypes.DWORD(0)
+        if not self._k.ReadFile(wintypes.HANDLE(self._h), buf, wintypes.DWORD(int(n)), ctypes.byref(got), None):
+            return b""                                     # ERROR_BROKEN_PIPE: the window closed it = end of input
+        return buf.raw[:got.value]
+
+    def close(self) -> None:
+        if self._h:
+            self._k.CloseHandle(self._h)
+            self._h = 0
+
+
+def private_stdin() -> Optional[Any]:
+    """Windows only: a reader over a private duplicate of fd 0's handle (see ``_PrivateStdin``), with fd 0, sys.stdin
+    and STD_INPUT_HANDLE moved to NUL; None elsewhere or when there is no usable stdin handle (nothing is changed
+    then)."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.GetCurrentProcess.restype = wintypes.HANDLE
+        k.DuplicateHandle.argtypes = [wintypes.HANDLE, wintypes.HANDLE, wintypes.HANDLE,
+                                      ctypes.POINTER(wintypes.HANDLE), wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k.DuplicateHandle.restype = wintypes.BOOL
+        k.ReadFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+                               ctypes.c_void_p]
+        k.ReadFile.restype = wintypes.BOOL
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        k.SetStdHandle.argtypes = [wintypes.DWORD, wintypes.HANDLE]
+        k.SetStdHandle.restype = wintypes.BOOL
+        h0 = msvcrt.get_osfhandle(0)
+        if h0 in (-1, -2, 0):
+            return None
+        me = k.GetCurrentProcess()
+        dup = wintypes.HANDLE()
+        if not k.DuplicateHandle(me, wintypes.HANDLE(h0), me, ctypes.byref(dup), 0, False, 0x2):   # SAME_ACCESS
+            return None
+        nul = os.open(os.devnull, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        try:
+            os.dup2(nul, 0)                                # closes fd 0's pipe handle; fd 0 is NUL from now on
+        finally:
+            os.close(nul)
+        k.SetStdHandle(wintypes.DWORD(-10 & 0xFFFFFFFF), wintypes.HANDLE(msvcrt.get_osfhandle(0)))
+        return _PrivateStdin(int(dup.value), k)
+    except (OSError, ValueError, AttributeError, ImportError):
+        return None
+
+
 def watch_stdin(flag: CancelFlag, stream: Any = None, name: str = "hdc-stdin") -> Optional[threading.Thread]:
     """A daemon thread that reads the worker's stdin line by line and sets ``flag`` on ``cancel``. End of input
-    is not a cancel (a --cli run may have no stdin). Returns None when there is no stdin."""
+    is not a cancel (a --cli run may have no stdin). Returns None when there is no stdin. Without ``stream`` on
+    Windows the pipe is read through ``private_stdin()`` (never through fd 0: see ``_PrivateStdin``)."""
     if stream is None:
+        stream = private_stdin()
+    if stream is None:
+        if os.name == "nt":
+            return None                                    # never a blocking read of fd 0 on Windows
         try:
             stream = open(0, "rb", buffering=0, closefd=False)
         except (OSError, ValueError):

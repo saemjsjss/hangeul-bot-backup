@@ -205,11 +205,31 @@ def _dedupe(hits: List[Hit]) -> List[Hit]:
 
 # ---------------------------------------------------------------------------------------------- archives
 
+PYI_COOKIE = b"MEI\014\013\012\013\016"     # PyInstaller's CArchive cookie (CArchiveReader._COOKIE_MAGIC_PATTERN)
+
+
+def has_pyi_cookie(path: Path, chunk: int = CHUNK) -> bool:
+    """True when the file holds PyInstaller's CArchive cookie (read chunk by chunk, no PyInstaller import). An exe
+    without it is not a PyInstaller exe (torch\\bin\\protoc.exe), so it has no archive to read."""
+    tail = b""
+    with open(path, "rb") as fh:
+        while True:
+            buf = fh.read(chunk)
+            if not buf:
+                return False
+            if PYI_COOKIE in tail + buf:
+                return True
+            tail = buf[-(len(PYI_COOKIE) - 1):]
+
+
 class ArchiveSource:
     """What the scan needs from PyInstaller's readers; tests pass a fake with the same two methods."""
 
     def pkg_entries(self, exe: Path) -> Optional[List[Tuple[str, str, bytes]]]:
-        """[(name, typecode, decompressed bytes)] of the exe's CArchive; None when the exe has none."""
+        """[(name, typecode, decompressed bytes)] of the exe's CArchive; None when the exe has none (no cookie:
+        CArchiveReader would raise ArchiveReadError for such an exe)."""
+        if not has_pyi_cookie(exe):
+            return None
         from PyInstaller.archive.readers import CArchiveReader, NotAnArchiveError
         try:
             r = CArchiveReader(str(exe))
@@ -494,7 +514,10 @@ def _scan_exe(p: Path, rel: str, rep: Report, source: ArchiveSource) -> None:
         rep.failures.append(f"{rel}: cannot read its archive: {type(exc).__name__}")
         return
     if entries is None:
-        rep.notes.append(f"{rel}: no PyInstaller archive")
+        if "/" not in rel:                               # the app's own exe must carry the frozen code
+            rep.failures.append(f"{rel}: the app's exe has no PyInstaller archive")
+        else:
+            rep.notes.append(f"{rel}: no PyInstaller archive (scanned raw only)")
         return
     for name, typecode, data in entries:
         if typecode == "z":

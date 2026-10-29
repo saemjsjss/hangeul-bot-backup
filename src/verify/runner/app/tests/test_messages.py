@@ -131,6 +131,19 @@ class WaitingAndLines(unittest.TestCase):
         self.assertEqual([M.minutes(x) for x in (None, -5, 0, 59.9, 60, 3599, "x", float("nan"))],
                          [0, 0, 0, 0, 1, 59, 0, 0])
 
+    def test_result_notes_of_g1_review_finding_4(self):
+        for fn in (M.budget_note, M.downscaled_note, M.skipped_note):
+            for n in (0, None, -1, "x", True and 0):
+                self.assertEqual(fn(n), "", (fn.__name__, n))
+        self.assertEqual(M.budget_note(2), "2 QR or barcode reading step(s) ran out of time, so a code may not have "
+                         "been read. Check again when the PC is idle; the result may then differ.")
+        self.assertEqual(M.downscaled_note(1), "1 page(s) were read at a smaller size because the graphics card ran "
+                         "out of memory. Check again when the graphics card is free; the result may then differ.")
+        self.assertTrue(M.skipped_note(3).startswith("3 page(s) were too large for the graphics card's memory"))
+        for text in (M.budget_note(5), M.downscaled_note(5), M.skipped_note(5)):
+            self.assertTrue(text.isascii())
+            self.assertIsNone(DRIVE_PATH.search(text))
+
     def test_low_memory_note_is_yellow(self):
         n = M.low_card_memory_note(3000)
         self.assertEqual(n.kind, M.NOTE)

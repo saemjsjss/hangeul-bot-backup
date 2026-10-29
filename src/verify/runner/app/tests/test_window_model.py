@@ -381,7 +381,8 @@ class CheckStream(Base):
         self.assertRegex(job["job"], r"^[0-9a-f]{32}$")
         self.assertEqual(job["input"], str(self.pdf))
         self.assertEqual(job["program"], "KLP")
-        self.assertIsNone(job["today"])
+        self.assertEqual(job["today"], "2026-10-28")       # "today" is fixed at Check (G1 review finding 6)
+        self.assertEqual(m.check_date, "2026-10-28")
         self.assertEqual(job["cache_root"], str(self.data / "cache"))
         self.assertEqual(job["gpu"], {"lock_paths": [os.path.normpath(LOCK), os.path.normpath(OTHER_LOCK)],
                                       "index": 0, "cap_gb": 3.0, "need_free_mb": 4096})
@@ -394,6 +395,49 @@ class CheckStream(Base):
         except ImportError:
             return
         protocol.check_job(dict(job))                      # C's validator accepts the window's job
+
+    def test_one_check_date_for_the_window_and_the_worker(self):
+        # G1 review finding 6: Check pressed at 23:59:59; the worker starts after midnight. The job carries the
+        # window's date, so the worker's result code and date rules use the date the window shows.
+        late = dt.datetime(2026, 10, 29, 23, 59, 59)
+        m = self.model(now=lambda: late)
+        m, h = self.started(m)
+        self.assertEqual(h.job["today"], "2026-10-29")
+        self.run_events(m, h, {"ev": "hello"}, done_event(check_date="2026-10-29"),
+                        end=outcome("done", exit=0, done=done_event(check_date="2026-10-29")))
+        self.assertEqual(m.view().result.check_date, "2026-10-29")
+        m2, h2 = self.started(self.model())                    # the worker's date wins on screen
+        self.run_events(m2, h2, {"ev": "hello"}, done_event(check_date="2026-10-27"),
+                        end=outcome("done", exit=0, done=done_event(check_date="2026-10-27")))
+        self.assertEqual(m2.view().result.check_date, "2026-10-27")
+        m3, h3 = self.started(self.model())                    # an older worker sends none: the window's
+        self.run_events(m3, h3, {"ev": "hello"}, done_event(check_date="28.10.2026"),
+                        end=outcome("done", exit=0, done=done_event()))
+        self.assertEqual(m3.view().result.check_date, "2026-10-28")
+
+    def test_notes_for_what_can_change_a_verdict(self):
+        # G1 review finding 4: pages read smaller or left to the light reader, and QR / barcode budget hits
+        gpu = {"card": CARD, "peak_alloc_gb": 2.4, "peak_reserved_gb": 2.8, "cpu_calls": 0, "waits": 0,
+               "waited_s": 0.0, "downscaled": 2, "skipped": 1}
+        m, h = self.started()
+        ev = done_event(gpu=gpu, budget_hits=3)
+        self.run_events(m, h, {"ev": "hello"}, {"ev": "budget", "where": "birth.qr", "page": None}, ev,
+                        end=outcome("done", exit=0, done=ev))
+        notes = m.view().result.notes
+        for want in (M.downscaled_note(2), M.skipped_note(1), M.budget_note(3)):   # the done event's count wins
+            self.assertIn(want, notes)
+        self.assertNotIn(M.budget_note(1), notes)
+        m, h = self.started()                                 # no counts in the done event: the window's own
+        self.run_events(m, h, {"ev": "hello"}, {"ev": "budget", "where": "tin.stage_b", "page": None},
+                        {"ev": "budget", "where": "birth.qr", "page": None}, done_event(),
+                        end=outcome("done", exit=0, done=done_event()))
+        notes = m.view().result.notes
+        self.assertIn(M.budget_note(2), notes)
+        self.assertFalse([n for n in notes if "smaller size" in n or "light reader instead" in n])
+        m, h = self.started()                                 # nothing to say: no note
+        self.run_events(m, h, {"ev": "hello"}, done_event(budget_hits=0),
+                        end=outcome("done", exit=0, done=done_event(budget_hits=0)))
+        self.assertFalse([n for n in m.view().result.notes if "ran out of time" in n])
 
     def test_fixed_date_goes_into_the_job(self):
         m = self.model()
@@ -755,6 +799,7 @@ class Auto(Base):
         self.assertEqual(data["overall"], "FAIL")
         self.assertEqual(data["exit"], 0)
         self.assertEqual(data["pages_read_on_card"], 1)
+        self.assertEqual(data["check_date"], "2026-10-28")
         self.assertNotIn(":\\", res.read_text(encoding="utf-8"))
         self.assertIn(str(res), self.allowed)
         self.assertFalse((self.data / "settings.json").exists())        # --auto stores nothing

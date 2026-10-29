@@ -45,6 +45,7 @@ _ALIASES = {
     "cpu_calls": ("calls_cpu", "cpu_calls"),
     "cpu_s": ("seconds_cpu", "cpu_seconds", "cpu_s"),
     "oom_retries": ("oom_retries", "ooms", "oom"),
+    "lean_calls": ("calls_lean", "lean_calls"),
     "peak_alloc_gb": ("peak_alloc_gb", "peak_allocated_gb", "max_alloc_gb", "alloc_gb"),
     "peak_reserved_gb": ("peak_reserved_gb", "max_reserved_gb", "reserved_gb"),
 }
@@ -174,7 +175,8 @@ def card_info_block(info: Any) -> Dict[str, Any]:
 
 def first_read_block(fr: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     """gpuengine.first_read's result (counts only): pages by kind, downscaled, skipped, OOM retries, seconds,
-    model load and the phase-1 peaks."""
+    model load, the phase-1 peaks, and what was not reused from an earlier check (pages read smaller before, read
+    again now; a file of another build)."""
     if not isinstance(fr, Mapping):
         return {}
     pages = fr.get("pages") if isinstance(fr.get("pages"), Mapping) else {}
@@ -182,17 +184,22 @@ def first_read_block(fr: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
             "downscaled": count(fr.get("downscaled")), "skipped": count(fr.get("skipped")),
             "oom_retries": count(fr.get("oom_retries")), "seconds_total": number(fr.get("seconds_total")),
             "model_load_s": number(fr.get("model_load_s")),
+            "reread_downscaled": count(fr.get("reread_downscaled")), "stale_store": bool(fr.get("stale_store")),
             "peak_alloc_gb": number(pick(fr, "peak_alloc_gb")),
             "peak_reserved_gb": number(pick(fr, "peak_reserved_gb"))}
 
 
 def session_block(st: Any) -> Dict[str, Any]:
-    """One TorchSession.stats(): calls and seconds on the card and on the processor, OOM retries."""
+    """One TorchSession.stats(): calls and seconds on the card and on the processor, OOM retries, the calls that
+    ran on the card through the lean detector pass after an OOM (G2), and the times torch's card cache was given
+    back after a call (R2.1.5)."""
     if not isinstance(st, Mapping):
-        return {"card_calls": 0, "card_s": None, "cpu_calls": 0, "cpu_s": None, "oom_retries": 0}
+        return {"card_calls": 0, "card_s": None, "cpu_calls": 0, "cpu_s": None, "oom_retries": 0, "lean_calls": 0,
+                "releases": 0}
     return {"card_calls": count(pick(st, "card_calls", 0)), "card_s": number(pick(st, "card_s")),
             "cpu_calls": count(pick(st, "cpu_calls", 0)), "cpu_s": number(pick(st, "cpu_s")),
-            "oom_retries": count(pick(st, "oom_retries", 0))}
+            "oom_retries": count(pick(st, "oom_retries", 0)), "lean_calls": count(pick(st, "lean_calls", 0)),
+            "releases": count(st.get("releases", 0))}
 
 
 def waits_block(gs: Any) -> Dict[str, Any]:
@@ -215,7 +222,8 @@ def gpu_block(*, info: Any = None, card: Optional[Mapping[str, Any]] = None, cap
     ses = {k: session_block(v) for k, v in (sessions or {}).items() if safe_str(k)}
     totals = {"card_calls": sum(s["card_calls"] for s in ses.values()),
               "cpu_calls": sum(s["cpu_calls"] for s in ses.values()),
-              "oom_retries": sum(s["oom_retries"] for s in ses.values())}
+              "oom_retries": sum(s["oom_retries"] for s in ses.values()),
+              "lean_calls": sum(s["lean_calls"] for s in ses.values())}
     pk_alloc = [v for v in (number(pick(peaks or {}, "peak_alloc_gb")), frb.get("peak_alloc_gb")) if v is not None]
     pk_res = [v for v in (number(pick(peaks or {}, "peak_reserved_gb")), frb.get("peak_reserved_gb"))
               if v is not None]
@@ -240,12 +248,16 @@ def gpu_block(*, info: Any = None, card: Optional[Mapping[str, Any]] = None, cap
 
 
 def done_gpu(block: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
-    """The "gpu" part of the done event (R2.3.3): card, peaks, calls on the processor, waits."""
+    """The "gpu" part of the done event (R2.3.3): card, peaks, calls on the processor, waits, and the first read's
+    pages read smaller ("downscaled") and left to the light reader ("skipped") because of card memory (the window
+    shows them as result notes)."""
     b = block if isinstance(block, Mapping) else {}
     card, peaks, waits = b.get("card") or {}, b.get("peaks") or {}, b.get("waits") or {}
+    fr = b.get("first_read") or {}
     return {"card": card.get("name"), "peak_alloc_gb": peaks.get("alloc_gb"),
             "peak_reserved_gb": peaks.get("reserved_gb"), "cpu_calls": count(b.get("cpu_calls")),
-            "waits": count(waits.get("count")), "waited_s": number(waits.get("seconds")) or 0.0}
+            "waits": count(waits.get("count")), "waited_s": number(waits.get("seconds")) or 0.0,
+            "downscaled": count(fr.get("downscaled")), "skipped": count(fr.get("skipped"))}
 
 
 # ------------------------------------------------------------------------------------------ the run's lines
