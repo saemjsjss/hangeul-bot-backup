@@ -24,6 +24,12 @@ card (made-up pages, one gpu_guard slot): exit 0 in 56 s, first-read CER 0.0, 0 
 gave the same verdicts and result code on the same page texts. Cross-task fixes and accepted deviations: APP_SPEC
 R2.10. Next (G2): build env, stage, freeze, check (needs Q-O1 for cardrun), then P1, P4, P5, 8 c, installer, P3.
 
+RELEASED 29 Oct ~13:10: GPU app 1.0.1, C:\Hangeul\DOCCHECK\release\1.0.1 (Setup 1,939,820,983 bytes, sha256
+72c32b8e66bc426b153c6d36d93bbb201debaa311402e4cff46041e1399b51c9; build 20261029.4-58040f9; commits 58040f9, fe7da45).
+P1 = r8 on the 4 cases, P4 7/7, P5 memory met, install cycle 36/36 on the default data folder. Next release 1.1:
+step-count budgets for tin/birth QR (folder 9 hits tin.stage_e 4 times; a slower PC could differ); the app's own
+messages still say "SELFTEST.txt"; ISCC version not recorded in installer.json; then steps 2-7 below.
+
 | # | Step | Status |
 |---|------|--------|
 | 0 | Rev 2.6: the closer look, the owner's 28 Oct rules, 4 owner cases re-run | done, 74325b6 |
