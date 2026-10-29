@@ -10,7 +10,9 @@ Scenarios (R2.6 P4) and what passes:
   (6) no lock: the reference. It finishes; its result code equals P1's THIS_PC_CODE (when P1 ran).
   (1) the lock is there before the start: a ``gpu_wait`` start with ``where`` "start" within 3 s, no ``card`` ready
       event while the lock is there (60 s); after its removal the check finishes.
-  (2) the lock is made after the 3rd phase-1 page event, and (3) after the ``names`` stage starts (phase 2): a
+  (2) the lock is made after the 3rd phase-1 page event, and (3) after the closer-look ``names`` stage starts
+      (phase 2: the names stage after the ``financial`` stage, which makes model calls on the card; the runner's
+      first names stage takes ~0 s and leads straight into the processor-only ``bot`` stage, scenario 7's case): a
       ``gpu_wait`` start within 3 s, ``reserved_mb`` <= 256, no page or stage event during the 60 s hold, resumed
       within 10 s of the removal; the check finishes.
   (4) ``--worker`` with stdin: the lock after the 3rd page, ``cancel`` written 2 s into the wait: a ``cancelled``
@@ -68,7 +70,8 @@ APP_IDLE_MAX_MB = 1024
 FREE_SAMPLES_MIN = 3
 SETTLE_S = 0.5                      # after the app ended: free memory is read 3 times, this far apart (the max counts)
 ORDER = (6, 1, 2, 3, 7, 5, 4)
-TITLES = {1: "lock before the start", 2: "lock after the 3rd phase-1 page", 3: "lock after the names stage starts",
+TITLES = {1: "lock before the start", 2: "lock after the 3rd phase-1 page",
+          3: "lock after the closer-look names stage starts",
           4: "cancel during a wait (--worker)", 5: "stale lock (5 h old)", 6: "no lock (reference)",
           7: "lock during the bot stage (processor work)"}
 
@@ -143,6 +146,7 @@ class Controller:
         self._mu = threading.Lock()
         self._stage: Optional[str] = None
         self._phase1 = 0
+        self._financial = False
         self._waiting = False
         self._last_bot = -1e9
         self._last_free = -1e9
@@ -169,9 +173,14 @@ class Controller:
                 self._stage = ev.get("key") if ev.get("state") == "start" else None
             if kind == "page" and (ev.get("where") == "card" or self._stage == "firstread"):
                 self._phase1 += 1
+            if kind == "stage" and ev.get("key") == "financial" and ev.get("state") == "start":
+                self._financial = True
+            # (3) fires at the closer-look names stage (names.evaluate, card work), which starts after the
+            # financial stage. The runner's FIRST names stage (affidavit_info, ~0 s) is followed at once by the
+            # processor-only bot stage, where no model call comes for up to a minute: that is scenario 7 (G2).
             fire = ((self.trigger == "page3" and kind == "page" and self._phase1 == 3)
                     or (self.trigger in ("names", "bot") and kind == "stage" and ev.get("key") == self.trigger
-                        and ev.get("state") == "start"))
+                        and ev.get("state") == "start" and (self.trigger != "names" or self._financial)))
             if fire and self.marks["t_lock"] is None:
                 self.lock.make()
                 self.marks["t_lock"] = ctl.elapsed() if ctl is not None else t

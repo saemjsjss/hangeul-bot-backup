@@ -719,6 +719,36 @@ class PolitenessTests(TmpCase):
         self.assertFalse(c.marks["gave_up"])
         self.assertEqual(politeness.ORDER, (6, 1, 2, 3, 7, 5, 4))
 
+    def test_controller_scenario_3_fires_at_the_closer_look_names_stage(self):
+        # G2 P4: the runner has two names stages; the first (affidavit_info, ~0 s) leads straight into the
+        # processor-only bot stage. Scenario 3 must make its lock at the second one (names.evaluate, after the
+        # financial stage), where the closer looks call the card.
+        lock = politeness.FakeLock(self.tmp / "fakelock" / "auto_verify.lock")
+        c = politeness.Controller(3, lock, bot_active=lambda: False)
+        ctl = FakeCtl()
+        c.before_start()
+
+        def stage(key, state):
+            return json.dumps({"v": 1, "ev": "stage", "key": key, "state": state})
+
+        for t, (key, state) in enumerate([("names", "start"), ("names", "end"), ("bot", "start"), ("bot", "end"),
+                                          ("bank", "start"), ("bank", "end"), ("tin", "start"), ("tin", "end")],
+                                         start=1):
+            c.on_line(float(t), stage(key, state), ctl)
+        self.assertFalse(lock.exists())
+        self.assertIsNone(c.marks["t_lock"])
+        c.on_line(9.0, stage("financial", "start"), ctl)
+        c.on_line(9.5, stage("financial", "end"), ctl)
+        self.assertFalse(lock.exists())
+        ctl.t = 10.05
+        c.on_line(10.0, stage("names", "start"), ctl)
+        self.assertTrue(lock.exists())
+        self.assertEqual(c.marks["t_lock"], 10.05)
+        c.on_line(10.4, json.dumps(wait_ev("start", lock="other", where="det", reserved_mb=40)), ctl)
+        self.assertEqual(c.marks["t_ws"], 10.4)
+        c.finish()
+        self.assertFalse(lock.exists())
+
     def test_controller_page3_hold_and_removal(self):
         lock = politeness.FakeLock(self.tmp / "fakelock" / "auto_verify.lock")
         c = politeness.Controller(2, lock, hold_s=5.0, bot_active=lambda: False)
@@ -1326,6 +1356,46 @@ class TraceCheckTests(TmpCase):
         (self.install / "extra.txt").write_bytes(b"x")
         r = self.check(manifest=mpath)
         self.assertEqual(r["by_kind"], {"manifest": 1})
+
+    def test_mkdir_of_an_installed_folder_is_a_no_op_only_with_the_manifest(self):
+        # G2 8 c: EasyOCR's Path(dir).mkdir(parents=True, exist_ok=True) on the bundle's model folders
+        model = self.install / "_internal" / "engine" / "easyocr" / "model"
+        user = self.install / "_internal" / "engine" / "easyocr" / "user_network"
+        files = {"Hangeul Document Checker.exe": b"MZ1", "_internal/engine/easyocr/model/w.pth": b"w",
+                 "_internal/engine/easyocr/user_network/.keep": b""}
+        for rel, data in files.items():
+            (self.install / rel).parent.mkdir(parents=True, exist_ok=True)
+            (self.install / rel).write_bytes(data)
+        mpath = self.install / "_internal" / "MANIFEST.json"
+        mpath.write_text(json.dumps({"files": [{"path": rel, "size": len(d)} for rel, d in files.items()]}),
+                         encoding="utf-8")
+        mk = [{"event": "os.mkdir", "args": [str(model), 511, -1]}, {"event": "os.mkdir", "args": [str(user), 511, -1]}]
+        self.write(self.good + mk + mk)
+        r = self.check(manifest=mpath)
+        self.assertTrue(r["passed"], r["findings"])
+        self.assertEqual(r["advisory"], {"mkdir of an installed folder (no-op)": 4})
+        r = self.check()                                               # without the manifest: findings
+        self.assertEqual(r["by_kind"], {"write-install": 4})
+        new = {"event": "os.mkdir", "args": [str(self.install / "_internal" / "engine" / "new"), 511, -1]}
+        self.write(self.good + [new])
+        self.assertEqual(self.check(manifest=mpath)["by_kind"], {"write-install": 1})
+        rm = {"event": "os.rmdir", "args": [str(model), -1]}           # only mkdir is a no-op
+        self.write(self.good + [rm])
+        self.assertEqual(self.check(manifest=mpath)["by_kind"], {"write-install": 1})
+
+    def test_the_harness_result_file_may_be_written(self):
+        # G2 8 c: the window writes the --auto-result file atomically where the harness put it
+        auto = self.tmp / "runroot" / "auto.json"
+        ev = [{"event": "open", "args": [str(auto) + ".tmp", "w", 577]},
+              {"event": "os.rename", "args": [str(auto) + ".tmp", str(auto), -1, -1]}]
+        self.write(self.good + ev)
+        self.assertEqual(self.check()["by_kind"], {"outside": 3})
+        r = self.check(allow_files=[auto])
+        self.assertTrue(r["passed"], r["findings"])
+        self.assertEqual(r["advisory"], {"the harness's own result file": 3})
+        other = {"event": "open", "args": [str(auto.parent / "other.json"), "w", 577]}
+        self.write(self.good + ev + [other])
+        self.assertEqual(self.check(allow_files=[auto])["by_kind"], {"outside": 1})
 
     def test_cli_check_and_run_with_fakes(self):
         self.write(self.good)

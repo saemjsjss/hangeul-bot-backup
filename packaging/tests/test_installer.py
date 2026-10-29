@@ -928,13 +928,18 @@ class FakeInno:
     def __init__(self, app_src: Path, pl: ic.Places, *, key: Optional[Dict[str, Any]] = None, setup_rc: int = 0,
                  install_delete: bool = True, extra_file: Optional[str] = None, selftest_rc: int = 0,
                  app_writes: bool = False, keeps_data: bool = False, location: Optional[str] = None,
-                 version: str = "1.0.0", lnk_elsewhere: bool = False, desktop: bool = False):
+                 version: str = "1.0.0", lnk_elsewhere: bool = False, desktop: bool = False,
+                 case_facts: Optional[Dict[str, Any]] = None):
         self.app_src, self.pl, self.key = app_src, pl, key
         self.setup_rc, self.install_delete, self.extra_file = setup_rc, install_delete, extra_file
         self.selftest_rc, self.app_writes, self.keeps_data = selftest_rc, app_writes, keeps_data
         self.location, self.version, self.lnk_elsewhere, self.desktop = location, version, lnk_elsewhere, desktop
+        self.case_facts = case_facts
         self.calls: List[str] = []
         self.selftests: List[Path] = []
+        self.selftest_data: List[Optional[Path]] = []
+        self.data_at_uninstall: List[bool] = []
+        self.cases: List[Dict[str, Any]] = []
         self.installed: set = set()
 
     def uninstall_key(self):
@@ -979,6 +984,7 @@ class FakeInno:
         return bi.RunResult(self.setup_rc, 2.0, in_job=True)
 
     def _uninstall(self) -> bi.RunResult:
+        self.data_at_uninstall.append(self.pl.data_dir.exists())
         d = self.pl.test_dir
         for rel in sorted(self.installed, reverse=True):
             p = d / rel
@@ -996,15 +1002,36 @@ class FakeInno:
             shutil.rmtree(self.pl.data_dir)
         return bi.RunResult(0, 1.0, in_job=True)
 
-    def selftest(self, exe: Path, report_dir: Path, timeout_s: float):
+    def selftest(self, exe: Path, report_dir: Path, timeout_s: float, data_dir: Optional[Path] = None):
         self.selftests.append(exe)
+        self.selftest_data.append(data_dir)
         assert exe == self.pl.exe and report_dir.is_dir()
-        (self.pl.data_dir / "selftest").mkdir(parents=True, exist_ok=True)
-        (self.pl.data_dir / "selftest" / "SELFTEST.txt").write_text("made-up", encoding="ascii")
+        d = data_dir if data_dir is not None else self.pl.data_dir
+        (d / "selftest").mkdir(parents=True, exist_ok=True)
+        (d / "selftest" / "SELFTEST.txt").write_text("made-up", encoding="ascii")
         (report_dir / "SELFTEST 2026-10-29 1200.txt").write_text("made-up", encoding="ascii")
         if self.app_writes:
             (self.pl.test_dir / "written-by-app.txt").write_text("made-up", encoding="ascii")
         return self.selftest_rc, ""
+
+    def check_case(self, exe: Path, spec: Any, out_dir: Path, data_dir: Path, override: bool = False
+                   ) -> Dict[str, Any]:
+        assert exe == self.pl.exe and out_dir.is_dir()
+        assert (data_dir != self.pl.data_dir) == override
+        self.cases.append({"label": spec.label, "installs": sum(" /DIR=" in c for c in self.calls),
+                           "uninstalls": sum("unins000.exe" in c for c in self.calls),
+                           "selftests": len(self.selftests), "out": out_dir, "data": data_dir,
+                           "override": override})
+        store = data_dir / "cache" / "pagetexts" / (spec.case_id + ".json")
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text('{"made-up": true}', encoding="ascii")
+        (out_dir / "run.json").write_text("{}", encoding="ascii")
+        facts = {"exit": 0, "timed_out": False, "code": spec.expect_code, "why": "", "verdicts_equal": True,
+                 "summary_equal": True, "summary_lines": 22, "run_equal": True, "looks_equal": 11, "looks_r8": 11,
+                 "store_in_data": True, "p1_equal": True, "p1_equal_pages": 29, "p1_pages": 29, "p1_differing": [],
+                 "p1_problems": 0, "r8_equal_pages": 27, "r8_pages": 29, "r8_differing": [9, 14]}
+        facts.update(self.case_facts or {})
+        return facts
 
     def sleep(self, seconds: float) -> None:
         pass
@@ -1138,6 +1165,283 @@ class TestCycle(unittest.TestCase):
         self.assertEqual(fake.selftests, [])
 
 
+CASE_ID = "F-0123456789abcdef"        # made-up case id
+CASE_CODE = "ABCD-0123"               # made-up result code
+
+
+def make_case_spec(root: Path, **kw: Any) -> "ic.CaseSpec":
+    inp = root / "made-up input"
+    inp.mkdir(parents=True, exist_ok=True)
+    args = dict(label="owner_x_r8", input=str(inp), program="EAP", today="2026-10-28", case_id=CASE_ID, mode="folder",
+                r8_dir=root / "runs" / "owner_x_r8", expect_code=CASE_CODE, apptest=root / "apptest" / BID,
+                p1_store=root / "p1store.json", p1_r8_differing=[9, 14])
+    args.update(kw)
+    return ic.CaseSpec(**args)
+
+
+class TestCycleCase(unittest.TestCase):
+    """--case: one r8 case on the installed app after the upgrade (G3)."""
+
+    def setUp(self):
+        self.root = scratch("cyclecase")
+        self.app = make_app(self.root / "dist")
+        self.pl = ic.Places(self.root / "LocalAppData", self.root / "Programs", self.root / "Desktop")
+        mpath = bi.find_manifest(self.app)
+        self.ctx = ic.Ctx(build_id=BID, app_version="1.0.0", setup_exe=self.root / "made-up setup.exe",
+                          manifest=bi.load_manifest(mpath), manifest_rel="_internal/MANIFEST.json",
+                          manifest_sha256=bi.sha256_file(mpath), reports=self.root / "reports", grace_s=0,
+                          case=make_case_spec(self.root))
+        self.lines: List[str] = []
+
+    def tearDown(self):
+        remove(self.root)
+
+    def cycle(self, fake: FakeInno) -> ic.Outcome:
+        return ic.run_cycle(self.ctx, self.pl, fake, out=self.lines.append)
+
+    def test_case_runs_after_the_upgrade_and_its_data_is_deleted(self):
+        fake = FakeInno(self.app, self.pl)
+        o = self.cycle(fake)
+        self.assertEqual(o.status, "PASS", [c.name for c in o.failed])
+        self.assertEqual(len(fake.cases), 1)
+        self.assertEqual({k: fake.cases[0][k] for k in ("installs", "uninstalls", "selftests")},
+                         {"installs": 2, "uninstalls": 0, "selftests": 2})
+        out = fake.cases[0]["out"]
+        self.assertEqual((out.name, out.parent.name), ("out", "owner_x_r8"))
+        self.assertTrue(out.parent.parent.name.startswith("p3-"))
+        self.assertEqual(out.parent.parent.parent, self.ctx.case.apptest)
+        names = [(c.step, c.name) for c in o.checks]
+        for name in ("run", "result code", "verdicts", "data folder", "page texts"):
+            self.assertIn(("case", name), names)
+        self.assertLess(names.index(("case", "run")), names.index(("uninstall", "data gone")))
+        self.assertFalse(self.pl.data_dir.exists())             # the case's page texts went with the uninstall
+        self.assertEqual(o.facts["case"]["expect_code"], CASE_CODE)
+        self.assertTrue(any("the same pages as in P1" in n for n in o.notes))
+        text = "\n".join(self.lines) + json.dumps(o.to_json())
+        self.assertNotIn(str(self.root), text)
+        self.assertNotIn(str(self.root).replace("\\", "\\\\"), text)
+        self.assertNotIn("made-up input", text)
+
+    def test_a_wrong_case_result_fails_but_still_uninstalls(self):
+        for facts, expect in (({"code": "FFFF-0000"}, "result code"), ({"verdicts_equal": False}, "verdicts"),
+                              ({"exit": 1}, "run"), ({"timed_out": True}, "run"),
+                              ({"store_in_data": False}, "data folder"),
+                              ({"p1_equal": False, "p1_differing": [3]}, "page texts"),
+                              ({"exit": None, "code": None, "why": "cardrun.run raised NotApproved"}, "run")):
+            with self.subTest(facts):
+                for p in (self.pl.local_appdata, self.pl.programs, self.pl.desktop):
+                    shutil.rmtree(p, ignore_errors=True)
+                fake = FakeInno(self.app, self.pl, case_facts=facts)
+                o = self.cycle(fake)
+                self.assertEqual(o.status, "FAIL")
+                self.assertIn("case/" + expect, ["%s/%s" % (c.step, c.name) for c in o.failed])
+                self.assertTrue("unins000.exe" in fake.calls[-1])
+                self.assertFalse(self.pl.data_dir.exists())
+
+    def test_no_case_when_setup_fails_and_no_p1_store_is_a_note(self):
+        fake = FakeInno(self.app, self.pl, setup_rc=4)
+        o = self.cycle(fake)
+        self.assertEqual(fake.cases, [])
+        self.assertEqual(o.status, "FAIL")
+        self.ctx.case = make_case_spec(self.root, p1_store=None)
+        o = self.cycle(FakeInnoNoP1(self.app, self.pl))
+        self.assertEqual(o.status, "PASS", [c.name for c in o.failed])
+        self.assertNotIn(("case", "page texts"), [(c.step, c.name) for c in o.checks])
+        self.assertTrue(any("compared with r8 only" in n for n in o.notes))
+
+    def test_data_dir_for_a_redirected_appdata(self):
+        self.ctx.app_data = self.root / "private data"
+        fake = FakeInno(self.app, self.pl)
+        o = self.cycle(fake)
+        self.assertEqual(o.status, "PASS", [c.name for c in o.failed])
+        self.assertEqual(fake.selftest_data, [self.ctx.app_data, self.ctx.app_data])
+        self.assertEqual((fake.cases[0]["data"], fake.cases[0]["override"]), (self.ctx.app_data, True))
+        self.assertEqual(fake.data_at_uninstall, [True])          # the made-up file was there for the uninstaller
+        self.assertFalse(self.pl.data_dir.exists())
+        self.assertTrue((self.ctx.app_data / "cache" / "pagetexts" / (CASE_ID + ".json")).is_file())
+        self.assertTrue(any("made-up file was put in the app's data folder" in n for n in o.notes))
+        fake = FakeInno(self.app, self.pl, keeps_data=True)       # an uninstaller that keeps the data: caught
+        o = self.cycle(fake)
+        self.assertIn("uninstall/data gone", ["%s/%s" % (c.step, c.name) for c in o.failed])
+        shutil.rmtree(self.pl.data_dir)
+
+    def test_selftest_command_with_a_data_dir(self):
+        seen = {}
+
+        class FakeCardrun:
+            @staticmethod
+            def app_env(data_dir=None):
+                return {"D": str(data_dir)}
+
+            @staticmethod
+            def run(cmd, timeout, *, what=None, env=None):
+                seen.update(cmd=cmd, env=env)
+                return {"returncode": 0}
+
+        self.assertEqual(ic.cardrun_selftest(Path("Z:\\t\\x.exe"), Path("Z:\\r"), 9, loader=lambda: FakeCardrun,
+                                             data_dir=Path("Z:\\d")), (0, ""))
+        self.assertEqual(seen["cmd"], ["Z:\\t\\x.exe", "--data-dir", "Z:\\d", "--selftest", "--report-dir", "Z:\\r"])
+        self.assertEqual(seen["env"], {"D": "Z:\\d"})
+        ic.cardrun_selftest(Path("x.exe"), Path("r"), 9, loader=lambda: FakeCardrun)
+        self.assertEqual((seen["cmd"][1], seen["env"]), ("--selftest", {"D": "None"}))
+
+    def test_case_command_has_no_data_dir(self):
+        spec = make_case_spec(self.root)
+        cmd = ic.case_command(Path("Z:\\t\\a.exe"), spec, Path("Z:\\o"))
+        self.assertEqual(cmd, ["Z:\\t\\a.exe", "--cli", spec.input, "--program", "EAP", "--out", "Z:\\o",
+                               "--today", "2026-10-28"])
+        spec.today = None
+        self.assertNotIn("--today", ic.case_command(Path("a.exe"), spec, Path("o")))
+        self.assertNotIn("--data-dir", cmd)
+        self.assertEqual(ic.case_command(Path("a.exe"), spec, Path("o"), Path("Z:\\d"))[-2:], ["--data-dir", "Z:\\d"])
+
+    def test_cardrun_case_judges_with_parity(self):
+        seen: Dict[str, Any] = {}
+        spec = make_case_spec(self.root)
+        data = self.root / "data"
+        store = data / "cache" / "pagetexts" / (CASE_ID + ".json")
+        store.parent.mkdir(parents=True)
+        store.write_text('{"files": []}', encoding="ascii")
+        spec.p1_store.write_text('{"files": []}', encoding="ascii")
+        out = self.root / "p3" / "owner_x_r8" / "out"
+        out.mkdir(parents=True)
+
+        class Res:
+            returncode, timed_out, lines = 0, False, [(1.0, "made-up")]
+
+            @staticmethod
+            def stats():
+                return {"seconds": 300.0, "slot_wait_s": 0.1, "peak_working_set_mb": 2000.0,
+                        "job_peak_process_commit_mb": 5400.0}
+
+        class FakeCardrun:
+            @staticmethod
+            def app_env(data_dir=None):
+                return {"MADE_UP": "1"} if data_dir is None else {"MADE_UP": "1", "HDC_DATA_DIR": str(data_dir)}
+
+            @staticmethod
+            def run(cmd, timeout, *, what=None, env=None, log_dir=None):
+                seen.update(cmd=cmd, timeout=timeout, what=what, env=env, log_dir=log_dir)
+                return Res()
+
+            events_of = staticmethod(lambda lines: [(1.0, {"ev": "done"})])
+            done_event = staticmethod(lambda ev: {"code": "0000-0000", "gpu": {"cpu_calls": 0, "waits": 1}})
+            error_codes = staticmethod(lambda ev: [])
+            read_json = staticmethod(lambda p: json.loads(Path(p).read_text(encoding="ascii")))
+
+        class FakeParity:
+            class R8Case:
+                def __init__(self, **kw):
+                    seen["case"] = kw
+
+            @staticmethod
+            def judge_outputs(case, out_dir, data_dir):
+                seen["judged"] = (out_dir, data_dir)
+                return {"code": CASE_CODE, "verdicts_equal": True,
+                        "summary": {"equal": True, "lines_r8": 22, "diffs": []},
+                        "run": {"equal": True, "diffs": []}, "looks": {"equal_looks": 11, "looks_r8": 11, "diffs": []},
+                        "page_texts": {"equal_pages": 27, "pages_r8": 29, "differing": [{"page": 9}, {"page": 14}]}}
+
+            find_store = staticmethod(lambda d, cid: store if cid == CASE_ID else None)
+
+            @staticmethod
+            def compare_page_texts(a, b):
+                seen["p1_compare"] = (a, b)
+                return {"equal": True, "equal_pages": 29, "pages_r8": 29, "differing": [], "problems": []}
+
+        f = ic.cardrun_case(self.pl.exe, spec, out, data, loader=lambda: FakeCardrun, judge_loader=lambda: FakeParity)
+        self.assertEqual(seen["cmd"], ic.case_command(self.pl.exe, spec, out))
+        self.assertEqual((seen["env"], seen["log_dir"], seen["timeout"]), ({"MADE_UP": "1"}, out.parent, spec.timeout_s))
+        self.assertIn("install cycle", seen["what"])
+        self.assertEqual(seen["judged"], (out, data))
+        self.assertEqual(seen["case"]["case_id"], CASE_ID)
+        self.assertEqual(seen["p1_compare"], ({"files": []}, {"files": []}))
+        self.assertEqual((f["exit"], f["code"], f["verdicts_equal"], f["store_in_data"], f["p1_equal"]),
+                         (0, CASE_CODE, True, True, True))
+        self.assertEqual((f["r8_differing"], f["cpu_calls"], f["peak_working_set_mb"]), ([9, 14], 0, 2000.0))
+        f = ic.cardrun_case(self.pl.exe, spec, out, data, override=True, loader=lambda: FakeCardrun,
+                            judge_loader=lambda: FakeParity)
+        self.assertEqual(seen["cmd"][-2:], ["--data-dir", str(data)])
+        self.assertEqual(seen["env"], {"MADE_UP": "1", "HDC_DATA_DIR": str(data)})
+        self.assertTrue(f["store_in_data"])
+        store.unlink()                                    # only another pagetexts file left: not the case's
+        (store.parent / "selftest-made-up.json").write_text("{}", encoding="ascii")
+        f = ic.cardrun_case(self.pl.exe, spec, out, data, loader=lambda: FakeCardrun, judge_loader=lambda: FakeParity)
+        self.assertFalse(f["store_in_data"])
+        self.assertNotIn("p1_equal", f)
+        self.assertIsNone(ic.case_store(data, ""))
+        nested = data / "x" / "pagetexts" / (CASE_ID + ".json")
+        nested.parent.mkdir(parents=True)
+        nested.write_text("{}", encoding="ascii")
+        self.assertEqual(ic.case_store(data, CASE_ID), nested)
+
+        class NotApproved(RuntimeError):
+            pass
+
+        class Refuses(FakeCardrun):
+            @staticmethod
+            def run(cmd, timeout, **kw):
+                raise NotApproved("made-up")
+
+        f = ic.cardrun_case(self.pl.exe, spec, out, data, loader=lambda: Refuses, judge_loader=lambda: FakeParity)
+        self.assertIsNone(f["exit"])
+        self.assertIn("HDC_CARDRUN_APPROVAL=Q-O1", f["why"])
+
+    def test_load_case(self):
+        runs, builds, apptest = self.root / "runs", self.root / "builds", self.root / "apptest"
+        inp = self.root / "made-up input"
+        inp.mkdir(exist_ok=True)                     # setUp's case spec made it already
+        (runs / "owner_x_r8").mkdir(parents=True)
+        (runs / "owner_x_r8" / "run.json").write_text(json.dumps(
+            {"input": str(inp), "program": "EAP", "today": "2026-10-28", "case_id": CASE_ID, "mode": "folder"}),
+            encoding="utf-8")
+        (builds / BID / "reports").mkdir(parents=True)
+        parity_json = builds / BID / "reports" / "parity.json"
+        p1 = {"build_id": BID, "passed": True, "run_folder": "p1-20261029-073106",
+              "cases": [{"label": "owner_x_r8", "ok": True, "code": CASE_CODE,
+                         "page_texts": {"differing": [{"page": 9}, {"page": 14}]}}]}
+        parity_json.write_text(json.dumps(p1), encoding="utf-8")
+        store = apptest / BID / "p1-20261029-073106" / "owner_x_r8" / "data" / "cache" / "pagetexts" / (CASE_ID + ".json")
+        store.parent.mkdir(parents=True)
+        store.write_text("{}", encoding="ascii")
+        spec = ic.load_case(BID, builds, "owner_x_r8", runs=runs, apptest=apptest)
+        self.assertEqual((spec.input, spec.program, spec.today, spec.case_id, spec.expect_code),
+                         (str(inp), "EAP", "2026-10-28", CASE_ID, CASE_CODE))
+        self.assertEqual((spec.p1_store, spec.p1_r8_differing, spec.apptest), (store, [9, 14], apptest / BID))
+        self.assertEqual(ic.load_case(BID, builds, "owner_x_r8", runs=runs, apptest=apptest,
+                                      expect_code="0000-1111").expect_code, "0000-1111")
+        bad = (({"label": "../x"}, "r8 run name"), ({"label": "owner_y_r8"}, "no readable run.json"),
+               ({"expect_code": "abcd-0123"}, "XXXX-XXXX"), ({"case_input": "relative"}, "not there"))
+        for kw, msg in bad:
+            with self.subTest(kw):
+                label = kw.pop("label", "owner_x_r8")
+                with self.assertRaises(ValueError) as cm:
+                    ic.load_case(BID, builds, label, runs=runs, apptest=apptest, **kw)
+                self.assertIn(msg, str(cm.exception))
+                self.assertNotIn(str(self.root), str(cm.exception))
+        parity_json.write_text(json.dumps(dict(p1, passed=False)), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            ic.load_case(BID, builds, "owner_x_r8", runs=runs, apptest=apptest)
+        parity_json.write_text(json.dumps(dict(p1, build_id="20261029.4-abc1234")), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            ic.load_case(BID, builds, "owner_x_r8", runs=runs, apptest=apptest, expect_code=CASE_CODE)
+        parity_json.unlink()
+        with self.assertRaises(ValueError):
+            ic.load_case(BID, builds, "owner_x_r8", runs=runs, apptest=apptest)
+        spec = ic.load_case(BID, builds, "owner_x_r8", runs=runs, apptest=apptest, expect_code=CASE_CODE)
+        self.assertIsNone(spec.p1_store)
+
+
+class FakeInnoNoP1(FakeInno):
+    """The case's facts without a P1 page-texts comparison (P1's store was not found)."""
+
+    def check_case(self, exe, spec, out_dir, data_dir):
+        f = super().check_case(exe, spec, out_dir, data_dir)
+        for k in ("p1_equal", "p1_equal_pages", "p1_pages", "p1_differing", "p1_problems"):
+            f.pop(k, None)
+        return f
+
+
 class TestCycleMain(unittest.TestCase):
     def setUp(self):
         self.root = scratch("cyclemain")
@@ -1170,6 +1474,38 @@ class TestCycleMain(unittest.TestCase):
         self.assertEqual((data["status"], data["build_id"]), ("PASS", BID))
         self.assertNotIn(str(self.root).replace("\\", "\\\\"), report.read_text(encoding="utf-8"))
         self.assertTrue(self.lines[-1].startswith("RESULT: PASS"))
+
+    def test_main_with_a_case(self):
+        runs, apptest = self.root / "runs", self.root / "apptest"
+        inp = self.root / "made-up input"
+        inp.mkdir()
+        (runs / "owner_x_r8").mkdir(parents=True)
+        (runs / "owner_x_r8" / "run.json").write_text(json.dumps(
+            {"input": str(inp), "program": "KLP", "today": "2026-10-28", "case_id": CASE_ID}), encoding="utf-8")
+        args = ["--case", "owner_x_r8", "--runs-root", str(runs), "--apptest-root", str(apptest)]
+        fake = FakeInno(self.app, self.pl)
+        self.assertEqual(self.main(fake, *args), ic.EXIT_USAGE)          # no P1 result and no --expect-code
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(self.main(fake, "--expect-code", CASE_CODE), ic.EXIT_USAGE)   # needs --case
+        self.assertEqual(self.main(fake, *args, "--expect-code", CASE_CODE), ic.EXIT_PASS, self.lines)
+        self.assertEqual(len(fake.cases), 1)
+        report = self.builds / BID / "reports" / "install_cycle" / "install_cycle.json"
+        data = json.loads(report.read_text(encoding="utf-8"))
+        self.assertEqual((data["facts"]["case"]["expect_code"], data["facts"]["case"]["code"]), (CASE_CODE, CASE_CODE))
+        self.assertNotIn(str(self.root).replace("\\", "\\\\"), report.read_text(encoding="utf-8"))
+        self.assertEqual(len(list((apptest / BID).glob("p3-*"))), 1)
+        busy = self.root / "busy data"
+        busy.mkdir()
+        (busy / "x.txt").write_text("made-up", encoding="ascii")
+        la = os.environ.get("LOCALAPPDATA") or "C:\\made-up-la"
+        for bad in ("relative data", str(busy), la + "\\made-up hdc test data"):
+            with self.subTest(bad):
+                self.assertEqual(self.main(FakeInno(self.app, self.pl), "--data-dir", bad), ic.EXIT_USAGE)
+        self.assertFalse(os.path.exists(la + "\\made-up hdc test data"))
+        fake = FakeInno(self.app, self.pl)
+        self.assertEqual(self.main(fake, *args, "--expect-code", CASE_CODE, "--data-dir", str(self.root / "pd")),
+                         ic.EXIT_PASS, self.lines)
+        self.assertEqual(fake.selftest_data, [self.root / "pd", self.root / "pd"])
 
     def test_exit_codes(self):
         self.assertEqual(self.main(FakeInno(self.app, self.pl, key={"x": 1})), ic.EXIT_SKIPPED)

@@ -16,7 +16,10 @@ Pass (rev 1 + R2.6):
     the working folder (DATA, set by boot);
   - nothing under C:\\Hangeul\\BOT (the lock is only stat'ed, which raises no audit event); nothing in the system
     %TEMP%;
-  - zero write events under the install folder; no registry writes; registry reads only of the expected keys (CPU
+  - zero write events under the install folder, except an ``os.mkdir`` of a folder that holds MANIFEST.json files
+    (EasyOCR's ``mkdir(exist_ok=True)`` on the bundle's model folders: a no-op, counted as advisory; needs the
+    manifest); the harness's own ``--auto-result`` file (and its ``.tmp``) may be written where the harness put it
+    (``--allow-file``; ``run`` passes its auto.json); no registry writes; registry reads only of the expected keys (CPU
     name, Windows version, LongPathsEnabled, Smart App Control state); no process start other than the app's own
     exe; no socket event that was not refused; no onnxruntime session (GPU build);
   - with ``--manifest``: the install folder still matches MANIFEST.json (sizes; sha256 with ``--hash``), none added.
@@ -97,6 +100,11 @@ class Roots:
     windir: str
     temp: str
     cwd: str
+    # files the harness itself asked the app to write outside the roots (``--auto-result``), with their ".tmp"
+    # sibling (the window writes them atomically); normalized
+    allowed_files: Tuple[str, ...] = ()
+    # the install's own folders (every ancestor folder of a MANIFEST.json file); normalized
+    shipped_dirs: frozenset = frozenset()
 
     def token(self, p: str) -> str:
         for name in ("trace", "data", "report", "install", "input", "windir"):
@@ -192,6 +200,7 @@ def _paths(e: Event) -> List[Tuple[str, bool]]:
 def check_events(events: Sequence[Event], roots: Roots, extra_reg: Sequence[str] = ()) -> Dict[str, Any]:
     findings: List[Finding] = []
     counts: Dict[str, int] = {}
+    advisory: Dict[str, int] = {}
     allowed_roots = [roots.install, roots.data, roots.input, roots.report, roots.trace, roots.windir]
     reg_ok = tuple(x.lower() for x in EXPECTED_REG) + tuple(x.lower() for x in extra_reg)
     for e in events:
@@ -239,15 +248,53 @@ def check_events(events: Sequence[Event], roots: Roots, extra_reg: Sequence[str]
                 findings.append(Finding("bot", e.name, "C:\\Hangeul\\BOT\\<...>", "an access under C:\\Hangeul\\BOT"))
                 continue
             if write and _under(ap, roots.install):
+                if n == "os.mkdir" and _norm(ap) in roots.shipped_dirs:
+                    # e.g. EasyOCR's Path(model_dir).mkdir(parents=True, exist_ok=True) on the bundle's own model
+                    # folders: the folder holds installed files, so the call can only end in FileExistsError
+                    advisory["mkdir of an installed folder (no-op)"] = (
+                        advisory.get("mkdir of an installed folder (no-op)", 0) + 1)
+                    continue
                 findings.append(Finding("write-install", e.name, "<INSTALL>", "a write under the install folder"))
                 continue
             if any(_under(ap, r) for r in allowed_roots if r):
+                continue
+            if _norm(ap) in roots.allowed_files:
+                advisory["the harness's own result file"] = advisory.get("the harness's own result file", 0) + 1
                 continue
             kind = "temp" if roots.temp and _under(ap, roots.temp) else "outside"
             if (e.name.lower(), kind) in EXCEPTIONS:
                 continue
             findings.append(Finding(kind, e.name, mask(ap), "write" if write else "read"))
-    return {"events": len(events), "counts": counts, "findings": findings}
+    return {"events": len(events), "counts": counts, "findings": findings, "advisory": advisory}
+
+
+def allowed_file_set(files: Sequence[Any]) -> Tuple[str, ...]:
+    """Each file the harness asked for, and its atomic-write sibling ``<file>.tmp``, normalized."""
+    out: List[str] = []
+    for f in files:
+        if f:
+            out += [_norm(str(f)), _norm(str(f) + ".tmp")]
+    return tuple(out)
+
+
+def shipped_dirs_of(install: Path, manifest: Optional[Path]) -> frozenset:
+    """The install folder and every folder that holds a MANIFEST.json file (at any depth), normalized; empty when
+    there is no readable manifest (then every mkdir under the install folder is a finding)."""
+    if manifest is None:
+        return frozenset()
+    try:
+        entries = manifest_entries(json.loads(Path(manifest).read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return frozenset()
+    out = set()
+    for rel in entries:
+        parts = [x for x in rel.split("/") if x][:-1]
+        cur = str(install)
+        out.add(_norm(cur))
+        for x in parts:
+            cur = ntpath.join(cur, x)
+            out.add(_norm(cur))
+    return frozenset(out)
 
 
 def _abs(p: str, cwd: str) -> str:
@@ -336,11 +383,12 @@ def check_manifest(install: Path, manifest: Path, hash_files: bool = False) -> L
 
 def run_check(trace: Path, install: Path, data: Path, input_path: Path, report: Path, cwd: Optional[Path] = None,
               manifest: Optional[Path] = None, hash_files: bool = False, extra_reg: Sequence[str] = (),
-              environ: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+              environ: Optional[Dict[str, str]] = None, allow_files: Sequence[Any] = ()) -> Dict[str, Any]:
     env = os.environ if environ is None else environ
     roots = Roots(install=str(install), data=str(data), input=str(input_path), report=str(report), trace=str(trace),
                   windir=env.get("WINDIR") or env.get("SystemRoot") or r"C:\Windows",
-                  temp=env.get("TEMP") or env.get("TMP") or "", cwd=str(cwd or data))
+                  temp=env.get("TEMP") or env.get("TMP") or "", cwd=str(cwd or data),
+                  allowed_files=allowed_file_set(allow_files), shipped_dirs=shipped_dirs_of(Path(install), manifest))
     events, errors = load_events(trace)
     res = check_events(events, roots, extra_reg)
     findings: List[Finding] = res["findings"]
@@ -351,6 +399,7 @@ def run_check(trace: Path, install: Path, data: Path, input_path: Path, report: 
         by_kind[f.kind] = by_kind.get(f.kind, 0) + 1
     return {"passed": not findings and not errors, "events": res["events"], "counts": res["counts"],
             "errors": errors, "by_kind": by_kind, "findings": [f.__dict__ for f in findings],
+            "advisory": res["advisory"],
             "limits": ["native opens (MuPDF fonts, Windows loading DLLs, NVIDIA ComputeCache/ProgramData) are not "
                        "audit events"]}
 
@@ -366,6 +415,8 @@ def print_result(r: Dict[str, Any]) -> None:
             continue
         seen.add(k)
         print(f"  FAIL {f['kind']}: {f['event']} {f['where']} ({f['detail']})")
+    for what, n in sorted((r.get("advisory") or {}).items()):
+        print(f"  advisory: {what}: {n} event(s)")
     for lim in r["limits"]:
         print(f"  limit: {lim}")
     print(f"8 c {'PASS' if r['passed'] else 'FAIL'}")
@@ -373,7 +424,8 @@ def print_result(r: Dict[str, Any]) -> None:
 
 def _cmd_check(a: argparse.Namespace) -> int:
     r = run_check(Path(a.trace), Path(a.install), Path(a.data), Path(a.input), Path(a.report),
-                  Path(a.cwd) if a.cwd else None, Path(a.manifest) if a.manifest else None, a.hash, a.allow_reg)
+                  Path(a.cwd) if a.cwd else None, Path(a.manifest) if a.manifest else None, a.hash, a.allow_reg,
+                  allow_files=a.allow_file)
     print_result(r)
     out = Path(a.json) if a.json else Path(a.trace).parent / "trace_check.json"
     out.write_text(json.dumps(r, indent=1, ensure_ascii=True), encoding="utf-8")
@@ -406,7 +458,7 @@ def _cmd_run(a: argparse.Namespace, run_fn: Any = None) -> int:
     print(f"8 c run: exit {res.returncode}{' TIMEOUT' if res.timed_out else ''} | run folder {root.name}")
     man = app / "_internal" / "MANIFEST.json"
     r = run_check(trace, app, data, Path(case.input), reports, None, man if man.is_file() else None, False,
-                  a.allow_reg)
+                  a.allow_reg, allow_files=[root / "auto.json"])
     print_result(r)
     (root / "trace_check.json").write_text(json.dumps(r, indent=1, ensure_ascii=True), encoding="utf-8")
     return 0 if (r["passed"] and res.returncode == 0) else 1
@@ -426,6 +478,8 @@ def main(argv: Optional[Sequence[str]] = None, run_fn: Any = None) -> int:
     c.add_argument("--hash", action="store_true")
     c.add_argument("--json", default="")
     c.add_argument("--allow-reg", action="append", default=[])
+    c.add_argument("--allow-file", action="append", default=[],
+                   help="a file the harness asked the app to write (e.g. the --auto-result file; its .tmp too)")
     r = sub.add_parser("run")
     r.add_argument("--build-id", default="")
     r.add_argument("--app-dir", default="")
