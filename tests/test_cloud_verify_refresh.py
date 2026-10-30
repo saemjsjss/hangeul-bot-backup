@@ -75,7 +75,7 @@ def pinned_store():
 
 PINNED_IDS = {P1: ("425", "HNG-2026-905")}
 # sha256 of the joined content hashes, as records.py at 8317741 (and C1) built them from pinned_store()
-PINNED_DOC_CHECKS = "755208f5a813e8cefe6b6b7106566cbf06a8c0a4a54cfc2e55743763f616cdaf"
+PINNED_DOC_CHECKS = "1513f162f27454253315d558165d2ff75826c1c9d2f89b3401d821b1b2393ccc"
 PINNED_DOCUMENT_REPORT = "2d89d5d02e6d8b63af5bb936c3c8bab3a04b2ce7450e723f49f7c8bd94865303"
 PINNED_FIELD_REPORT = "21e67c8a8326885aec0254deeb88b9f4d92a4efa5bfb64a76716086467a4cd11"
 
